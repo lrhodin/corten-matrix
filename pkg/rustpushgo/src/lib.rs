@@ -3260,118 +3260,17 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
                     );
                 }
             }
-
-            // Also remove the bridge from peer's session.members entirely so
-            // iOS drops the member entry immediately, not after the ~60s
-            // "member never joined" timeout. The unprop cmd 208 above only
-            // flipped active=None (iOS hides the tile visually); cmd 208's
-            // handler at facetime.rs:1399 doesn't prune non-temp members
-            // from session.members, so the bridge would linger as a member
-            // record otherwise.
-            let own_handles: Vec<String> = session.my_handles.clone();
-            let to_remove: Vec<rustpush::facetime::FTMember> = session
-                .members
-                .iter()
-                .filter(|m| own_handles.contains(&m.handle))
-                .cloned()
-                .collect();
-            if !to_remove.is_empty() {
-                match evict_bridge_from_peer_view(ft, session, &to_remove).await {
-                    Ok(()) => info!(
-                        "pending ring: evicted bridge from session {} members via cmd 209 RemoveMember",
-                        guid
-                    ),
-                    Err(e) => warn!(
-                        "pending ring: RemoveMember fanout failed for session {}: {:?} — peer's UI will clear after its own ~60s timeout",
-                        guid, e
-                    ),
-                }
-                session.members.retain(|m| !own_handles.contains(&m.handle));
-            }
+            // Intentionally no cmd 209 RemoveMember here. A post-ring
+            // RemoveMember was tried in 20bf121f to drop the bridge from
+            // peer's session.members immediately instead of waiting for
+            // iOS's ~60s "member never joined" timeout. Empirically that
+            // wire coincided with outbound video collapsing on peer's
+            // side — the wipe-then-restore in her unpack_participants
+            // dropped webview media. The tile fades via the auto-unprop
+            // cmd 208 above; the stale session.members entry is a
+            // cosmetic 60s issue, not a media one.
         }
     }
-}
-
-// Send a cmd 209 RemoveMember naming the bridge. Two wire-shape wrinkles
-// we handle here that upstream's FTClient::remove_members doesn't:
-//
-// 1. active_participants must be populated. Peer's unpack_participants
-//    (facetime.rs:245-258) wipes EVERY participant to active=None on
-//    entry and then only re-promotes those present in the wire message.
-//    Upstream leaves message.active_participants empty, so a straight
-//    remove_members call marks peer's own participant and the webview
-//    pseud inactive — media collapses to audio-only.
-//
-// 2. active_participants must EXCLUDE our own handles. We send this wire
-//    right after an unprop cmd 208 that flipped the bridge to active=None
-//    on peer's side; if we re-listed ourselves here, the wipe-then-restore
-//    would re-activate the bridge and undo the unprop. Filter out
-//    session.my_handles so only the webview and peer come back as active.
-async fn evict_bridge_from_peer_view(
-    ft: &rustpush::facetime::FTClient,
-    session: &mut rustpush::facetime::FTSession,
-    remove: &[rustpush::facetime::FTMember],
-) -> Result<(), rustpush::PushError> {
-    use rustpush::facetime::facetimep::{
-        ConversationMember, ConversationMessage, ConversationMessageType, Handle, HandleType,
-    };
-
-    // Local copy of facetime.rs's private handle_from_ids — we can't call
-    // it from outside the crate, but the uri-scheme → Handle mapping is
-    // stable since it's what Apple's wire format demands.
-    fn handle_from_ids(ids: &str) -> Handle {
-        let mut handle = Handle::default();
-        if let Some(addr) = ids.strip_prefix("mailto:") {
-            handle.set_type(HandleType::EmailAddress);
-            handle.value = addr.to_string();
-        } else if let Some(phone) = ids.strip_prefix("tel:") {
-            handle.set_type(HandleType::PhoneNumber);
-            handle.value = phone.to_string();
-            handle.iso_country_code = "us".to_string();
-        } else if ids.starts_with("temp:") {
-            handle.set_type(HandleType::Generic);
-            handle.value = ids.to_string();
-        }
-        handle
-    }
-
-    fn ft_member_to_conversation(m: &rustpush::facetime::FTMember) -> ConversationMember {
-        ConversationMember {
-            version: 0,
-            handle: Some(handle_from_ids(&m.handle)),
-            nickname: m.nickname.clone(),
-            lightweight_primary: None,
-            lightweight_primary_participant_id: 0,
-            validation_source: 0,
-        }
-    }
-
-    let mut message = ConversationMessage::default();
-    message.set_type(ConversationMessageType::RemoveMember);
-    message.conversation_group_uuid_string = session.group_id.clone();
-    message.removed_members = remove.iter().map(ft_member_to_conversation).collect();
-    // Preserve every currently-active participant EXCEPT our own handles
-    // so peer's unpack_participants (facetime.rs:245-258) wipes the bridge
-    // to inactive (reinforcing the auto-unprop cmd 208 that already went
-    // out) while re-promoting the webview and peer herself. If we included
-    // ourselves here, the wipe-then-restore would re-activate the bridge
-    // and undo the unprop we just did.
-    let own_handles: Vec<String> = session.my_handles.clone();
-    message.active_participants = session
-        .participants
-        .values()
-        .filter(|p| !own_handles.contains(&p.handle))
-        .filter_map(|p| p.active.clone())
-        .collect();
-    message.link = session.link.clone();
-
-    let before_members = session.members.clone();
-    let to_members: Vec<String> = session
-        .members
-        .iter()
-        .map(|m| m.handle.clone())
-        .collect();
-    ft.update_conversation(session, 3, message, &before_members, &to_members).await
 }
 
 // Send a RespondedElsewhere FaceTime message scoped to the caller's own
@@ -3589,44 +3488,6 @@ async fn ft_handle_with_join_recovery(
             Some(id) => id.as_u64(),
             None => return upstream_result,
         };
-        // Stamp active=Some(synthetic) so subsequent cmd 209 fanouts from
-        // add_members / remove_members carry this joiner in
-        // active_participants (facetime.rs:934 collects from
-        // session.participants.filter_map(p.active)). Without this, peer's
-        // unpack_participants wipes the joiner to inactive on the next cmd
-        // 209 we send, collapsing video on her side.
-        let synthetic_active = {
-            use rustpush::facetime::facetimep::{ConversationParticipant, Handle, HandleType};
-            let mut handle_proto = Handle::default();
-            if let Some(addr) = sender.strip_prefix("mailto:") {
-                handle_proto.set_type(HandleType::EmailAddress);
-                handle_proto.value = addr.to_string();
-            } else if let Some(phone) = sender.strip_prefix("tel:") {
-                handle_proto.set_type(HandleType::PhoneNumber);
-                handle_proto.value = phone.to_string();
-                handle_proto.iso_country_code = "us".to_string();
-            } else {
-                handle_proto.set_type(HandleType::Generic);
-                handle_proto.value = sender.clone();
-            }
-            Some(ConversationParticipant {
-                version: 0,
-                identifier: participant_id,
-                handle: Some(handle_proto),
-                avc_data: include_bytes!("../../../third_party/rustpush-upstream/src/sampleavcdata.bplist").to_vec(),
-                is_moments_available: Some(true),
-                is_screen_sharing_available: Some(true),
-                is_gondola_calling_available: Some(true),
-                is_mirage_available: None,
-                is_lightweight: None,
-                share_play_protocol_version: 4,
-                options: 0,
-                is_gft_downgrade_to_one_to_one_available: Some(false),
-                guest_mode_enabled: None,
-                association: None,
-                is_u_plus_n_downgrade_available: Some(false),
-            })
-        };
         session.participants.insert(
             participant_id.to_string(),
             rustpush::facetime::FTParticipant {
@@ -3634,7 +3495,7 @@ async fn ft_handle_with_join_recovery(
                 participant_id,
                 last_join_date: Some(ns_since_epoch / 1_000_000),
                 handle: sender.clone(),
-                active: synthetic_active,
+                active: None,
             },
         );
 
@@ -5589,14 +5450,15 @@ impl WrappedFaceTimeClient {
     //    at facetime.rs:771-783, video=Some(true), video_enabled=Some(false)).
     //    Peer's iOS inserts the bridge into session.participants and renders
     //    a tile.
-    //  - When the webview self-joins via temp: cmd 207, both upstream's line
-    //    1315 auto-unprop and our fallback at ft_handle_with_join_recovery
-    //    fire an unprop cmd 208 that flips the bridge participant to
-    //    active=None on peer's side. iOS hides inactive tiles.
-    //  - maybe_fire_pending_ring then sends evict_bridge_from_peer_view
-    //    (custom cmd 209 RemoveMember with active_participants excluding
-    //    own handles) so peer's session.members drops the bridge entry
-    //    immediately instead of lingering for ~60s.
+    //  - When the webview self-joins via temp: cmd 207, upstream's line
+    //    1315 auto-unprop fires a cmd 208 that flips the bridge participant
+    //    to active=None on peer's side. iOS hides inactive tiles.
+    //  - maybe_fire_pending_ring also calls unprop_conv as belt-and-
+    //    suspenders in case upstream's auto-unprop missed (e.g. the join
+    //    arrived via our BadMsg fallback). No post-ring cmd 209
+    //    RemoveMember — that wire regressed outbound video in 20bf121f.
+    //    peer's session.members entry for the bridge may linger ~60s
+    //    until iOS's "member never joined" timeout clears it; cosmetic.
     //
     // Why is_ringing_inaccurate starts false: prop_up_conv(ring=false)'s
     // `!ring && is_ringing_inaccurate` branch diverts into a
@@ -5617,10 +5479,10 @@ impl WrappedFaceTimeClient {
     // matching the prop wire's capability flags keeps us in add_members'
     // active_participants until the genuine auto-unprop flips us inactive.
     //
-    // Historical note: the TPP at _todo/FT-phantom-tile-learnings.md
-    // describes an earlier shape (no prop at create, post-ring RemoveMember
-    // with active_participants including self). That approach is preserved
-    // in commit 50473405 if needed to bisect.
+    // Historical note: earlier shapes are preserved in git for bisecting
+    // if this regresses — 50473405 (no prop at create, post-ring
+    // RemoveMember preserving self) and 88af11f8 (no prop at create, no
+    // post-ring cleanup at all). See _todo/FT-phantom-tile-learnings.md.
     pub async fn create_session_no_ring(
         &self,
         group_id: String,
