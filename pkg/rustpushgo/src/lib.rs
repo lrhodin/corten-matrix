@@ -3266,24 +3266,6 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
                 );
             }
 
-            // Evict the bridge from peer's FT UI by sending cmd 209
-            // RemoveMember naming our own handle. By the time we get here
-            // the ring has fired (Invitation is on the wire), the webview
-            // has already joined (that's what triggered this function),
-            // and media flows webview↔peer directly through Apple's
-            // quickrelay. The bridge being in peer's session.members — put
-            // there by respond_letmein's add_members cmd 209 fanout — is
-            // no longer load-bearing. Removing it now causes peer iOS to
-            // drop the "invited, hasn't joined" placeholder tile without
-            // disturbing the live call.
-            //
-            // Upstream's remove_members builds its wire from
-            // session.members, so we clone the list, strip our own handle
-            // for the wire fanout, and let upstream compose the
-            // ConversationMessage::RemoveMember. The local session.members
-            // mutation inside remove_members is a no-op (see facetime.rs:
-            // 987 — `session.members = new` where new is the pre-call
-            // clone), so we keep our own view intact for bookkeeping.
             let own_handles: Vec<String> = session.my_handles.clone();
             let to_remove: Vec<rustpush::facetime::FTMember> = session
                 .members
@@ -3297,24 +3279,94 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
                     guid
                 );
             } else {
-                match ft.remove_members(session, to_remove.clone()).await {
+                match evict_bridge_from_peer_view(ft, session, &to_remove).await {
                     Ok(()) => info!(
                         "pending ring: evicted {} bridge handle(s) from peer's view of session {} via cmd 209 RemoveMember",
                         to_remove.len(),
                         guid
                     ),
                     Err(e) => warn!(
-                        "pending ring: remove_members failed for session {}: {:?} — peer may still see a phantom tile",
+                        "pending ring: RemoveMember fanout failed for session {}: {:?} — peer may still see a phantom tile",
                         guid, e
                     ),
                 }
-                // remove_members upstream retains session.members locally;
-                // drop the bridge from our own copy too so subsequent
-                // fanouts don't re-include it.
                 session.members.retain(|m| !own_handles.contains(&m.handle));
             }
         }
     }
+}
+
+// Send a cmd 209 RemoveMember naming the bridge, preserving peer's
+// currently-active participants on the wire. Critical wrinkle:
+// upstream's FTClient::remove_members leaves message.active_participants
+// empty, and peer's unpack_participants (facetime.rs:245-248) wipes EVERY
+// participant to active=None on entry and then only re-promotes those in
+// the wire message. An empty active_participants therefore marks peer's
+// own participant (and the webview pseud) inactive — media negotiation
+// collapses and video drops to audio-only. So we reconstruct the cmd 209
+// ourselves, cloning every active participant out of session.participants
+// into message.active_participants before calling update_conversation.
+async fn evict_bridge_from_peer_view(
+    ft: &rustpush::facetime::FTClient,
+    session: &mut rustpush::facetime::FTSession,
+    remove: &[rustpush::facetime::FTMember],
+) -> Result<(), rustpush::PushError> {
+    use rustpush::facetime::facetimep::{
+        ConversationMember, ConversationMessage, ConversationMessageType, Handle, HandleType,
+    };
+
+    // Local copy of facetime.rs's private handle_from_ids — we can't call
+    // it from outside the crate, but the uri-scheme → Handle mapping is
+    // stable since it's what Apple's wire format demands.
+    fn handle_from_ids(ids: &str) -> Handle {
+        let mut handle = Handle::default();
+        if let Some(addr) = ids.strip_prefix("mailto:") {
+            handle.set_type(HandleType::EmailAddress);
+            handle.value = addr.to_string();
+        } else if let Some(phone) = ids.strip_prefix("tel:") {
+            handle.set_type(HandleType::PhoneNumber);
+            handle.value = phone.to_string();
+            handle.iso_country_code = "us".to_string();
+        } else if ids.starts_with("temp:") {
+            handle.set_type(HandleType::Generic);
+            handle.value = ids.to_string();
+        }
+        handle
+    }
+
+    fn ft_member_to_conversation(m: &rustpush::facetime::FTMember) -> ConversationMember {
+        ConversationMember {
+            version: 0,
+            handle: Some(handle_from_ids(&m.handle)),
+            nickname: m.nickname.clone(),
+            lightweight_primary: None,
+            lightweight_primary_participant_id: 0,
+            validation_source: 0,
+        }
+    }
+
+    let mut message = ConversationMessage::default();
+    message.set_type(ConversationMessageType::RemoveMember);
+    message.conversation_group_uuid_string = session.group_id.clone();
+    message.removed_members = remove.iter().map(ft_member_to_conversation).collect();
+    // Preserve every currently-active participant so peer's wipe-then-
+    // repopulate in unpack_participants doesn't drop the webview (or peer
+    // herself) from the call. This mirrors what add_members does at
+    // facetime.rs:934 for the join direction.
+    message.active_participants = session
+        .participants
+        .values()
+        .filter_map(|p| p.active.clone())
+        .collect();
+    message.link = session.link.clone();
+
+    let before_members = session.members.clone();
+    let to_members: Vec<String> = session
+        .members
+        .iter()
+        .map(|m| m.handle.clone())
+        .collect();
+    ft.update_conversation(session, 3, message, &before_members, &to_members).await
 }
 
 // Send a RespondedElsewhere FaceTime message scoped to the caller's own
