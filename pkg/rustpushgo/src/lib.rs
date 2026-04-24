@@ -3255,42 +3255,10 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
                     warn!("pending ring: unprop_conv failed for session {}: {:?}", guid, e);
                 } else {
                     info!(
-                        "pending ring: unpropped bridge from session {} — web client carries the call from here",
+                        "pending ring: unpropped bridge from session {} — peer's iOS will hide our tile via active=None",
                         guid
                     );
                 }
-            } else {
-                info!(
-                    "pending ring: session {} was never propped — no unprop needed (expected on outbound post-prop-skip)",
-                    guid
-                );
-            }
-
-            let own_handles: Vec<String> = session.my_handles.clone();
-            let to_remove: Vec<rustpush::facetime::FTMember> = session
-                .members
-                .iter()
-                .filter(|m| own_handles.contains(&m.handle))
-                .cloned()
-                .collect();
-            if to_remove.is_empty() {
-                info!(
-                    "pending ring: session {} had no bridge handle in members — nothing to evict",
-                    guid
-                );
-            } else {
-                match evict_bridge_from_peer_view(ft, session, &to_remove).await {
-                    Ok(()) => info!(
-                        "pending ring: evicted {} bridge handle(s) from peer's view of session {} via cmd 209 RemoveMember",
-                        to_remove.len(),
-                        guid
-                    ),
-                    Err(e) => warn!(
-                        "pending ring: RemoveMember fanout failed for session {}: {:?} — peer may still see a phantom tile",
-                        guid, e
-                    ),
-                }
-                session.members.retain(|m| !own_handles.contains(&m.handle));
             }
         }
     }
@@ -5631,10 +5599,94 @@ impl WrappedFaceTimeClient {
                 msg: format!("ensure_allocations failed: {:?}", e),
             })?;
 
+        // Prop the bridge so peer's iPhone renders it as an active participant.
+        // That "phantom" tile IS the mechanism: when the webview later joins
+        // with a temp: sender, upstream's auto-unprop at facetime.rs:1315
+        // fires a cmd 208 that flips the bridge participant to active=None on
+        // peer's side. iOS hides inactive participants, so the tile
+        // disappears cleanly without disturbing the webview's own state
+        // (unlike a cmd 209 RemoveMember, which triggers unpack_participants'
+        // wipe-then-repopulate and collapses video to audio-only).
+        //
+        // Mirrors the inbound path: respond_letmein's needs_prop branch
+        // (facetime.rs:1078) runs exactly this call, just triggered by
+        // peer's Invitation instead of our own outbound arm.
+        self.inner
+            .prop_up_conv(session, false)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("prop_up_conv(ring=false) failed: {:?}", e),
+            })?;
+
+        // After prop_up_conv, upstream leaves our OWN participant's .active
+        // at None locally (it only sets is_propped=true and sends the wire,
+        // see facetime.rs:820). That's fine inbound because the respond_letmein
+        // → prop → add_members(webview) → auto-unprop sequence all fires
+        // inside a single letmein handler and wife's state converges
+        // quickly. On outbound though, respond_letmein's add_members runs
+        // AFTER our prop — and add_members builds its cmd 209 from
+        // `session.participants.values().filter_map(|p| p.active.clone())`
+        // (facetime.rs:934). With our own participant's .active still None,
+        // that list is empty, and wife's unpack_participants wipes the
+        // bridge tile she JUST got from our prop 207. By the time the
+        // auto-unprop cmd 208 arrives, there's nothing to un-wipe — wife
+        // is left with an empty session.participants, the webview tile
+        // never registers as active, and iOS shows no one.
+        //
+        // Stamp .active on our own participant with a snapshot that mirrors
+        // what prop_up_conv just put on the wire. Subsequent add_members
+        // fanouts then carry us in active_participants and wife's state
+        // stays consistent until the genuine auto-unprop flips us inactive.
+        {
+            use rustpush::facetime::facetimep::{ConversationParticipant, Handle, HandleType};
+            fn handle_from_ids(ids: &str) -> Handle {
+                let mut h = Handle::default();
+                if let Some(addr) = ids.strip_prefix("mailto:") {
+                    h.set_type(HandleType::EmailAddress);
+                    h.value = addr.to_string();
+                } else if let Some(phone) = ids.strip_prefix("tel:") {
+                    h.set_type(HandleType::PhoneNumber);
+                    h.value = phone.to_string();
+                    h.iso_country_code = "us".to_string();
+                } else {
+                    h.set_type(HandleType::Generic);
+                    h.value = ids.to_string();
+                }
+                h
+            }
+
+            // Upstream's prop_up_conv hardcodes these capability flags in the
+            // wire message (facetime.rs:771-783). We mirror them so what we
+            // tell wife later matches what she has from the initial prop 207.
+            let my_token_b64 = base64_encode(&self.inner.conn.get_token().await);
+            if let Some(my_participant) = session
+                .participants
+                .values_mut()
+                .find(|p| p.token.as_deref() == Some(my_token_b64.as_str()))
+            {
+                my_participant.active = Some(ConversationParticipant {
+                    version: 0,
+                    identifier: my_participant.participant_id,
+                    handle: Some(handle_from_ids(&my_participant.handle)),
+                    avc_data: include_bytes!("../../../third_party/rustpush-upstream/src/sampleavcdata.bplist").to_vec(),
+                    is_moments_available: Some(true),
+                    is_screen_sharing_available: Some(true),
+                    is_gondola_calling_available: Some(true),
+                    is_mirage_available: None,
+                    is_lightweight: None,
+                    share_play_protocol_version: 4,
+                    options: 0,
+                    is_gft_downgrade_to_one_to_one_available: Some(false),
+                    guest_mode_enabled: None,
+                    association: None,
+                    is_u_plus_n_downgrade_available: Some(false),
+                });
+            }
+        }
+
         info!(
-            "FaceTime create_session_no_ring: allocated session {} with {} participant slot(s); prop_up_conv deferred — peer won't see bridge until the ring fanout fans",
+            "FaceTime create_session_no_ring: allocated + propped session {}; bridge participant stamped active locally so add_members preserves it on the wire",
             group_id,
-            session.participants.len(),
         );
         Ok(())
     }
