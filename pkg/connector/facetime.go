@@ -328,25 +328,19 @@ func appendFaceTimeLinkName(link, name string) string {
 // web join link's `n=` fragment so the recipient sees a real name instead
 // of a raw phone number on the peer's incoming-call UI. Preference order:
 //  1. `facetime_display_name` config override (per-user escape hatch),
-//  2. the logged-in bridge user's Matrix displayname (resolved from their
-//     management-room member event),
+//  2. Apple ID "First Last" read from the cached SPD dict (the name Apple
+//     has on file for this account — same name iMessage and FaceTime
+//     already show everywhere else),
 //  3. the bare iMessage handle as a last-resort fallback.
 func (c *IMClient) resolveFaceTimeDisplayName(ctx context.Context) string {
 	if override := strings.TrimSpace(c.Main.Config.FaceTimeDisplayName); override != "" {
 		return override
 	}
-	if c.UserLogin != nil && c.UserLogin.User != nil && c.UserLogin.User.MXID != "" {
-		if mgmt, err := c.UserLogin.User.GetManagementRoom(ctx); err == nil && mgmt != "" {
-			if info, err := c.Main.Bridge.Matrix.GetMemberInfo(ctx, mgmt, c.UserLogin.User.MXID); err == nil && info != nil {
-				if name := strings.TrimSpace(info.Displayname); name != "" {
-					return name
-				}
-			}
+	if c.tokenProvider != nil && *c.tokenProvider != nil {
+		if name := strings.TrimSpace((*c.tokenProvider).AppleAccountFullName()); name != "" {
+			return name
 		}
-		// Member event existed but carried no displayname, or the AS state
-		// store doesn't have an entry for this user yet. Log once so the
-		// user has a breadcrumb to set `facetime_display_name` in config.
-		c.UserLogin.Log.Debug().Msg("FaceTime display-name lookup fell through to handle; set facetime_display_name in config to override")
+		c.UserLogin.Log.Debug().Msg("FaceTime display-name: Apple Account SPD lookup returned empty; set facetime_display_name in config to override")
 	}
 	return stripIdentifierPrefix(c.handle)
 }

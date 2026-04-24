@@ -2006,6 +2006,29 @@ impl WrappedTokenProvider {
         Ok(adsid)
     }
 
+    /// Read the logged-in user's full name from the cached Apple Account SPD
+    /// ("fn" + "ln", populated during GSA login — the canonical "first last"
+    /// Apple stores for this Apple ID). Returns an empty string when the SPD
+    /// is missing (user not fully logged in) or when both fields are blank.
+    /// Used by the FaceTime link builder to pre-fill the web join page's
+    /// display-name field so peer sees a real name instead of a phone number.
+    pub(crate) async fn get_apple_account_full_name(&self) -> String {
+        let account = self.account.lock().await;
+        let Some(spd) = account.spd.as_ref() else { return String::new(); };
+        let first = spd
+            .get("fn")
+            .and_then(|v| v.as_string())
+            .unwrap_or("")
+            .trim();
+        let last = spd
+            .get("ln")
+            .and_then(|v| v.as_string())
+            .unwrap_or("")
+            .trim();
+        let combined = format!("{} {}", first, last);
+        combined.trim().to_string()
+    }
+
     /// Parse the stored MobileMe delegate plist bytes into whatever typed form
     /// the caller context expects (usually `rustpush::auth::MobileMeDelegateResponse`).
     /// `T` is inferred from the receiving function's signature at the call site —
@@ -2047,6 +2070,16 @@ impl WrappedTokenProvider {
 // call them.
 #[uniffi::export(async_runtime = "tokio")]
 impl WrappedTokenProvider {
+    /// Read the logged-in user's full name ("First Last") from the cached
+    /// Apple Account SPD. Sourced from Apple's GSA login response (spd.fn /
+    /// spd.ln — what Apple has on file for this Apple ID), so it matches
+    /// what the user already sees on their iMessage account. Returns an
+    /// empty string if the account isn't fully logged in or the name
+    /// fields are blank (older accounts may lack them).
+    pub async fn apple_account_full_name(&self) -> String {
+        self.get_apple_account_full_name().await
+    }
+
     /// List devices that have escrow bottles in the iCloud Keychain trust circle.
     /// Returns device info (name, model, serial, timestamp) for each bottle.
     /// Call this before join_keychain_clique_for_device to let the user choose.
@@ -5451,14 +5484,40 @@ impl WrappedFaceTimeClient {
             .unwrap_or_default()
             .as_millis() as u64;
 
+        // Session.members contains ONLY the peer(s). The bridge's own handle
+        // is kept out so that the subsequent add_members call (inside
+        // respond_letmein when the webview sends letmein) fans out cmd 209
+        // with `update_context.members = before_members` that omits the
+        // bridge. Peer's handler at facetime.rs:1342 calls
+        // unpack_members(decoded_context.members), which would otherwise
+        // record the bridge as a member-without-participant — iOS renders
+        // that pairing as an "invited, hasn't joined" phantom tile that
+        // can't be cleared by a later unprop (handle isn't `temp:`, so
+        // facetime.rs:1399-1403's member-prune doesn't remove it).
+        //
+        // Inbound doesn't hit this because peer's own create_session
+        // populates her session.members from her side — the bridge is
+        // there but it ALSO has an active participant entry from our
+        // respond_letmein prop, which goes active=None on unprop and iOS
+        // hides inactive tiles.
         let members = participants
             .iter()
-            .chain(std::iter::once(&handle))
             .map(|p| FTMember {
                 nickname: None,
                 handle: p.clone(),
             })
             .collect();
+
+        // Ensure the bridge gets a quickrelay allocation (participant_id +
+        // token) even though it's not in session.members. ensure_allocations
+        // iterates session.members.chain(new_members) for allocation, so
+        // passing the bridge as new_members keeps it reachable via
+        // session.participants without leaking into the wire-level members
+        // list.
+        let bridge_member = FTMember {
+            nickname: None,
+            handle: handle.clone(),
+        };
 
         let session = FTSession {
             group_id: group_id.clone(),
@@ -5480,14 +5539,14 @@ impl WrappedFaceTimeClient {
         let session = state.sessions.get_mut(&group_id).expect("just inserted");
 
         self.inner
-            .ensure_allocations(session, &[])
+            .ensure_allocations(session, std::slice::from_ref(&bridge_member))
             .await
             .map_err(|e| WrappedError::GenericError {
                 msg: format!("ensure_allocations failed: {:?}", e),
             })?;
 
         info!(
-            "FaceTime create_session_no_ring: allocated session {} with {} participant slot(s); skipping prop_up_conv to keep bridge out of peer's UI",
+            "FaceTime create_session_no_ring: allocated session {} with {} participant slot(s); bridge excluded from session.members to suppress peer phantom tile",
             group_id,
             session.participants.len(),
         );
