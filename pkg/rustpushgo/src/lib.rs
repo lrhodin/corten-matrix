@@ -5504,11 +5504,11 @@ impl WrappedFaceTimeClient {
         // the webview's own cmd 207 self-join doesn't fanout to the bridge,
         // maybe_fire_pending_ring never triggers, and peer never rings.
         //
-        // Phantom-tile cleanup happens AFTER the ring has fired, in
-        // maybe_fire_pending_ring, via remove_members (cmd 209 RemoveMember).
-        // By that point the webview has already joined and media flows
-        // webview↔peer directly through Apple's quickrelay — bridge being
-        // a member is no longer load-bearing.
+        // The bridge's session.members entry on peer's side is cleared by
+        // iOS's own "member never joined" timeout (~60s) once we unprop.
+        // We used to force this via a post-ring cmd 209 RemoveMember, but
+        // that wire regressed outbound video — see the comment in
+        // maybe_fire_pending_ring.
         let members = participants
             .iter()
             .chain(std::iter::once(&handle))
