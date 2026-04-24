@@ -3632,84 +3632,7 @@ async fn auto_approve_bridge_letmein(
         }
     }
 
-    // Inbound parity with outbound (create_session_no_ring): pre-allocate +
-    // pre-prop + pre-stamp bridge.active BEFORE respond_letmein runs. Without
-    // this, respond_letmein's needs_prop branch (facetime.rs:1078) gates on
-    // `is_ringing_inaccurate && active_count==1` — true on inbound when only
-    // the peer is active — so it runs its own prop_up_conv. Upstream's
-    // prop_up_conv leaves our own .active=None locally (facetime.rs:820),
-    // then the immediate add_members(webview) fans cmd 209 with
-    // active_participants=[peer.active] only. Peer's unpack_participants
-    // (facetime.rs:245) wipes all participants and self-excludes by token
-    // (line 254), leaving ZERO active participants on her side — webview
-    // tile never registers, no video.
-    //
-    // By pre-ensuring bridge is allocated + propped + stamped active here,
-    // needs_prop flips to false (count==2) → respond_letmein skips its
-    // internal prop → add_members fans with [peer.active, bridge.active].
-    // Peer's unpack_participants preserves bridge active after her self
-    // exclusion, and the later auto-unprop (cmd 208) flips bridge inactive
-    // cleanly once the webview joins. Mirrors the outbound path where the
-    // same pattern already works.
-    if inbound_session {
-        use rustpush::facetime::facetimep::{ConversationParticipant, Handle, HandleType};
-        fn handle_from_ids(ids: &str) -> Handle {
-            let mut h = Handle::default();
-            if let Some(addr) = ids.strip_prefix("mailto:") {
-                h.set_type(HandleType::EmailAddress);
-                h.value = addr.to_string();
-            } else if let Some(phone) = ids.strip_prefix("tel:") {
-                h.set_type(HandleType::PhoneNumber);
-                h.value = phone.to_string();
-                h.iso_country_code = "us".to_string();
-            } else {
-                h.set_type(HandleType::Generic);
-                h.value = ids.to_string();
-            }
-            h
-        }
-
-        let my_token_b64 = base64_encode(&facetime.conn.get_token().await);
-        let mut state = facetime.state.write().await;
-        if let Some(session) = state.sessions.get_mut(&approved_group) {
-            if !session.is_propped {
-                facetime.ensure_allocations(session, &[]).await?;
-                facetime.prop_up_conv(session, false).await?;
-                if let Some(my_participant) = session
-                    .participants
-                    .values_mut()
-                    .find(|p| p.token.as_deref() == Some(my_token_b64.as_str()))
-                {
-                    my_participant.active = Some(ConversationParticipant {
-                        version: 0,
-                        identifier: my_participant.participant_id,
-                        handle: Some(handle_from_ids(&my_participant.handle)),
-                        avc_data: include_bytes!(
-                            "../../../third_party/rustpush-upstream/src/sampleavcdata.bplist"
-                        )
-                        .to_vec(),
-                        is_moments_available: Some(true),
-                        is_screen_sharing_available: Some(true),
-                        is_gondola_calling_available: Some(true),
-                        is_mirage_available: None,
-                        is_lightweight: None,
-                        share_play_protocol_version: 4,
-                        options: 0,
-                        is_gft_downgrade_to_one_to_one_available: Some(false),
-                        guest_mode_enabled: None,
-                        association: None,
-                        is_u_plus_n_downgrade_available: Some(false),
-                    });
-                }
-                info!(
-                    "FaceTime inbound letmein: pre-propped + stamped bridge active locally for session {} so respond_letmein's add_members fans active_participants including bridge",
-                    approved_group,
-                );
-            }
-        }
-    }
-
-    // Diagnostic: dump session state right before respond_letmein so we can
+    // Diagnostic: dump session state right before the retry loop so we can
     // see empirically whether session.members includes the peer on inbound.
     // Hypothesis we're testing: on inbound letmein, session.members holds
     // only [webview] so upstream add_members fans to nobody and wife's
@@ -3750,8 +3673,13 @@ async fn auto_approve_bridge_letmein(
         }
     }
 
-    // respond_letmein: sends LetMeInResponse then add_members/ring over APNs.
-    // APNs can flap (early eof → SendTimedOut) especially right after boot.
+    // Inbound pre-prop + respond_letmein both hit APNs, and APNs can flap
+    // (early eof → SendTimedOut) especially right after boot. Retry the
+    // whole sequence together. ensure_inbound_pre_prop is idempotent — its
+    // is_propped check short-circuits on re-entry — so if the pre-prop
+    // succeeded on attempt N but respond_letmein timed out, attempt N+1
+    // skips pre-prop and retries only respond_letmein without duplicating
+    // the RespondedElsewhere + cmd 207 sends.
     //
     // Subtlety: respond_letmein's first action for delegated requests is
     // removing the delegation_uuid from delegated_requests. If the later
@@ -3763,6 +3691,30 @@ async fn auto_approve_bridge_letmein(
     // instead of re-add).
     let mut last_err: Option<rustpush::PushError> = None;
     for attempt in 0..3u32 {
+        if inbound_session {
+            match ensure_inbound_pre_prop(facetime, &approved_group).await {
+                Ok(true) => info!(
+                    "FaceTime inbound letmein: pre-propped + stamped bridge active locally for session {} so respond_letmein's add_members fans active_participants including bridge",
+                    approved_group,
+                ),
+                Ok(false) => {}
+                Err(e) => {
+                    let is_timeout = matches!(&e, rustpush::PushError::SendTimedOut);
+                    last_err = Some(e);
+                    if !is_timeout || attempt >= 2 {
+                        break;
+                    }
+                    warn!(
+                        "FaceTime letmein pre-prop timed out (attempt {}), retrying in {}s",
+                        attempt + 1,
+                        attempt + 1
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs((attempt + 1) as u64)).await;
+                    continue;
+                }
+            }
+        }
+
         let mut retry_request = request.clone();
         if attempt > 0 {
             retry_request.delegation_uuid = None;
@@ -3800,6 +3752,93 @@ async fn auto_approve_bridge_letmein(
         }
     }
     Err(last_err.unwrap_or(rustpush::PushError::SendTimedOut))
+}
+
+// Inbound parity with outbound (create_session_no_ring): pre-allocate +
+// pre-prop + pre-stamp bridge.active BEFORE respond_letmein runs. Without
+// this, respond_letmein's needs_prop branch (facetime.rs:1078) gates on
+// `is_ringing_inaccurate && active_count==1` — true on inbound when only
+// the peer is active — so it runs its own prop_up_conv. Upstream's
+// prop_up_conv leaves our own .active=None locally (facetime.rs:820),
+// then the immediate add_members(webview) fans cmd 209 with
+// active_participants=[peer.active] only. Peer's unpack_participants
+// (facetime.rs:245) wipes all participants and self-excludes by token
+// (line 254), leaving ZERO active participants on her side — webview
+// tile never registers, no video.
+//
+// Pre-ensuring bridge is allocated + propped + stamped active flips
+// needs_prop to false (count==2) → respond_letmein skips its internal
+// prop → add_members fans with [peer.active, bridge.active]. Peer
+// preserves bridge active after her self-exclusion; auto-unprop (cmd 208)
+// flips bridge inactive cleanly once the webview joins. Mirrors the
+// outbound path.
+//
+// Idempotent via session.is_propped: first successful call sets it to
+// true (inside prop_up_conv); later calls short-circuit. That makes this
+// safe to call once per retry attempt in auto_approve_bridge_letmein —
+// an APNs SendTimedOut mid-sequence won't cause a second RespondedElsewhere
+// / cmd 207 fan on the retry.
+//
+// Returns Ok(true) if the prop ran this call, Ok(false) if already propped
+// (or the session disappeared between retries).
+async fn ensure_inbound_pre_prop(
+    facetime: &rustpush::facetime::FTClient,
+    approved_group: &str,
+) -> Result<bool, rustpush::PushError> {
+    use rustpush::facetime::facetimep::{ConversationParticipant, Handle, HandleType};
+    fn handle_from_ids(ids: &str) -> Handle {
+        let mut h = Handle::default();
+        if let Some(addr) = ids.strip_prefix("mailto:") {
+            h.set_type(HandleType::EmailAddress);
+            h.value = addr.to_string();
+        } else if let Some(phone) = ids.strip_prefix("tel:") {
+            h.set_type(HandleType::PhoneNumber);
+            h.value = phone.to_string();
+            h.iso_country_code = "us".to_string();
+        } else {
+            h.set_type(HandleType::Generic);
+            h.value = ids.to_string();
+        }
+        h
+    }
+
+    let my_token_b64 = base64_encode(&facetime.conn.get_token().await);
+    let mut state = facetime.state.write().await;
+    let Some(session) = state.sessions.get_mut(approved_group) else {
+        return Ok(false);
+    };
+    if session.is_propped {
+        return Ok(false);
+    }
+    facetime.ensure_allocations(session, &[]).await?;
+    facetime.prop_up_conv(session, false).await?;
+    if let Some(my_participant) = session
+        .participants
+        .values_mut()
+        .find(|p| p.token.as_deref() == Some(my_token_b64.as_str()))
+    {
+        my_participant.active = Some(ConversationParticipant {
+            version: 0,
+            identifier: my_participant.participant_id,
+            handle: Some(handle_from_ids(&my_participant.handle)),
+            avc_data: include_bytes!(
+                "../../../third_party/rustpush-upstream/src/sampleavcdata.bplist"
+            )
+            .to_vec(),
+            is_moments_available: Some(true),
+            is_screen_sharing_available: Some(true),
+            is_gondola_calling_available: Some(true),
+            is_mirage_available: None,
+            is_lightweight: None,
+            share_play_protocol_version: 4,
+            options: 0,
+            is_gft_downgrade_to_one_to_one_available: Some(false),
+            guest_mode_enabled: None,
+            association: None,
+            is_u_plus_n_downgrade_available: Some(false),
+        });
+    }
+    Ok(true)
 }
 
 async fn facetime_event_to_wrapped(
