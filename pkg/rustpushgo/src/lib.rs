@@ -3292,16 +3292,21 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
     }
 }
 
-// Send a cmd 209 RemoveMember naming the bridge, preserving peer's
-// currently-active participants on the wire. Critical wrinkle:
-// upstream's FTClient::remove_members leaves message.active_participants
-// empty, and peer's unpack_participants (facetime.rs:245-248) wipes EVERY
-// participant to active=None on entry and then only re-promotes those in
-// the wire message. An empty active_participants therefore marks peer's
-// own participant (and the webview pseud) inactive — media negotiation
-// collapses and video drops to audio-only. So we reconstruct the cmd 209
-// ourselves, cloning every active participant out of session.participants
-// into message.active_participants before calling update_conversation.
+// Send a cmd 209 RemoveMember naming the bridge. Two wire-shape wrinkles
+// we handle here that upstream's FTClient::remove_members doesn't:
+//
+// 1. active_participants must be populated. Peer's unpack_participants
+//    (facetime.rs:245-258) wipes EVERY participant to active=None on
+//    entry and then only re-promotes those present in the wire message.
+//    Upstream leaves message.active_participants empty, so a straight
+//    remove_members call marks peer's own participant and the webview
+//    pseud inactive — media collapses to audio-only.
+//
+// 2. active_participants must EXCLUDE our own handles. We send this wire
+//    right after an unprop cmd 208 that flipped the bridge to active=None
+//    on peer's side; if we re-listed ourselves here, the wipe-then-restore
+//    would re-activate the bridge and undo the unprop. Filter out
+//    session.my_handles so only the webview and peer come back as active.
 async fn evict_bridge_from_peer_view(
     ft: &rustpush::facetime::FTClient,
     session: &mut rustpush::facetime::FTSession,
@@ -5570,44 +5575,52 @@ impl WrappedFaceTimeClient {
         Ok(())
     }
 
-    // Create a FaceTime session without ringing any participant AND without
-    // propping the bridge. Used by the portal-room !im facetime flow: session
-    // is allocated with Apple's quickrelay (so the join link is valid), but
-    // no cmd 207 fanout is sent. The contact's phone rings only when the
-    // caller's webview joins — that JoinEvent triggers maybe_fire_pending_ring,
-    // which calls ft.ring() (cmd 242 Invitation) with the queued targets.
+    // Create a FaceTime session for the portal-room !im facetime flow.
+    // Session is allocated with Apple's quickrelay (so the join link
+    // resolves) and the bridge is propped into the conversation so peer's
+    // iOS renders it as an active participant. The contact's phone does
+    // not ring until the caller's webview joins — the webview's JoinEvent
+    // triggers maybe_fire_pending_ring, which calls ft.ring() (cmd 242
+    // Invitation) with the queued targets.
     //
-    // Why no prop_up_conv at creation (attempt 8 of the phantom-tile hunt):
-    // prop_up_conv sends a cmd 207 ConversationParticipantDidJoinContext
-    // carrying the bridge as a participant with `video=Some(true),
-    // video_enabled=Some(false)` (facetime.rs:774). On outbound, creation
-    // happens when the caller first types `!im facetime` — potentially
-    // minutes before the webview actually taps Join. Peer's iOS sees the
-    // bridge-as-silent-participant wire, renders a phantom "not connected"
-    // tile, and keeps rendering it even after a later cmd 208 unprop
-    // because their handler at facetime.rs:1387-1403 only prunes `temp:`-
-    // prefixed participants from `session.members` (the bridge's handle
-    // is real, so it sticks). Prior revert history (commits 0c198ee3,
-    // 0639e55f, 1915c6d4) tried to evict the bridge *after* the prop by
-    // pruning members or sending RemoveMember — all regressed the call.
+    // Bridge-visibility mechanism (the "phantom tile" on peer's iOS):
+    //  - prop_up_conv(false) sends a cmd 207 ConversationParticipantDidJoinContext
+    //    to peer with the bridge as a participant (capability flags hardcoded
+    //    at facetime.rs:771-783, video=Some(true), video_enabled=Some(false)).
+    //    Peer's iOS inserts the bridge into session.participants and renders
+    //    a tile.
+    //  - When the webview self-joins via temp: cmd 207, both upstream's line
+    //    1315 auto-unprop and our fallback at ft_handle_with_join_recovery
+    //    fire an unprop cmd 208 that flips the bridge participant to
+    //    active=None on peer's side. iOS hides inactive tiles.
+    //  - maybe_fire_pending_ring then sends evict_bridge_from_peer_view
+    //    (custom cmd 209 RemoveMember with active_participants excluding
+    //    own handles) so peer's session.members drops the bridge entry
+    //    immediately instead of lingering for ~60s.
     //
-    // Skipping prop_up_conv here is safe because:
-    //  - ensure_allocations still registers the session with Apple's
-    //    quickrelay, so the pre-minted link resolves and the webview's
-    //    letmein lands on a valid session.
-    //  - Upstream's respond_letmein (facetime.rs:1078) only forces a prop
-    //    when `is_ringing_inaccurate && active_participants == 1`. On
-    //    outbound both are false, so respond_letmein skips the prop and
-    //    proceeds directly to add_members + LetMeInResponse. The OneOnOne-
-    //    exit workaround whose absence froze peer iOS in the 1915c6d4
-    //    revert is inbound-only (peer sent the Invitation, so
-    //    is_ringing_inaccurate flips true on our side).
-    //  - ft.ring() (maybe_fire_pending_ring) sends cmd 242 Invitation,
-    //    which creates peer's session entry and triggers her ring — no
-    //    participant insert, so peer never sees a bridge tile at all.
-    //  - Our own fallback at ft_handle_with_join_recovery:3460 and
-    //    upstream's line 1315 auto-unprop both guard on `is_propped`,
-    //    which stays false here — no stray cmd 208s.
+    // Why is_ringing_inaccurate starts false: prop_up_conv(ring=false)'s
+    // `!ring && is_ringing_inaccurate` branch diverts into a
+    // RespondedElsewhere send to own-devices. Leaving is_ringing_inaccurate
+    // false here suppresses that diversion at create time.
+    // maybe_fire_pending_ring flips it to true AFTER ft.ring() fires so
+    // upstream's missed-call detection (facetime.rs:1411) trips when the
+    // callee declines / times out.
+    //
+    // Why we stamp session.participants[bridge].active locally after prop:
+    // upstream's prop_up_conv only sets session.is_propped=true and fires
+    // the wire (facetime.rs:820), leaving our OWN participant's .active at
+    // None. respond_letmein's add_members (facetime.rs:934) builds its cmd
+    // 209 active_participants from `session.participants.filter_map(p.active)`,
+    // which would exclude us without the stamp. Peer's unpack_participants
+    // then wipes-and-restores and the bridge tile she got from our prop 207
+    // never comes back as active. Stamping a synthetic ConversationParticipant
+    // matching the prop wire's capability flags keeps us in add_members'
+    // active_participants until the genuine auto-unprop flips us inactive.
+    //
+    // Historical note: the TPP at _todo/FT-phantom-tile-learnings.md
+    // describes an earlier shape (no prop at create, post-ring RemoveMember
+    // with active_participants including self). That approach is preserved
+    // in commit 50473405 if needed to bisect.
     pub async fn create_session_no_ring(
         &self,
         group_id: String,
