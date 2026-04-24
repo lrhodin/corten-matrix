@@ -54,6 +54,16 @@ type IMConfig struct {
 	// If empty, the handle chosen during login is used.
 	PreferredHandle string `yaml:"preferred_handle"`
 
+	// FaceTimeProxyBase is the external base URL under which the bridge's
+	// FaceTime web-join proxy is reachable from user browsers, e.g.
+	// "https://imessage.bridges.beeper.com". Falls back to
+	// appservice.public_address if unset. Setting this to empty string
+	// (or leaving both unset) disables the proxy — ring notices will
+	// embed raw facetime.apple.com/join URLs, which work everywhere but
+	// leave the user clicking through a name form + Join button (see
+	// facetime_proxy.go for the full story).
+	FaceTimeProxyBase string `yaml:"facetime_proxy_base"`
+
 	// StatusKitShareOnStartup publishes share_status(available) once after
 	// StatusKit init completes. Peer iOS reciprocates with a reshare (which
 	// carries the key material needed to decrypt its subsequent presence
