@@ -213,12 +213,12 @@ var cmdFaceTimeRemoveMembers = &commands.FullHandler{
 // the binding incomplete and causes peer's UI to attribute media to the
 // bridge's IDS endpoint rather than the webview pseud.
 const (
-	ftLinkUsageNext             = "next"              // pre-minted outbound
-	ftLinkUsageCurrent          = "current"           // in-flight outbound
-	ftLinkUsageCurrentOld       = "current-old"       // prior outbound
-	ftLinkUsageNextIncomingCall = "nextincomingcall"  // pre-minted inbound
-	ftLinkUsageIncomingCall     = "incomingcall"      // in-flight inbound
-	ftLinkUsageIncomingCallOld  = "incomingcall-old"  // prior inbound
+	ftLinkUsageNext             = "next"             // pre-minted outbound
+	ftLinkUsageCurrent          = "current"          // in-flight outbound
+	ftLinkUsageCurrentOld       = "current-old"      // prior outbound
+	ftLinkUsageNextIncomingCall = "nextincomingcall" // pre-minted inbound
+	ftLinkUsageIncomingCall     = "incomingcall"     // in-flight inbound
+	ftLinkUsageIncomingCallOld  = "incomingcall-old" // prior inbound
 )
 
 // armBridgeFaceTimeCall does the Rust-side dance shared by the outbound
@@ -514,7 +514,13 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 	}
 	_ = sessionID
 
-	bare := stripIdentifierPrefix(target)
+	// Resolve the target's display name via the ghost store (same path the
+	// inbound ring notice uses for "Incoming FaceTime call from {name}"),
+	// falling back to the bare phone/email if no ghost name is known.
+	targetName := stripIdentifierPrefix(target)
+	if ghost, ghostErr := client.Main.Bridge.GetGhostByID(ce.Ctx, makeUserID(normalizeIdentifierForPortalID(target))); ghostErr == nil && ghost != nil && ghost.Name != "" {
+		targetName = ghost.Name
+	}
 
 	// One URL for everyone. facetime.apple.com is an Apple Universal Link:
 	// iOS / macOS intercept the domain and hand the URL off to the FaceTime
@@ -526,7 +532,7 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 			"[**🌐 Join FaceTime call**](%s)\n\n"+
 			"⚠️ **Tapping this link will ring %s's phone.** The ring fires the moment you join — open the link when you're ready to be on camera. If you don't tap within 60 seconds the session is dropped and nothing rings. Works on iOS, macOS, Android, Windows, and Linux.\n\n"+
 			"Raw URL: %s",
-		bare, webLink, bare, webLink,
+		targetName, webLink, targetName, webLink,
 	)
 	return true
 }
