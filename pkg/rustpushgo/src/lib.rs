@@ -3479,56 +3479,6 @@ async fn ft_handle_with_join_recovery(
             Some(id) => id.as_u64(),
             None => return upstream_result,
         };
-        // Stamp active=Some(synthetic) so subsequent cmd 209 fanouts from
-        // add_members / remove_members carry this joiner in
-        // active_participants (facetime.rs:934 collects from
-        // session.participants.filter_map(p.active)). Without this, peer's
-        // unpack_participants wipes the joiner to inactive on the next cmd
-        // 209 we send, collapsing video to audio-only on her side.
-        //
-        // Mirrors upstream's happy-path cmd 207 handling: when upstream's
-        // handle() processes the join successfully, it populates .active
-        // from the context.message ConversationParticipant. Our fallback
-        // here fires when Apple strips that field (the BadMsg case); we
-        // synthesize a matching participant so the post-recovery state
-        // converges on the same shape as the happy path.
-        //
-        // Load-bearing for inbound video: upstream returns BadMsg on
-        // inbound webview 207s (confirmed in logs), so recovery fires and
-        // this stamp is what keeps the webview's video active on peer's
-        // side after respond_letmein's add_members fans the cmd 209.
-        let synthetic_active = {
-            use rustpush::facetime::facetimep::{ConversationParticipant, Handle, HandleType};
-            let mut handle_proto = Handle::default();
-            if let Some(addr) = sender.strip_prefix("mailto:") {
-                handle_proto.set_type(HandleType::EmailAddress);
-                handle_proto.value = addr.to_string();
-            } else if let Some(phone) = sender.strip_prefix("tel:") {
-                handle_proto.set_type(HandleType::PhoneNumber);
-                handle_proto.value = phone.to_string();
-                handle_proto.iso_country_code = "us".to_string();
-            } else {
-                handle_proto.set_type(HandleType::Generic);
-                handle_proto.value = sender.clone();
-            }
-            Some(ConversationParticipant {
-                version: 0,
-                identifier: participant_id,
-                handle: Some(handle_proto),
-                avc_data: include_bytes!("../../../third_party/rustpush-upstream/src/sampleavcdata.bplist").to_vec(),
-                is_moments_available: Some(true),
-                is_screen_sharing_available: Some(true),
-                is_gondola_calling_available: Some(true),
-                is_mirage_available: None,
-                is_lightweight: None,
-                share_play_protocol_version: 4,
-                options: 0,
-                is_gft_downgrade_to_one_to_one_available: Some(false),
-                guest_mode_enabled: None,
-                association: None,
-                is_u_plus_n_downgrade_available: Some(false),
-            })
-        };
         session.participants.insert(
             participant_id.to_string(),
             rustpush::facetime::FTParticipant {
@@ -3536,7 +3486,7 @@ async fn ft_handle_with_join_recovery(
                 participant_id,
                 last_join_date: Some(ns_since_epoch / 1_000_000),
                 handle: sender.clone(),
-                active: synthetic_active,
+                active: None,
             },
         );
 
@@ -5581,10 +5531,87 @@ impl WrappedFaceTimeClient {
                 msg: format!("ensure_allocations failed: {:?}", e),
             })?;
 
+        // Prop the bridge so peer's iPhone renders it as an active participant.
+        // That "phantom" tile is what bootstraps peer's session.participants on
+        // her side; when the webview later joins with a temp: sender, upstream's
+        // auto-unprop at facetime.rs:1315 fires a cmd 208 that flips the bridge
+        // participant to active=None on peer's side. iOS hides inactive
+        // participants, so the tile disappears cleanly without disturbing the
+        // webview's own state (unlike a cmd 209 RemoveMember, which triggers
+        // unpack_participants' wipe-then-repopulate and collapses video).
+        //
+        // Mirrors inbound: respond_letmein's needs_prop branch
+        // (facetime.rs:1078) runs exactly this call, just triggered by peer's
+        // Invitation instead of our outbound arm.
+        self.inner
+            .prop_up_conv(session, false)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("prop_up_conv(ring=false) failed: {:?}", e),
+            })?;
+
+        // After prop_up_conv, upstream leaves our OWN participant's .active at
+        // None locally (it only sets is_propped=true and sends the wire — see
+        // facetime.rs:820). On outbound, respond_letmein's add_members runs
+        // AFTER our prop — and add_members builds its cmd 209 from
+        // `session.participants.values().filter_map(|p| p.active.clone())`
+        // (facetime.rs:934). With our own participant's .active still None,
+        // that list comes out empty and peer's unpack_participants wipes the
+        // bridge tile she just got from our prop 207 — then the webview tile
+        // never registers as active and iOS shows no one.
+        //
+        // Stamp .active on our own participant with a snapshot mirroring the
+        // capability fields upstream hardcodes in the prop_up_conv wire
+        // (facetime.rs:771-783). Subsequent add_members fanouts then carry
+        // us in active_participants and peer's state stays consistent until
+        // the genuine auto-unprop flips us inactive.
+        {
+            use rustpush::facetime::facetimep::{ConversationParticipant, Handle, HandleType};
+            fn handle_from_ids(ids: &str) -> Handle {
+                let mut h = Handle::default();
+                if let Some(addr) = ids.strip_prefix("mailto:") {
+                    h.set_type(HandleType::EmailAddress);
+                    h.value = addr.to_string();
+                } else if let Some(phone) = ids.strip_prefix("tel:") {
+                    h.set_type(HandleType::PhoneNumber);
+                    h.value = phone.to_string();
+                    h.iso_country_code = "us".to_string();
+                } else {
+                    h.set_type(HandleType::Generic);
+                    h.value = ids.to_string();
+                }
+                h
+            }
+
+            let my_token_b64 = base64_encode(&self.inner.conn.get_token().await);
+            if let Some(my_participant) = session
+                .participants
+                .values_mut()
+                .find(|p| p.token.as_deref() == Some(my_token_b64.as_str()))
+            {
+                my_participant.active = Some(ConversationParticipant {
+                    version: 0,
+                    identifier: my_participant.participant_id,
+                    handle: Some(handle_from_ids(&my_participant.handle)),
+                    avc_data: include_bytes!("../../../third_party/rustpush-upstream/src/sampleavcdata.bplist").to_vec(),
+                    is_moments_available: Some(true),
+                    is_screen_sharing_available: Some(true),
+                    is_gondola_calling_available: Some(true),
+                    is_mirage_available: None,
+                    is_lightweight: None,
+                    share_play_protocol_version: 4,
+                    options: 0,
+                    is_gft_downgrade_to_one_to_one_available: Some(false),
+                    guest_mode_enabled: None,
+                    association: None,
+                    is_u_plus_n_downgrade_available: Some(false),
+                });
+            }
+        }
+
         info!(
-            "FaceTime create_session_no_ring: allocated session {} with {} participant slot(s); skipping prop_up_conv to keep bridge out of peer's UI",
+            "FaceTime create_session_no_ring: allocated + propped session {}; bridge participant stamped active locally so add_members preserves it on the wire",
             group_id,
-            session.participants.len(),
         );
         Ok(())
     }
