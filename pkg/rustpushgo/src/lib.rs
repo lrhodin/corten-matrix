@@ -3260,6 +3260,34 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
                     );
                 }
             }
+
+            // Also remove the bridge from peer's session.members entirely so
+            // iOS drops the member entry immediately, not after the ~60s
+            // "member never joined" timeout. The unprop cmd 208 above only
+            // flipped active=None (iOS hides the tile visually); cmd 208's
+            // handler at facetime.rs:1399 doesn't prune non-temp members
+            // from session.members, so the bridge would linger as a member
+            // record otherwise.
+            let own_handles: Vec<String> = session.my_handles.clone();
+            let to_remove: Vec<rustpush::facetime::FTMember> = session
+                .members
+                .iter()
+                .filter(|m| own_handles.contains(&m.handle))
+                .cloned()
+                .collect();
+            if !to_remove.is_empty() {
+                match evict_bridge_from_peer_view(ft, session, &to_remove).await {
+                    Ok(()) => info!(
+                        "pending ring: evicted bridge from session {} members via cmd 209 RemoveMember",
+                        guid
+                    ),
+                    Err(e) => warn!(
+                        "pending ring: RemoveMember fanout failed for session {}: {:?} — peer's UI will clear after its own ~60s timeout",
+                        guid, e
+                    ),
+                }
+                session.members.retain(|m| !own_handles.contains(&m.handle));
+            }
         }
     }
 }
@@ -3317,13 +3345,17 @@ async fn evict_bridge_from_peer_view(
     message.set_type(ConversationMessageType::RemoveMember);
     message.conversation_group_uuid_string = session.group_id.clone();
     message.removed_members = remove.iter().map(ft_member_to_conversation).collect();
-    // Preserve every currently-active participant so peer's wipe-then-
-    // repopulate in unpack_participants doesn't drop the webview (or peer
-    // herself) from the call. This mirrors what add_members does at
-    // facetime.rs:934 for the join direction.
+    // Preserve every currently-active participant EXCEPT our own handles
+    // so peer's unpack_participants (facetime.rs:245-258) wipes the bridge
+    // to inactive (reinforcing the auto-unprop cmd 208 that already went
+    // out) while re-promoting the webview and peer herself. If we included
+    // ourselves here, the wipe-then-restore would re-activate the bridge
+    // and undo the unprop we just did.
+    let own_handles: Vec<String> = session.my_handles.clone();
     message.active_participants = session
         .participants
         .values()
+        .filter(|p| !own_handles.contains(&p.handle))
         .filter_map(|p| p.active.clone())
         .collect();
     message.link = session.link.clone();
@@ -3552,6 +3584,44 @@ async fn ft_handle_with_join_recovery(
             Some(id) => id.as_u64(),
             None => return upstream_result,
         };
+        // Stamp active=Some(synthetic) so subsequent cmd 209 fanouts from
+        // add_members / remove_members carry this joiner in
+        // active_participants (facetime.rs:934 collects from
+        // session.participants.filter_map(p.active)). Without this, peer's
+        // unpack_participants wipes the joiner to inactive on the next cmd
+        // 209 we send, collapsing video on her side.
+        let synthetic_active = {
+            use rustpush::facetime::facetimep::{ConversationParticipant, Handle, HandleType};
+            let mut handle_proto = Handle::default();
+            if let Some(addr) = sender.strip_prefix("mailto:") {
+                handle_proto.set_type(HandleType::EmailAddress);
+                handle_proto.value = addr.to_string();
+            } else if let Some(phone) = sender.strip_prefix("tel:") {
+                handle_proto.set_type(HandleType::PhoneNumber);
+                handle_proto.value = phone.to_string();
+                handle_proto.iso_country_code = "us".to_string();
+            } else {
+                handle_proto.set_type(HandleType::Generic);
+                handle_proto.value = sender.clone();
+            }
+            Some(ConversationParticipant {
+                version: 0,
+                identifier: participant_id,
+                handle: Some(handle_proto),
+                avc_data: include_bytes!("../../../third_party/rustpush-upstream/src/sampleavcdata.bplist").to_vec(),
+                is_moments_available: Some(true),
+                is_screen_sharing_available: Some(true),
+                is_gondola_calling_available: Some(true),
+                is_mirage_available: None,
+                is_lightweight: None,
+                share_play_protocol_version: 4,
+                options: 0,
+                is_gft_downgrade_to_one_to_one_available: Some(false),
+                guest_mode_enabled: None,
+                association: None,
+                is_u_plus_n_downgrade_available: Some(false),
+            })
+        };
         session.participants.insert(
             participant_id.to_string(),
             rustpush::facetime::FTParticipant {
@@ -3559,7 +3629,7 @@ async fn ft_handle_with_join_recovery(
                 participant_id,
                 last_join_date: Some(ns_since_epoch / 1_000_000),
                 handle: sender.clone(),
-                active: None,
+                active: synthetic_active,
             },
         );
 
