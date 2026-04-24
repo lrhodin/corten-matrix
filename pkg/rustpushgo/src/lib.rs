@@ -3479,6 +3479,56 @@ async fn ft_handle_with_join_recovery(
             Some(id) => id.as_u64(),
             None => return upstream_result,
         };
+        // Stamp active=Some(synthetic) so subsequent cmd 209 fanouts from
+        // add_members / remove_members carry this joiner in
+        // active_participants (facetime.rs:934 collects from
+        // session.participants.filter_map(p.active)). Without this, peer's
+        // unpack_participants wipes the joiner to inactive on the next cmd
+        // 209 we send, collapsing video to audio-only on her side.
+        //
+        // Mirrors upstream's happy-path cmd 207 handling: when upstream's
+        // handle() processes the join successfully, it populates .active
+        // from the context.message ConversationParticipant. Our fallback
+        // here fires when Apple strips that field (the BadMsg case); we
+        // synthesize a matching participant so the post-recovery state
+        // converges on the same shape as the happy path.
+        //
+        // Load-bearing for inbound video: upstream returns BadMsg on
+        // inbound webview 207s (confirmed in logs), so recovery fires and
+        // this stamp is what keeps the webview's video active on peer's
+        // side after respond_letmein's add_members fans the cmd 209.
+        let synthetic_active = {
+            use rustpush::facetime::facetimep::{ConversationParticipant, Handle, HandleType};
+            let mut handle_proto = Handle::default();
+            if let Some(addr) = sender.strip_prefix("mailto:") {
+                handle_proto.set_type(HandleType::EmailAddress);
+                handle_proto.value = addr.to_string();
+            } else if let Some(phone) = sender.strip_prefix("tel:") {
+                handle_proto.set_type(HandleType::PhoneNumber);
+                handle_proto.value = phone.to_string();
+                handle_proto.iso_country_code = "us".to_string();
+            } else {
+                handle_proto.set_type(HandleType::Generic);
+                handle_proto.value = sender.clone();
+            }
+            Some(ConversationParticipant {
+                version: 0,
+                identifier: participant_id,
+                handle: Some(handle_proto),
+                avc_data: include_bytes!("../../../third_party/rustpush-upstream/src/sampleavcdata.bplist").to_vec(),
+                is_moments_available: Some(true),
+                is_screen_sharing_available: Some(true),
+                is_gondola_calling_available: Some(true),
+                is_mirage_available: None,
+                is_lightweight: None,
+                share_play_protocol_version: 4,
+                options: 0,
+                is_gft_downgrade_to_one_to_one_available: Some(false),
+                guest_mode_enabled: None,
+                association: None,
+                is_u_plus_n_downgrade_available: Some(false),
+            })
+        };
         session.participants.insert(
             participant_id.to_string(),
             rustpush::facetime::FTParticipant {
@@ -3486,7 +3536,7 @@ async fn ft_handle_with_join_recovery(
                 participant_id,
                 last_join_date: Some(ns_since_epoch / 1_000_000),
                 handle: sender.clone(),
-                active: None,
+                active: synthetic_active,
             },
         );
 
