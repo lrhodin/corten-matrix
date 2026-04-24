@@ -237,7 +237,7 @@ func armBridgeFaceTimeCall(
 	callerHandle string,
 	targetHandle string,
 	ringTTLSecs uint64,
-	proxy *faceTimeProxy,
+	displayName string,
 ) (webLink string, sessionID string, err error) {
 	sessionID, err = newFaceTimeSessionID()
 	if err != nil {
@@ -295,14 +295,7 @@ func armBridgeFaceTimeCall(
 		}
 	}()
 
-	link = appendFaceTimeLinkName(link, stripIdentifierPrefix(callerHandle))
-	// Wrap the raw facetime.apple.com link with the bridge's proxy if the
-	// proxy endpoint is live. The proxy preserves the fragment and serves
-	// a patched main.js that auto-submits the name and clicks Join — OB's
-	// convention, see facetime_proxy.go. iOS/macOS UAs are 302-redirected
-	// back to the raw URL so native FaceTime.app Universal Link handling
-	// kicks in.
-	link = proxy.buildLink(link)
+	link = appendFaceTimeLinkName(link, displayName)
 	return link, sessionID, nil
 }
 
@@ -329,6 +322,33 @@ func appendFaceTimeLinkName(link, name string) string {
 		return link + "&n=" + encoded
 	}
 	return link + "#n=" + encoded
+}
+
+// resolveFaceTimeDisplayName returns the value to stamp into the FaceTime
+// web join link's `n=` fragment so the recipient sees a real name instead
+// of a raw phone number on the peer's incoming-call UI. Preference order:
+//  1. `facetime_display_name` config override (per-user escape hatch),
+//  2. the logged-in bridge user's Matrix displayname (resolved from their
+//     management-room member event),
+//  3. the bare iMessage handle as a last-resort fallback.
+func (c *IMClient) resolveFaceTimeDisplayName(ctx context.Context) string {
+	if override := strings.TrimSpace(c.Main.Config.FaceTimeDisplayName); override != "" {
+		return override
+	}
+	if c.UserLogin != nil && c.UserLogin.User != nil && c.UserLogin.User.MXID != "" {
+		if mgmt, err := c.UserLogin.User.GetManagementRoom(ctx); err == nil && mgmt != "" {
+			if info, err := c.Main.Bridge.Matrix.GetMemberInfo(ctx, mgmt, c.UserLogin.User.MXID); err == nil && info != nil {
+				if name := strings.TrimSpace(info.Displayname); name != "" {
+					return name
+				}
+			}
+		}
+		// Member event existed but carried no displayname, or the AS state
+		// store doesn't have an entry for this user yet. Log once so the
+		// user has a breadcrumb to set `facetime_display_name` in config.
+		c.UserLogin.Log.Debug().Msg("FaceTime display-name lookup fell through to handle; set facetime_display_name in config to override")
+	}
+	return stripIdentifierPrefix(c.handle)
 }
 
 // retryOnAPNsFlap retries an APNs-dependent operation up to three times
@@ -382,8 +402,7 @@ func fnFaceTime(ce *commands.Event) {
 			go func(h string) {
 				_ = rotateOutboundLink(ft, h)
 			}(handle)
-			link = appendFaceTimeLinkName(link, stripIdentifierPrefix(handle))
-			link = client.Main.ftProxy.buildLink(link)
+			link = appendFaceTimeLinkName(link, client.resolveFaceTimeDisplayName(ce.Ctx))
 			ce.Reply("FaceTime link for **%s**: %s\n\nShare this link to start a FaceTime call. Use `!im facetime-clear` to revoke it.", handle, link)
 			return
 		}
@@ -487,7 +506,7 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		return true
 	}
 
-	webLink, sessionID, err := armBridgeFaceTimeCall(ft, client.handle, target, 60, client.Main.ftProxy)
+	webLink, sessionID, err := armBridgeFaceTimeCall(ft, client.handle, target, 60, client.resolveFaceTimeDisplayName(ce.Ctx))
 	if err != nil {
 		switch {
 		case isNonRetryableResourceClosed(err):
@@ -572,8 +591,7 @@ func fnFaceTimeSend(ce *commands.Event) {
 	go func() {
 		_ = rotateOutboundLink(ft, client.handle)
 	}()
-	link = appendFaceTimeLinkName(link, stripIdentifierPrefix(client.handle))
-	link = client.Main.ftProxy.buildLink(link)
+	link = appendFaceTimeLinkName(link, client.resolveFaceTimeDisplayName(ce.Ctx))
 
 	conv := client.portalToConversation(ce.Portal)
 	if _, sendErr := client.client.SendMessage(conv, link, nil, client.handle, nil, nil, nil); sendErr != nil {

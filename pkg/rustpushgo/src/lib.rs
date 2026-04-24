@@ -3226,6 +3226,11 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
                         guid
                     );
                 }
+            } else {
+                info!(
+                    "pending ring: session {} was never propped — no unprop needed (expected on outbound post-prop-skip)",
+                    guid
+                );
             }
         }
     }
@@ -5394,21 +5399,44 @@ impl WrappedFaceTimeClient {
         Ok(())
     }
 
-    // Create a FaceTime session without ringing any participant. Used by the
-    // portal-room !im facetime flow: session is allocated + registered with
-    // Apple's relay (so the join link is valid), but no Invitation wire is
-    // fanned out. The contact's phone rings only when the caller taps the
-    // link — that JoinEvent triggers maybe_fire_pending_ring which calls
-    // ft.ring() with the queued targets.
+    // Create a FaceTime session without ringing any participant AND without
+    // propping the bridge. Used by the portal-room !im facetime flow: session
+    // is allocated with Apple's quickrelay (so the join link is valid), but
+    // no cmd 207 fanout is sent. The contact's phone rings only when the
+    // caller's webview joins — that JoinEvent triggers maybe_fire_pending_ring,
+    // which calls ft.ring() (cmd 242 Invitation) with the queued targets.
     //
-    // Difference from create_session:
-    // - is_ringing_inaccurate starts false, so prop_up_conv's !ring branch
-    //   doesn't divert into RespondedElsewhere (facetime.rs:708).
-    // - prop_up_conv(session, false) so the wire message carries no
-    //   ConversationMessageType::Invitation on any target (facetime.rs:759).
+    // Why no prop_up_conv at creation (attempt 8 of the phantom-tile hunt):
+    // prop_up_conv sends a cmd 207 ConversationParticipantDidJoinContext
+    // carrying the bridge as a participant with `video=Some(true),
+    // video_enabled=Some(false)` (facetime.rs:774). On outbound, creation
+    // happens when the caller first types `!im facetime` — potentially
+    // minutes before the webview actually taps Join. Peer's iOS sees the
+    // bridge-as-silent-participant wire, renders a phantom "not connected"
+    // tile, and keeps rendering it even after a later cmd 208 unprop
+    // because their handler at facetime.rs:1387-1403 only prunes `temp:`-
+    // prefixed participants from `session.members` (the bridge's handle
+    // is real, so it sticks). Prior revert history (commits 0c198ee3,
+    // 0639e55f, 1915c6d4) tried to evict the bridge *after* the prop by
+    // pruning members or sending RemoveMember — all regressed the call.
     //
-    // Net effect on Apple's side: session allocated + propped (state=live)
-    // but nobody's device rings.
+    // Skipping prop_up_conv here is safe because:
+    //  - ensure_allocations still registers the session with Apple's
+    //    quickrelay, so the pre-minted link resolves and the webview's
+    //    letmein lands on a valid session.
+    //  - Upstream's respond_letmein (facetime.rs:1078) only forces a prop
+    //    when `is_ringing_inaccurate && active_participants == 1`. On
+    //    outbound both are false, so respond_letmein skips the prop and
+    //    proceeds directly to add_members + LetMeInResponse. The OneOnOne-
+    //    exit workaround whose absence froze peer iOS in the 1915c6d4
+    //    revert is inbound-only (peer sent the Invitation, so
+    //    is_ringing_inaccurate flips true on our side).
+    //  - ft.ring() (maybe_fire_pending_ring) sends cmd 242 Invitation,
+    //    which creates peer's session entry and triggers her ring — no
+    //    participant insert, so peer never sees a bridge tile at all.
+    //  - Our own fallback at ft_handle_with_join_recovery:3460 and
+    //    upstream's line 1315 auto-unprop both guard on `is_propped`,
+    //    which stays false here — no stray cmd 208s.
     pub async fn create_session_no_ring(
         &self,
         group_id: String,
@@ -5457,12 +5485,12 @@ impl WrappedFaceTimeClient {
             .map_err(|e| WrappedError::GenericError {
                 msg: format!("ensure_allocations failed: {:?}", e),
             })?;
-        self.inner
-            .prop_up_conv(session, false)
-            .await
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("prop_up_conv(ring=false) failed: {:?}", e),
-            })?;
+
+        info!(
+            "FaceTime create_session_no_ring: allocated session {} with {} participant slot(s); skipping prop_up_conv to keep bridge out of peer's UI",
+            group_id,
+            session.participants.len(),
+        );
         Ok(())
     }
 
