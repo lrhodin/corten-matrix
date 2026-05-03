@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/rs/zerolog"
 
@@ -32,12 +33,20 @@ func runCardDAVSetup() {
 	password := fs.String("password", "", "App password for CardDAV authentication")
 	username := fs.String("username", "", "Username (defaults to email if empty)")
 	url := fs.String("url", "", "CardDAV URL (skip auto-discovery)")
+	stripSpaces := fs.Bool("strip-spaces", false, "Strip spaces from password (for Google app passwords)")
 
 	fs.Parse(os.Args[2:])
 
 	if *email == "" || *password == "" {
-		fmt.Fprintln(os.Stderr, "Usage: carddav-setup --email <email> --password <password> [--username <user>] [--url <url>]")
+		fmt.Fprintln(os.Stderr, "Usage: carddav-setup --email <email> --password <password> [--username <user>] [--url <url>] [--strip-spaces]")
 		os.Exit(1)
+	}
+
+	cleanPassword := *password
+	if *stripSpaces {
+		// Google app passwords are displayed with spaces (e.g. "abcd efgh ijkl mnop").
+		// Strip them so users can paste as-is without auth failures.
+		cleanPassword = strings.ReplaceAll(cleanPassword, " ", "")
 	}
 
 	log := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr}).With().Timestamp().Logger()
@@ -51,7 +60,7 @@ func runCardDAVSetup() {
 	discoveredURL := *url
 	if discoveredURL == "" {
 		var err error
-		discoveredURL, err = connector.DiscoverCardDAVURL(*email, effectiveUsername, *password, log)
+		discoveredURL, err = connector.DiscoverCardDAVURL(*email, effectiveUsername, cleanPassword, log)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: CardDAV auto-discovery failed: %v\n", err)
 			os.Exit(1)
@@ -60,7 +69,7 @@ func runCardDAVSetup() {
 	}
 
 	// Encrypt the password
-	encrypted, err := connector.EncryptCardDAVPassword(*password)
+	encrypted, err := connector.EncryptCardDAVPassword(cleanPassword)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to encrypt password: %v\n", err)
 		os.Exit(1)

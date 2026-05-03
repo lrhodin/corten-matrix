@@ -400,7 +400,7 @@ open('$CONFIG', 'w').write(text)
             case "$CONTACT_CHOICE" in
                 2)
                     CARDDAV_URL="https://www.googleapis.com/carddav/v1/principals/$CARDDAV_EMAIL/lists/default/"
-                    echo "  Note: Use a Google App Password, without spaces (https://myaccount.google.com/apppasswords)"
+                    echo "  Note: Use a Google App Password (https://myaccount.google.com/apppasswords)"
                     ;;
                 3)
                     CARDDAV_URL="https://carddav.fastmail.com/dav/addressbooks/user/$CARDDAV_EMAIL/Default/"
@@ -430,6 +430,9 @@ open('$CONFIG', 'w').write(text)
 
             # Encrypt password and patch config
             CARDDAV_ARGS="--email $CARDDAV_EMAIL --password $CARDDAV_PASSWORD --url $CARDDAV_URL"
+            if [ "$CONTACT_CHOICE" = "2" ]; then
+                CARDDAV_ARGS="$CARDDAV_ARGS --strip-spaces"
+            fi
             if [ -n "$CARDDAV_USERNAME" ]; then
                 CARDDAV_ARGS="$CARDDAV_ARGS --username $CARDDAV_USERNAME"
             fi
