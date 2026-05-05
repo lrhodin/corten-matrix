@@ -74,6 +74,16 @@ The four install scripts dominate the line count (104 occurrences of 207). Most 
 
 **Counts include `mautrix-imessage`, `mautrix-imessage-v2`, and `com.lrhodin.mautrix-imessage` together** (any string containing `mautrix-imessage`).
 
+### Are any of these actually references to other things, not our own naming?
+
+Checked the three plausible sources of false positives:
+
+1. **`mautrix-go` library (the bridgev2 framework).** Imported as `maunium.net/go/mautrix` in `go.mod`. The grep is scoped to the literal `mautrix-imessage` (with `-imessage`), which does not match `maunium.net/go/mautrix` — so library imports are **not in the 207**.
+2. **Upstream `mautrix-imessage` project** (`github.com/mautrix/imessage`). Grepped the tree for `github.com/mautrix/imessage` — **zero matches**. There are no in-tree references to the upstream as a project.
+3. **"Fork of / based on / upstream" prose mentions of `mautrix-imessage`.** Grepped — only matches are in this TPP itself. None in `README.md` or any other source/doc file.
+
+**Conclusion: every one of the 207 occurrences is our own self-naming** — our binary, our app bundle, our paths, our systemd/launchd unit, our app-metadata strings, our README's own setup instructions, our shell-rc marker comments, our Go file-header boilerplate. Renaming them is a self-contained edit; no occurrence is a factual reference to anything external that we'd want to preserve.
+
 ---
 
 ## Decisions (load-bearing — read before changing the plan)
