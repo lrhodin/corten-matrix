@@ -92,8 +92,13 @@ The four install scripts dominate the line count (104 occurrences of 207). Most 
 | Release tarballs | `mautrix-imessage-v2-{os}-{arch}.tar.gz` | `rustpush-matrix-{os}-{arch}.tar.gz` |
 
 ### What does NOT change (and why)
+
+> **Important distinction up front: `mautrix-go` ≠ `mautrix-imessage`.**
+> `mautrix-go` (`maunium.net/go/mautrix`, including the `bridgev2` framework we build on) is an **upstream library we depend on**. It is *not* part of this bridge's brand and is *not* being renamed, vendored, or replaced. We are renaming the bridge built *on top of* `mautrix-go`. Every `import "maunium.net/go/mautrix/..."` line stays verbatim. The 207-occurrence surface-area count was produced by grepping the literal string `mautrix-imessage` (i.e. with `-imessage`); it does not include any `mautrix-go` references. If a future scope decision ever revisits this assumption, it would be a separate, much larger effort (replacing the framework, not renaming a fork).
+
 | Identifier | Why it stays |
 |---|---|
+| `mautrix-go` library imports | External dep we use (the bridgev2 framework). Not our brand. Not in scope. |
 | `BeeperBridgeType: "imessagego"` | Beeper-side identifier. Changing orphans every Beeper-hosted bridge. |
 | `NetworkID: "imessage"` | Used as portal/ghost ID prefix. Changing rewrites every room and breaks every existing portal mapping. |
 | `DisplayName: "iMessage"` | Already the user-visible network name. Has nothing to do with the `mautrix` brand. |
