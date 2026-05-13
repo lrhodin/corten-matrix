@@ -1359,10 +1359,12 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		// the full ghost object for participants who aren't in the address book).
 		localID := stripIdentifierPrefix(string(g.id))
 		if localID == "" {
+			log.Warn().Str("ghost_id", string(g.id)).Msg("empty ghost id")
 			continue
 		}
 		contact, _ := c.contacts.GetContactInfo(localID)
 		if contact == nil || !contact.HasName() {
+			log.Warn().Str("ghost_id", string(g.id)).Msg("contact lookup returned nil entry or values")
 			continue
 		}
 		// Diff-gate: compute the expected displayname and skip if it matches
@@ -1376,6 +1378,7 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 			ID:        localID,
 		})
 		if g.name == expectedName {
+			log.Debug().Str("ghost_id", string(g.id)).Msg("ghost name already matches expected name")
 			continue
 		}
 		ghost, err := c.Main.Bridge.GetGhostByID(ctx, g.id)
@@ -1387,6 +1390,7 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		// to ensure name, avatar, and identifiers are all propagated to Matrix.
 		info, err := c.GetUserInfo(ctx, ghost)
 		if err != nil || info == nil {
+			log.Warn().Err(err).Str("ghost_id", string(g.id)).Msg("unable to fetch ghost info")
 			continue
 		}
 		ghost.UpdateInfo(ctx, info)
