@@ -21,24 +21,30 @@ State lives on a bind mount you control. The image lives at `ghcr.io/lrhodin/ime
 
 ### Step 1 — Install the host CLI
 
+One line:
+
 ```bash
-curl -L https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/imessage \
-    | sudo install /dev/stdin /usr/local/bin/imessage
+curl -fsSL https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/install-imessage.sh | sudo bash
 ```
 
-`/usr/local/bin` is on `$PATH` for every user on every standard Linux distro, so no shell config changes are needed. Verify with:
+The installer downloads the `imessage` script, drops it at `/usr/local/bin/imessage` (on `$PATH` by default on every standard Linux distro), verifies it's actually executable, and prints the next step. Idempotent — re-run any time to update to the latest version.
+
+Verify:
 
 ```bash
 imessage help
 ```
 
-That should print the list of subcommands. If you instead get `imessage: command not found`:
+If you get `command not found`, open a new terminal — your current shell may have cached the old PATH. If it still doesn't work, the installer will have already printed the fix (typically adding `/usr/local/bin` to your shell rc on a stripped-down distro).
 
-- Open a new shell — your current shell may have cached the old PATH. `hash -r` (bash) / `rehash` (zsh) also flushes the cache.
-- Confirm the script landed where it should: `ls -l /usr/local/bin/imessage` (should show `-rwxr-xr-x ... root root`).
-- Confirm `/usr/local/bin` is on PATH: `echo "$PATH" | tr ':' '\n' | grep /usr/local/bin`. If empty, add it to your shell rc: `echo 'export PATH="/usr/local/bin:$PATH"' >> ~/.bashrc` (or `~/.zshrc`).
+To uninstall: `sudo rm /usr/local/bin/imessage`.
 
-To update the CLI later, re-run the same `curl … install` line. To uninstall: `sudo rm /usr/local/bin/imessage`.
+> Prefer to inspect the installer before running it? Download and read first:
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/install-imessage.sh -o install-imessage.sh
+> less install-imessage.sh
+> sudo bash install-imessage.sh
+> ```
 
 ### Step 2 — Drop in a compose file
 
@@ -131,8 +137,7 @@ If you already have a bare-Linux install (the systemd-unit + `~/.local/share/mau
 Same as the fresh-install Step 1:
 
 ```bash
-curl -L https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/imessage \
-    | sudo install /dev/stdin /usr/local/bin/imessage
+curl -fsSL https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/install-imessage.sh | sudo bash
 ```
 
 ### Step 2 — Run the migration helper

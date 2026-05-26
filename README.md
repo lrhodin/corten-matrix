@@ -197,13 +197,11 @@ The Docker path bundles the same binary (built with `make build` so all rustpush
 Two one-liners to install — the image lives in GHCR, and a small `imessage` host CLI ships alongside it:
 
 ```bash
-# Install the host CLI (one line, always on PATH).
-curl -L https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/imessage \
-    | sudo install /dev/stdin /usr/local/bin/imessage
+# Install the host CLI — one line, drops `imessage` at /usr/local/bin (on PATH by default).
+curl -fsSL https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/install-imessage.sh | sudo bash
 
 # Drop in a compose file, then start + run setup.
-curl -L https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose.example.yml \
-    -o docker-compose.yml
+curl -fsSL https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose.example.yml -o docker-compose.yml
 # Edit docker-compose.yml: set BEEPER to "true" (Beeper) or "false" (self-hosted).
 imessage start
 imessage setup
