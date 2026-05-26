@@ -26,11 +26,17 @@ curl -L https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/imessa
     | sudo install /dev/stdin /usr/local/bin/imessage
 ```
 
-That puts `imessage` on `$PATH` for every user on the host. To verify:
+`/usr/local/bin` is on `$PATH` for every user on every standard Linux distro, so no shell config changes are needed. Verify with:
 
 ```bash
 imessage help
 ```
+
+That should print the list of subcommands. If you instead get `imessage: command not found`:
+
+- Open a new shell — your current shell may have cached the old PATH. `hash -r` (bash) / `rehash` (zsh) also flushes the cache.
+- Confirm the script landed where it should: `ls -l /usr/local/bin/imessage` (should show `-rwxr-xr-x ... root root`).
+- Confirm `/usr/local/bin` is on PATH: `echo "$PATH" | tr ':' '\n' | grep /usr/local/bin`. If empty, add it to your shell rc: `echo 'export PATH="/usr/local/bin:$PATH"' >> ~/.bashrc` (or `~/.zshrc`).
 
 To update the CLI later, re-run the same `curl … install` line. To uninstall: `sudo rm /usr/local/bin/imessage`.
 
@@ -90,16 +96,6 @@ Then you'll be asked about CardDAV (if applicable), preferred handle, and the op
 
 When the wizard finishes, the container detects the new `config.yaml` and starts the bridge automatically. `imessage logs` should now show the bridge running. Go send yourself an iMessage to confirm the round trip.
 
-### Step 6 (optional) — Install shell aliases
-
-If you'd prefer typing `start-imessage` instead of `imessage start`, the CLI can drop the same alias block the bare-Linux installer uses into your shell rc file:
-
-```bash
-imessage install-aliases
-```
-
-This auto-detects bash vs zsh from `$SHELL` and writes to `~/.bashrc` or `~/.zshrc`. Open a new terminal (or `source` the rc file) to pick the aliases up. To remove them: `imessage uninstall-aliases`.
-
 ---
 
 ## Day-to-day operations
@@ -115,6 +111,7 @@ This auto-detects bash vs zsh from `$SHELL` and writes to `~/.bashrc` or `~/.zsh
 | Re-run the iMessage login flow | `imessage login` |
 | Re-run setup (flip a toggle) | `imessage setup` |
 | Open a debug shell inside | `imessage shell` |
+| Run `bbctl` (Beeper bridge-manager) | `imessage bbctl <args>` |
 
 If you keep your compose file somewhere other than the current directory, set `IMESSAGE_COMPOSE_FILE`:
 

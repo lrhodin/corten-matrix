@@ -39,6 +39,8 @@ DAILY
     logs            Tail bridge logs (`docker logs -f Rustpush-Matrix`).
     status          Show whether the bridge container is running.
     shell           Open a bash shell inside the container (debugging).
+    bbctl <args>    Run bbctl inside the container with the given args.
+                    e.g. `imessage bbctl whoami`, `imessage bbctl logout`.
 
 LIFECYCLE
     start           docker compose up -d
@@ -53,11 +55,6 @@ ONE-TIME
                     stop+disable+remove the systemd unit, leave your
                     state at ~/.local/share/mautrix-imessage in place.
                     Then run `imessage start` and `imessage setup`.
-    install-aliases Same shell shortcuts the bare-Linux installer ships
-                    (start/stop/restart/imessage-log), pointed at this
-                    CLI instead. Useful if you want `start-imessage` etc.
-                    Idempotent; re-run to refresh.
-    uninstall-aliases  Remove the alias block written by install-aliases.
 
 ENV
     IMESSAGE_CONTAINER      Container name (default: Rustpush-Matrix).
@@ -114,18 +111,6 @@ strip_marker_block() {
     return 1
 }
 
-# install_marker_block <rc-file> <body-string>
-# Idempotent: strips any existing block before writing.
-install_marker_block() {
-    local rc="$1" body="$2"
-    strip_marker_block "$rc" || true
-    {
-        echo "$MARKER_START"
-        printf '%s\n' "$body"
-        echo "$MARKER_END"
-    } >> "$rc"
-}
-
 # ── commands ────────────────────────────────────────────────────────────────
 
 cmd_setup()   { exec docker exec -it "$CONTAINER" imessage-setup "$@"; }
@@ -133,6 +118,7 @@ cmd_login()   { exec docker exec -it "$CONTAINER" /entrypoint.sh login "$@"; }
 cmd_logs()    { exec docker logs -f "$CONTAINER"; }
 cmd_shell()   { exec docker exec -it "$CONTAINER" bash; }
 cmd_status()  { docker ps --filter "name=^${CONTAINER}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'; }
+cmd_bbctl()   { exec docker exec -it "$CONTAINER" bbctl "$@"; }
 
 cmd_start()   { compose up -d; }
 cmd_stop()    { compose stop "$CONTAINER"; }
@@ -201,45 +187,6 @@ Next:
 EOF
 }
 
-cmd_install_aliases() {
-    local body
-    body=$(cat <<'EOF'
-alias imessage-setup='imessage setup'
-alias imessage-logs='imessage logs'
-alias start-imessage='imessage start'
-alias stop-imessage='imessage stop'
-alias restart-imessage='imessage restart'
-EOF
-)
-    local rcs touched=0
-    rcs=$(detect_rc_files)
-    if [ -z "$rcs" ]; then
-        echo "error: no recognized shell rc file found." >&2
-        echo "  Tried ~/.bashrc and ~/.zshrc based on \$SHELL=$SHELL." >&2
-        echo "  Add your shell rc manually if it's something else." >&2
-        exit 1
-    fi
-    while IFS= read -r rc; do
-        [ -z "$rc" ] && continue
-        install_marker_block "$rc" "$body"
-        echo "✓ Installed aliases in $rc"
-        touched=1
-    done <<< "$rcs"
-    [ "$touched" -eq 1 ] && echo "Open a new terminal or 'source' your rc file to pick them up."
-}
-
-cmd_uninstall_aliases() {
-    local touched=0
-    while IFS= read -r rc; do
-        [ -z "$rc" ] && continue
-        if strip_marker_block "$rc"; then
-            echo "✓ Removed aliases from $rc"
-            touched=1
-        fi
-    done < <(detect_rc_files)
-    [ "$touched" -eq 0 ] && echo "✓ No managed-alias block found — nothing to remove."
-}
-
 # ── dispatch ────────────────────────────────────────────────────────────────
 
 cmd="${1:-}"
@@ -251,14 +198,13 @@ case "$cmd" in
     logs)               cmd_logs "$@" ;;
     shell)              cmd_shell "$@" ;;
     status)             cmd_status "$@" ;;
+    bbctl)              cmd_bbctl "$@" ;;
     start)              cmd_start "$@" ;;
     stop)               cmd_stop "$@" ;;
     restart)            cmd_restart "$@" ;;
     pull)               cmd_pull "$@" ;;
     update)             cmd_update "$@" ;;
     migrate)            cmd_migrate "$@" ;;
-    install-aliases)    cmd_install_aliases "$@" ;;
-    uninstall-aliases)  cmd_uninstall_aliases "$@" ;;
     ""|help|-h|--help)  usage ;;
     *)                  echo "error: unknown command '$cmd'" >&2; usage >&2; exit 2 ;;
 esac
