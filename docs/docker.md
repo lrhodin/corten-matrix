@@ -69,16 +69,18 @@ Open it in your editor:
    ```
 
    - `/data` holds bridge state (`config.yaml`, `mautrix-imessage.db`, `session.json`, `trustedpeers.plist`, …). Path matches bare-Linux's `~/.local/share/mautrix-imessage/`, so migrating in either direction is a no-copy operation.
-   - `/home/bridge/.config/bridge-manager` holds `bbctl`'s Beeper auth — same path bare-Linux puts it at (`~/.config/bridge-manager/`). Kept separate from bridge state on purpose: a bare-Linux user migrating their existing `~/.config/bridge-manager/` keeps their Beeper login, and `imessage bbctl logout` doesn't touch bridge state.
+   - `/home/bridge/.config/bridge-manager` holds `bbctl`'s Beeper auth — same path bare-Linux on Linux puts it at (`~/.config/bridge-manager/`). Kept separate from bridge state on purpose: a bare-Linux user migrating their existing `~/.config/bridge-manager/` keeps their Beeper login, and `imessage bbctl logout` doesn't touch bridge state.
 
    For non-default platforms, change the left side of each line:
 
-   | Platform | Bridge state path | bbctl path |
+   | Platform (Docker host) | Bridge state path | bbctl path |
    |---|---|---|
    | Standard Linux | `~/.local/share/mautrix-imessage` | `~/.config/bridge-manager` |
    | UNRAID | `/mnt/user/appdata/Rustpush-Matrix/data` | `/mnt/user/appdata/Rustpush-Matrix/bbctl` |
    | Synology | `/volume1/docker/Rustpush-Matrix/data` | `/volume1/docker/Rustpush-Matrix/bbctl` |
    | TrueNAS / ZFS | dataset of your choice | dataset of your choice |
+
+   > **Migrating from a Mac native install?** `make install-beeper` on macOS puts bbctl's auth at `~/Library/Application Support/bridge-manager/` (macOS convention), not `~/.config/bridge-manager/`. Copy that directory over to your Linux Docker host's `~/.config/bridge-manager/` before first start to keep your Beeper login. Docker itself doesn't run on the Mac — see the WIP banner at the top.
 
    Run `imessage fix-perms` after editing to chown both paths to the container's UID/GID in one step.
 
