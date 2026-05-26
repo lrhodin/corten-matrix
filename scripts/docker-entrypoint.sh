@@ -38,9 +38,16 @@ if [ "$(id -u)" = "0" ]; then
         groupmod -o -g "$PGID" bridge >/dev/null 2>&1 || true
     fi
 
+    # /data ownership reconciliation. If the top-level dir doesn't match
+    # PUID:PGID we run a recursive chown — not just /data itself —
+    # because a partial mismatch (top dir correct, files inside owned by
+    # a stranger UID) shows up as "permission denied" deep in the bridge
+    # startup ("unable to open database file"), nowhere near the actual
+    # cause. Recursive chown on a small state dir is fast.
     mkdir -p /data
     if [ "$(stat -c '%u:%g' /data 2>/dev/null)" != "${PUID}:${PGID}" ]; then
-        chown "${PUID}:${PGID}" /data
+        echo "[entrypoint] chowning /data tree to ${PUID}:${PGID} (was $(stat -c '%u:%g' /data))" >&2
+        chown -R "${PUID}:${PGID}" /data
     fi
 
     exec gosu bridge "$0" "$@"
