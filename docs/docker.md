@@ -82,7 +82,7 @@ Open it in your editor:
 
    Run `imessage fix-perms` after editing to chown both paths to the container's UID/GID in one step.
 
-If your host appdata is owned by a UID other than `1000` (UNRAID is often `99:100`, for example), also uncomment and set `PUID` / `PGID` to match. See [Finding your UID and GID](#finding-your-uid-and-gid) below for how to look them up.
+If your host appdata is owned by a UID other than `1000` (UNRAID is often `99:100`, for example), also uncomment and set the `user:` directive in compose to match — and run `imessage fix-perms` afterward to chown the bind-mount sources. See [Finding your UID and GID](#finding-your-uid-and-gid) below for how to look them up.
 
 ### Step 4 — Start the container
 
@@ -205,7 +205,7 @@ curl -L https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose
     -o docker-compose.yml
 ```
 
-The default bind mount (`~/.local/share/mautrix-imessage`) already points at your existing state, so no edits to volumes are needed unless your host UID isn't 1000 (set `PUID`/`PGID`) or your bare-Linux install used a non-default state directory.
+The default bind mounts already point at your existing state, so no edits to volumes are needed unless your host UID isn't 1000 (set `user:` in compose) or your bare-Linux install used non-default state paths.
 
 ### Step 4 — Start
 
@@ -221,15 +221,17 @@ If you want to flip toggles later: `imessage setup`. If you want to re-login: `i
 
 ## How the privilege model works
 
-The container's CMD is invoked as root, but only briefly. The entrypoint:
+The container runs as the `bridge` user (UID:GID `1000:1000`) from PID 1 — set via `USER bridge` in the Dockerfile. **No root process, ever.** No `gosu`, no privilege transitions, no setuid binaries in the image.
 
-1. Reads `PUID` / `PGID` from compose (default 1000:1000).
-2. Aligns the bundled `bridge` user to that UID/GID.
-3. Creates `/data` if Docker didn't (happens when the host bind-mount path didn't exist on first start).
-4. `chown`s `/data` to `PUID:PGID` only if it doesn't already match.
-5. Re-execs itself via `gosu` as the bridge user.
+To run as a different UID/GID, override with Docker's `user:` directive in `docker-compose.yml`:
 
-After step 5, the long-lived bridge process is non-root. The whole root window is a few milliseconds at container start.
+```yaml
+user: "99:100"     # UNRAID
+user: "568:568"    # TrueNAS Scale
+user: "0:0"        # root (discouraged — loses the non-root containment)
+```
+
+Whichever UID:GID you pick, the host bind-mount source paths must be chowned to match. `imessage fix-perms` reads compose, finds every bind-mount source, and chowns each to the right UID:GID in one step.
 
 ---
 
@@ -245,7 +247,7 @@ id -u        # just the UID, e.g. 1000
 id -g        # just the GID, e.g. 1000
 ```
 
-**The UID/GID that owns an existing directory** — most useful before starting the container, to make sure your `PUID`/`PGID` will line up with whatever path you're bind-mounting at `/data`:
+**The UID/GID that owns an existing directory** — most useful before starting the container, to make sure your bind-mount source paths line up with the container's user:
 
 ```bash
 stat -c '%u:%g' ~/.local/share/mautrix-imessage           # numeric:  1000:1000
@@ -253,7 +255,10 @@ stat -c '%U:%G' ~/.local/share/mautrix-imessage           # by name:  david:davi
 ls -ldn         ~/.local/share/mautrix-imessage           # numeric, with perms
 ```
 
-If those don't match the `PUID:PGID` in your compose file, the container won't be able to read/write the state files — change `PUID`/`PGID` to match the directory, or `sudo chown -R <uid>:<gid> <path>` the directory once to match the compose values.
+If those don't match what the container runs as (default `1000:1000`, override via `user:` in compose), the container can't read/write — fix in one of two ways:
+
+- Run `imessage fix-perms` (recommended — reads compose, chowns every bind-mount source to match the `user:` directive).
+- Or manually: `sudo chown -R <uid>:<gid> <bind-mount-path>`.
 
 **For another user** (e.g. you'll run Docker as a separate service account):
 
@@ -274,28 +279,27 @@ id beepuser
 
 If you're logged into the host as `root` (`id -u` returns `0`), you have two clean options. Pick one:
 
-**Option A — chown appdata to 1000:1000 once, use defaults (recommended)**
+**Option A — leave the container at its default 1000:1000 (recommended)**
 
-The image's bundled non-root `bridge` user is UID 1000, which is what `PUID` / `PGID` default to. Make the appdata directory match:
+The image runs as UID:GID `1000:1000` (the bundled non-root `bridge` user). Match by chowning your bind-mount sources to 1000:1000:
 
 ```bash
-mkdir -p ~/.local/share/mautrix-imessage     # or your chosen host path
-sudo chown -R 1000:1000 ~/.local/share/mautrix-imessage
+imessage fix-perms     # chowns every bind mount in compose to 1000:1000
 ```
 
-Leave `PUID` / `PGID` at `"1000"` in compose. The bridge process inside the container then runs as a real non-root user — the whole point of the `gosu` privilege drop in the entrypoint.
+This is the cleanest split: bridge runs non-root, your root login has full read access (because root bypasses owner checks), and `imessage` host commands keep working.
 
-**Option B — set PUID/PGID to 0**
+**Option B — run the container as root via `user: "0:0"`**
 
 ```yaml
-environment:
-  PUID: "0"
-  PGID: "0"
+user: "0:0"
 ```
 
-The entrypoint re-aliases the in-container `bridge` user to UID 0, and `gosu` then drops to it — which means the bridge process inside the container also runs as root. Functionally fine (Apple's servers don't care), but the container's privilege model collapses to root. Use Option A unless you specifically can't.
+The container then runs everything as root. Functionally fine (Apple's servers don't care), but you lose the non-root containment that the image gives you by default. Use Option A unless you specifically can't.
 
-The host CLI (`imessage`) calls `docker` directly and works the same either way — no extra config.
+Either way, `imessage` host commands work — they call `docker` directly without caring what UID the container ultimately runs as.
+
+You don't need to `mkdir` the bind-mount source paths manually. If the host paths don't exist, Docker creates them on first `imessage start`, and `imessage fix-perms` also creates them if it can't find them. Both default to root-owned, which is why `fix-perms` follows the mkdir with the chown.
 
 ---
 
@@ -313,7 +317,7 @@ The Mac running the relay is a separate machine from the Docker host. The key ne
 
 **`imessage logs` keeps showing `no /data/config.yaml yet`** — you never finished `imessage setup`, or the wizard exited mid-flow. Run it again; it's safe to re-run.
 
-**Container restarts in a loop** — `imessage logs` shows the actual error. Most common cause: UID mismatch between the host appdata dir and the container's `PUID`. Check `stat -c '%u:%g' <your host path>` and set `PUID`/`PGID` in compose to match.
+**Container restarts in a loop** — `imessage logs` shows the actual error. Most common cause: UID mismatch between the host bind-mount sources and the container's user. Run `imessage fix-perms` to chown both bind mounts to the right UID:GID in one step.
 
 **Bridge starts but Beeper doesn't see it** — `imessage logs` should show the appservice connecting. If it doesn't, the registration / login didn't complete. Re-run `imessage setup`.
 

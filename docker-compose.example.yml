@@ -39,6 +39,15 @@ services:
       # an existing bare-Linux ~/.config/bridge-manager/ into the
       # container with no copy, and lets bbctl auth survive any
       # rm-rf of the bridge state dir.
+      #
+      # bbctl config locations on the source machine (the host you
+      # might be migrating *from*):
+      #   Linux:   ~/.config/bridge-manager
+      #   macOS:   ~/Library/Application Support/bridge-manager
+      # The Docker setup itself is Linux-only — if you're moving from a
+      # Mac native install (`make install-beeper`) to Docker on a Linux
+      # host, copy/scp the macOS bridge-manager dir over to
+      # ~/.config/bridge-manager on the Linux host first.
       - ~/.config/bridge-manager:/home/bridge/.config/bridge-manager
 
     environment:
