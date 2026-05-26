@@ -66,10 +66,30 @@ COPY . /src
 RUN echo '#!/bin/bash' > scripts/bootstrap-linux.sh \
     && chmod +x scripts/bootstrap-linux.sh
 
-# `make build` runs ensure-rustpush-source → clones rustpush at the pinned
-# SHA, overlays open-absinthe, applies every sed patch — then cargo build,
-# then go build. Network is required during this step.
-RUN make build
+# Build with BuildKit cache mounts. CI exports these as part of
+# `cache-to: type=gha,mode=max` so subsequent runs reuse compiled
+# crates and Go modules instead of rebuilding rustpush from scratch
+# (~5 min saved per run once the cache is warm).
+#
+# Caches mounted:
+#   /root/.cargo/registry   - downloaded crate sources
+#   /root/.cargo/git        - git-backed crate sources
+#   /src/pkg/rustpushgo/target  - cargo build artifacts (the big one)
+#   /src/third_party/rustpush-upstream/target  - same, for rustpush itself
+#   /root/go                - GOPATH (Go module cache)
+#   /root/.cache/go-build   - Go build cache
+#
+# `make build` runs ensure-rustpush-source → clones rustpush at the
+# pinned SHA, overlays open-absinthe, applies every sed patch — then
+# cargo build, then go build. Network is required during this step
+# (BuildKit cache mounts don't replace network access for git clones).
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,target=/src/pkg/rustpushgo/target,sharing=locked \
+    --mount=type=cache,target=/src/third_party/rustpush-upstream/target,sharing=locked \
+    --mount=type=cache,target=/root/go,sharing=locked \
+    --mount=type=cache,target=/root/.cache/go-build,sharing=locked \
+    make build
 
 # ─── Stage 2: runtime ────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
