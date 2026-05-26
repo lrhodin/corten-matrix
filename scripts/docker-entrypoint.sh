@@ -89,6 +89,11 @@ require_tty() {
 }
 
 cmd_run() {
+    # Reconcile alias state against EMIT_ALIASES every start. Cheap when
+    # nothing changes (idempotent), guarantees the host rc files match
+    # the compose state without the user having to remember a setup step.
+    manage_aliases || true
+
     # Auto-trigger migration on first start when MIGRATE=true is set in
     # compose and we've never migrated this data dir before. The user
     # only sees the migration once — sentinel keeps subsequent restarts
@@ -127,17 +132,29 @@ cmd_run() {
     exec "$BIN" -c "$CONFIG"
 }
 
+# ── Alias-block helpers ──────────────────────────────────────────────────────
+# Marker format matches the bare-Linux install scripts so the same block
+# is recognized cross-runtime — a user who switches between bare-Linux
+# and Docker doesn't end up with duplicate blocks.
+ALIAS_MARKER_START="# >>> mautrix-imessage shortcuts (managed) >>>"
+ALIAS_MARKER_END="# <<< mautrix-imessage shortcuts (managed) <<<"
+
+# alias_block_contents — print the Docker-flavored alias body (no markers).
+# Kept as a function so the same source feeds the install path AND the
+# manual `aliases` subcommand.
+alias_block_contents() {
+    cat <<'EOF'
+alias imessage-setup='docker exec -it bridge imessage-setup'
+alias imessage-logs='docker logs -f bridge'
+EOF
+}
+
 # strip_alias_block — remove the managed-alias block from one rc file.
-# Matches the awk pattern the bare-Linux installer already uses, so the
-# remove-aliases path here and the install-script's remove-on-decline
-# path produce identical output. Returns 0 if anything was stripped,
-# 1 otherwise.
+# Returns 0 if anything was stripped, 1 otherwise. Idempotent.
 strip_alias_block() {
     local rc="$1"
-    local marker_start="# >>> mautrix-imessage shortcuts (managed) >>>"
-    local marker_end="# <<< mautrix-imessage shortcuts (managed) <<<"
-    if [ -f "$rc" ] && grep -qF "$marker_start" "$rc"; then
-        awk -v s="$marker_start" -v e="$marker_end" '
+    if [ -f "$rc" ] && grep -qF "$ALIAS_MARKER_START" "$rc"; then
+        awk -v s="$ALIAS_MARKER_START" -v e="$ALIAS_MARKER_END" '
             $0 == s { skip = 1; next }
             $0 == e { skip = 0; next }
             !skip   { print }
@@ -145,6 +162,70 @@ strip_alias_block() {
         return 0
     fi
     return 1
+}
+
+# install_alias_block — write the managed-alias block to one rc file.
+# Strips first so re-runs replace the block in place (matches the
+# bare-Linux install scripts' idempotent re-run pattern). Returns 0
+# on write, 1 if the rc file doesn't exist as a bind mount.
+install_alias_block() {
+    local rc="$1"
+    [ -e "$rc" ] || return 1
+    strip_alias_block "$rc" || true
+    {
+        echo "$ALIAS_MARKER_START"
+        alias_block_contents
+        echo "$ALIAS_MARKER_END"
+    } >> "$rc"
+    return 0
+}
+
+# manage_aliases — called from cmd_run before the bridge starts. Reads
+# EMIT_ALIASES and reconciles the alias block in any bind-mounted rc
+# files. Shell detection is by presence of the mount, not by $SHELL —
+# the container's $SHELL is the container's (always /bin/bash), not
+# the host's. If the user has both bash and zsh mounted we manage both.
+manage_aliases() {
+    case "${EMIT_ALIASES:-}" in
+        true|TRUE|1|yes|YES)    local want=install ;;
+        false|FALSE|0|no|NO)    local want=remove ;;
+        "")                     return 0 ;;
+        *)                      echo "EMIT_ALIASES has unknown value '${EMIT_ALIASES}' — skipping alias management" >&2; return 0 ;;
+    esac
+
+    local touched=0 mounted=0
+    for rc in /host/.bashrc /host/.zshrc; do
+        [ -e "$rc" ] || continue
+        mounted=1
+        if [ "$want" = install ]; then
+            if install_alias_block "$rc"; then
+                echo "✓ Installed mautrix-imessage shortcuts in $(echo "$rc" | sed 's|^/host|~|')"
+                touched=1
+            fi
+        else
+            if strip_alias_block "$rc"; then
+                echo "✓ Removed mautrix-imessage shortcuts from $(echo "$rc" | sed 's|^/host|~|')"
+                touched=1
+            fi
+        fi
+    done
+
+    if [ "$mounted" -eq 0 ]; then
+        cat >&2 <<'EOF'
+EMIT_ALIASES is set, but neither ~/.bashrc nor ~/.zshrc is bind-mounted
+into the container. To let the container install/remove the shortcut
+aliases automatically, add to docker-compose.yml under the bridge
+service's volumes:
+
+    - ~/.bashrc:/host/.bashrc
+    - ~/.zshrc:/host/.zshrc
+
+Open a new terminal (or `source` the rc file) after EMIT_ALIASES
+changes to pick up the new state.
+EOF
+    elif [ "$touched" -eq 1 ]; then
+        echo "  (Open a new terminal or 'source' the rc file to pick up the change.)"
+    fi
 }
 
 cmd_migrate() {
@@ -315,32 +396,14 @@ cmd_login() {
 }
 
 cmd_aliases() {
-    # Source of truth for whether to emit is EMIT_ALIASES in compose. When
-    # unset/false, this subcommand stays silent — caller's `>> ~/.bashrc`
-    # is then a no-op. The user opts in explicitly by flipping the env var.
-    case "${EMIT_ALIASES:-}" in
-        1|true|TRUE|yes|YES)
-            cat <<'EOF'
-# >>> mautrix-imessage shortcuts (docker, managed) >>>
-alias imessage-setup='docker exec -it bridge imessage-setup'
-alias imessage-logs='docker logs -f bridge'
-# <<< mautrix-imessage shortcuts (docker, managed) <<<
-EOF
-            ;;
-        *)
-            cat >&2 <<EOF
-EMIT_ALIASES is not set to true — no aliases emitted.
-
-To enable, set EMIT_ALIASES=true in your docker-compose.yml under the
-bridge service's environment block, then re-run:
-
-  docker exec bridge /entrypoint.sh aliases >> ~/.bashrc
-
-Open a new terminal (or source ~/.bashrc) to pick up the aliases.
-EOF
-            exit 0
-            ;;
-    esac
+    # Print the marker-wrapped block to stdout for manual paste. Useful
+    # when the user doesn't want to bind-mount their rc files into the
+    # container — they can pipe the output into their rc file once and
+    # manage it themselves. Same block content the startup-side
+    # install_alias_block writes, so the two paths can't drift.
+    echo "$ALIAS_MARKER_START"
+    alias_block_contents
+    echo "$ALIAS_MARKER_END"
 }
 
 case "$CMD" in
