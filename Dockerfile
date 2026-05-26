@@ -184,13 +184,23 @@ RUN wget -qO /tmp/AppleRootCA.cer https://www.apple.com/appleca/AppleIncRootCert
 # on the host works without chown gymnastics WHEN the host directory
 # is also owned by 1000:1000.
 #
-# HOME is /data on purpose — bbctl persists its Beeper auth state under
-# $HOME, and the bridge user's "home" needs to be on the bind-mounted
-# volume so credentials survive container restarts. Same directory the
-# bare-Linux install puts state in (~/.local/share/mautrix-imessage),
-# so paths match cross-runtime.
+# Home directory layout mirrors bare-Linux exactly so install scripts
+# that build $HOME/.local/share/mautrix-imessage/... paths land on the
+# bind mount the same way they land on the bare-Linux data dir:
+#
+#   $HOME = /home/bridge
+#   /home/bridge/.local/share/mautrix-imessage → symlink to /data
+#
+# Result: $HOME/.local/share/mautrix-imessage/bbctl/ resolves to
+# /data/bbctl/ via the symlink, which is the top of the bind mount —
+# the exact same on-disk location bare-Linux puts bbctl in. Migrations
+# from bare-Linux Just Work; no nested duplicate directories appear on
+# the host volume.
 RUN groupadd --system --gid 1000 bridge \
-    && useradd --system --uid 1000 --gid 1000 --home-dir /data --shell /bin/bash bridge \
+    && useradd --system --uid 1000 --gid 1000 --create-home --shell /bin/bash bridge \
+    && mkdir -p /home/bridge/.local/share \
+    && ln -sf /data /home/bridge/.local/share/mautrix-imessage \
+    && chown -R bridge:bridge /home/bridge \
     && mkdir -p /data \
     && chown bridge:bridge /data
 
