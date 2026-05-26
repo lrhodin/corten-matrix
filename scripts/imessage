@@ -210,9 +210,23 @@ cmd_migrate() {
     echo ""
 
     # 3. Sanity-check the state dir.
-    if [ -d "$HOME/.local/share/mautrix-imessage" ] && [ -f "$HOME/.local/share/mautrix-imessage/config.yaml" ]; then
+    local config="$HOME/.local/share/mautrix-imessage/config.yaml"
+    if [ -d "$HOME/.local/share/mautrix-imessage" ] && [ -f "$config" ]; then
         echo "✓ State at ~/.local/share/mautrix-imessage looks intact."
-        echo "  The Docker container will resume against it as-is."
+
+        # 3a. Rewrite the absolute database URI in config.yaml. The
+        # bare-Linux install bakes the host appdata path into config
+        # (e.g. file:/root/.local/share/mautrix-imessage/mautrix-imessage.db
+        # or file:/home/<user>/...). Inside the container that path
+        # doesn't exist — the bind mount lives at /data — and SQLite
+        # comes back with "permission denied" on open. Normalize any
+        # absolute file:/sqlite: URI ending in mautrix-imessage.db to
+        # the container's /data path.
+        if grep -qE '(uri: (file|sqlite):/.+/mautrix-imessage\.db)' "$config"; then
+            sed -i -E 's|uri: file:/.+/mautrix-imessage\.db|uri: file:/data/mautrix-imessage.db|' "$config"
+            sed -i -E 's|uri: sqlite:/.+/mautrix-imessage\.db|uri: sqlite:/data/mautrix-imessage.db|' "$config"
+            echo "✓ Rewrote database URI in config.yaml to /data/mautrix-imessage.db"
+        fi
     else
         echo "⚠  State directory missing or empty. The bridge will run setup as a fresh install."
     fi
