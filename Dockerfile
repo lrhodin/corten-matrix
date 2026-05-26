@@ -56,6 +56,16 @@ RUN wget -qO /tmp/AppleRootCA.cer https://www.apple.com/appleca/AppleIncRootCert
 WORKDIR /src
 COPY . /src
 
+# Stub out bootstrap-linux.sh inside the builder. Every dep it would
+# install is already in the apt layer above, but its dedup leaves
+# APT_PACKAGES=" " (single space) when nothing's missing, so the
+# `[ -n "$APT_PACKAGES" ]` guard fires and the script tries to `sudo
+# apt-get install` an empty list. sudo isn't in the builder image
+# either. Bypassing the whole script is cleaner than installing sudo +
+# fixing the dedup bug upstream.
+RUN echo '#!/bin/bash' > scripts/bootstrap-linux.sh \
+    && chmod +x scripts/bootstrap-linux.sh
+
 # `make build` runs ensure-rustpush-source → clones rustpush at the pinned
 # SHA, overlays open-absinthe, applies every sed patch — then cargo build,
 # then go build. Network is required during this step.
