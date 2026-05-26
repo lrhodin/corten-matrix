@@ -142,23 +142,35 @@ strip_marker_block() {
 cmd_setup()   { exec docker exec -it "$CONTAINER" imessage-setup "$@"; }
 cmd_login()   { exec docker exec -it "$CONTAINER" /entrypoint.sh login "$@"; }
 cmd_logs()    {
-    # Live-tail the bridge's zerolog file directly on the host volume.
-    # We do this without `docker exec` so it keeps working even when the
-    # container is restart-looping, stopped, or otherwise unhealthy —
-    # the bind-mounted file persists regardless of container state.
-    #
-    # The host path is discovered by inspecting the container's /data
-    # mount, so it follows whatever the user put in compose (default
-    # ~/.local/share/mautrix-imessage, UNRAID /mnt/user/appdata/...,
-    # Synology /volume1/docker/..., anything).
-    local host_path
-    host_path=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER" 2>/dev/null || true)
-    if [ -z "$host_path" ]; then
-        echo "error: container '$CONTAINER' doesn't exist or has no /data mount." >&2
-        echo "  Did you 'imessage start' yet?" >&2
-        exit 1
-    fi
-    exec tail -F "$host_path/logs/bridge.log"
+    # Live-tail the bridge's zerolog file. When the container is running
+    # we tail from inside it via `docker exec`, because tail-F on the
+    # host side of a Docker bind mount has unreliable inotify behaviour
+    # (writes from the container don't always wake up host-side
+    # watchers). When the container is stopped or restart-looping,
+    # docker exec can't attach, so we fall back to reading the same
+    # file from the host bind-mount path — the file persists either
+    # way, you just lose live-follow until the container's back up.
+    local state
+    state=$(docker inspect --format '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo missing)
+    case "$state" in
+        running)
+            exec docker exec -it "$CONTAINER" tail -F /data/logs/bridge.log
+            ;;
+        missing)
+            echo "error: container '$CONTAINER' doesn't exist. Did you 'imessage start' yet?" >&2
+            exit 1
+            ;;
+        *)
+            local host_path
+            host_path=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER" 2>/dev/null || true)
+            if [ -z "$host_path" ]; then
+                echo "error: no /data mount found on container '$CONTAINER'." >&2
+                exit 1
+            fi
+            echo "(container is $state — tailing host bind-mount file; live-follow may be sluggish)" >&2
+            exec tail -F "$host_path/logs/bridge.log"
+            ;;
+    esac
 }
 cmd_shell()   { exec docker exec -it "$CONTAINER" bash; }
 cmd_status()  { docker ps --filter "name=^${CONTAINER}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'; }
