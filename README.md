@@ -186,9 +186,11 @@ When the script finishes you're already logged in and the bridge is up.
 
 **Alternative: log in through the bridge bot.** If you ever need to log in (or log back in) outside the install script, DM the bridge bot in the Matrix management room and run the **"Apple ID (External Key)"** login flow there — same three prompts, same result.
 
-## Quick Start (Docker) — WIP
+## Quick Start (Docker, Linux only) — WIP
 
 > ⚠ **Work in progress.** The Docker image, entrypoint, and migration flow are under active development. Expect rough edges, breaking changes, and no compatibility guarantees yet. Use the bare-Linux install for anything you rely on.
+>
+> **Linux only. Don't run the bridge in Docker on macOS** — Docker Desktop on Mac runs the daemon in a slow VM and has flaky bind mounts. Mac users always use `make install` / `make install-beeper`.
 
 The Docker path bundles the same binary (built with `make build` so all rustpush patches apply), runs the existing install scripts inside the container, and stores state on a bind mount you choose — `~/.local/share/mautrix-imessage` by default (matches bare-Linux so migration is trivial), or wherever fits your platform (`/mnt/user/appdata/mautrix-imessage` on UNRAID, `/volume1/docker/mautrix-imessage` on Synology, any ZFS dataset, etc.).
 

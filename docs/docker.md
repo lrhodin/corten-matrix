@@ -1,6 +1,8 @@
 # Docker — Step-by-Step Guide
 
-The bridge runs in a Docker container. The container itself is opaque — you drive it from the host with a small CLI called `imessage`, which is just a thin wrapper around `docker exec` / `docker compose` so you don't have to memorize either.
+> **Linux only.** Docker Desktop on Mac runs the daemon inside a slow VM, gives you flaky bind mounts, and burns power for no reason when there's a native build that runs the bridge directly on the same machine. **Mac users always use `make install` or `make install-beeper` — never Docker.** The hardware key still gets extracted from a Mac, and the Apple Silicon NAC relay still runs on a Mac, but those are external machines from the Linux Docker host's perspective.
+
+The bridge runs in a Docker container on a Linux host. The container itself is opaque — you drive it from the host with a small CLI called `imessage`, which is just a thin wrapper around `docker exec` / `docker compose` so you don't have to memorize either.
 
 State lives on a bind mount you control. The image lives at `ghcr.io/lrhodin/imessage` (published manually via GitHub Actions, not auto-built per commit).
 
@@ -8,9 +10,9 @@ State lives on a bind mount you control. The image lives at `ghcr.io/lrhodin/ime
 
 ## What you need before starting
 
-- Docker Engine 20.10+ and `docker compose` v2 (`docker compose version`, not `docker-compose`).
+- A Linux host with Docker Engine 20.10+ and `docker compose` v2 (`docker compose version`, not `docker-compose`).
 - A Beeper account or your own Matrix homeserver.
-- A hardware key extracted from a Mac (see [Quick Start (Linux) → Step 1](../README.md#step-1-extract-hardware-key-one-time-on-your-mac) in the main README — same key path for Docker).
+- A hardware key extracted once from a Mac (see [Quick Start (Linux) → Step 1](../README.md#step-1-extract-hardware-key-one-time-on-your-mac) in the main README — same extraction path whether the bridge later runs bare-Linux or in Docker).
 - ~3 GB of disk for the image and ~1 GB for state, give or take.
 
 ---
@@ -188,8 +190,7 @@ After step 5, the long-lived bridge process is non-root. The whole root window i
 
 If your hardware key was extracted from an Apple Silicon Mac, the bridge fetches NAC validation data from a relay running on that Mac. The relay URL, bearer token, and TLS fingerprint are all embedded in the base64 key blob — there's nothing to configure in compose.
 
-- **Docker on the same Mac**: `host.docker.internal` resolves to the host. Works out of the box.
-- **Docker on a Linux server, remote Mac**: the key needs to have been extracted with a hostname/IP that's routable from the Linux server (LAN, VPN, or port-forwarded WAN).
+The Mac running the relay is a separate machine from the Docker host. The key needs to have been extracted with a hostname/IP that's routable from your Docker host (LAN, VPN, or port-forwarded WAN). Intel hardware keys don't need a relay at all — the x86_64 unicorn emulator runs entirely in-process inside the container.
 
 ---
 
