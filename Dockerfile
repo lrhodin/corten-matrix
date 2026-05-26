@@ -209,8 +209,10 @@ RUN chmod +x /entrypoint.sh /usr/local/bin/imessage-setup /opt/imessage/scripts/
 
 # State directory. WORKDIR /data is load-bearing: Rust hardcodes
 # `state/anisette/` as a relative path (pkg/rustpushgo/src/lib.rs).
-# Don't change it.
-RUN mkdir -p /data && chown bridge:bridge /data /opt/imessage /usr/local/bin/bbctl /usr/local/bin/mautrix-imessage-v2 || true
+# Don't change it. Initial chown sets ownership for the case where
+# Docker auto-creates the bind mount source; the entrypoint re-chowns
+# on every start to honor PUID/PGID overrides.
+RUN mkdir -p /data && chown bridge:bridge /data
 
 WORKDIR /data
 VOLUME ["/data"]
