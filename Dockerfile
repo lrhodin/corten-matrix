@@ -229,6 +229,15 @@ WORKDIR /data
 VOLUME ["/data"]
 EXPOSE 29325
 
+# Pin XDG_CONFIG_HOME to a subdir of /data so $HOME-relative tools
+# (notably bbctl, which keeps Beeper auth at $XDG_CONFIG_HOME/bridge-
+# manager/) land their state on the bind-mounted volume. Without this
+# bbctl would write to /home/bridge/.config — fine for the running
+# container, lost on every restart.
+ENV XDG_CONFIG_HOME=/data/.config
+ENV XDG_DATA_HOME=/data/.xdg-data
+ENV XDG_CACHE_HOME=/data/.xdg-cache
+
 # Container runs as the bridge user (UID:GID 1000:1000) from PID 1.
 # No privilege transitions, no gosu — what Docker starts is what runs.
 #
