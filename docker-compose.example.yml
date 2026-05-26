@@ -7,8 +7,9 @@
 #
 # The host data directory MUST be owned by the UID:GID the container
 # runs as. By default that's 1000:1000 (the typical first Linux user).
-# Run `imessage fix-perms` once after creating the dir if you're not
-# sure — it walks you through the chown.
+# If your bind-mount sources are owned by a different UID, update the
+# user: directive below to match. imessage start automatically checks and
+# corrects permissions, so there's nothing to do manually.
 #
 # Everything else (CardDAV, FaceTime toggle, StatusKit, HEIC, video
 # transcoding, preferred handle, …) is configured through the
@@ -56,7 +57,7 @@ services:
     #   user: "568:568"    # TrueNAS Scale (apps)
     #   user: "0:0"        # root (discouraged; only if you must)
     #
-    # Whatever UID:GID you pick, run `imessage fix-perms` to chown the
-    # bind-mount sources to match. See docs/docker.md → "Finding your
-    # UID and GID" for how to look up your host UID.
+    # Whatever UID:GID you pick, imessage start will automatically verify
+    # and correct bind-mount permissions to match. See docs/docker.md →
+    # "Finding your UID and GID" for how to look up your host UID.
     user: "1000:1000"

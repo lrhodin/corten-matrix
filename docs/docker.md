@@ -80,32 +80,17 @@ Open it in your editor:
    | Synology | `/volume1/docker/Rustpush-Matrix/data` | `/volume1/docker/Rustpush-Matrix/bbctl` |
    | TrueNAS / ZFS | dataset of your choice | dataset of your choice |
 
-   Run `imessage fix-perms` after editing to chown both paths to the container's UID/GID in one step.
-
 If your host bind-mount sources are owned by a UID other than `1000` (UNRAID is often `99:100`, for example), update the `user:` directive in compose to match. See [Finding your UID and GID](#finding-your-uid-and-gid) for how to look up the right values.
 
-### Step 4 — Fix permissions on the bind-mount sources
-
-**Do this before the first `imessage start`.** If the host bind-mount paths don't exist yet, Docker will create them as root on first start; if they already exist they probably aren't owned by the UID:GID your compose declares. Either way the container won't be able to read/write its own state.
-
-`imessage fix-perms` reads your compose file, finds every bind-mount source, creates any that are missing, and chowns each one to the `user:` UID:GID:
-
-```bash
-cd /path/to/the/dir/with/your/docker-compose.yml
-imessage fix-perms
-```
-
-You'll see a summary of what it found and a confirm prompt before any chown runs. Same CWD rule as `imessage start` — must be in the compose dir or set `IMESSAGE_COMPOSE_FILE`.
-
-Run this again any time you change the `user:` directive in compose or move the bind-mount paths.
-
-### Step 5 — Start the container
+### Step 4 — Start the container
 
 **`imessage start` must be run from the directory that contains your `docker-compose.yml`.** Same rule as raw `docker compose up` — compose-driven subcommands (`start`, `stop`, `restart`, `pull`, `update`) need to find the file, and they look in the current directory by default.
 
 ```bash
 imessage start
 ```
+
+`imessage start` first checks the bind-mount directories against your compose file's `user:` directive. If any directories don't exist, it creates them. If any don't match the target ownership, it fixes them with verbose console output, then starts the container.
 
 The container pulls the image (first time only, ~250 MB), comes up, and sits idle waiting for setup. You can confirm with:
 
@@ -116,9 +101,9 @@ imessage logs       # Ctrl-C to detach
 
 If you'd rather run lifecycle commands from anywhere, set `IMESSAGE_COMPOSE_FILE` to the absolute path of your compose file — see [Day-to-day operations](#day-to-day-operations) below.
 
-The logs should show `no /data/config.yaml yet — run 'imessage setup' from the host to configure the bridge.` every 30 seconds — that's the entrypoint waiting on step 6.
+The logs should show `no /data/config.yaml yet — run 'imessage setup' from the host to configure the bridge.` every 30 seconds — that's the entrypoint waiting on step 5.
 
-### Step 6 — Run the setup wizard
+### Step 5 — Run the setup wizard
 
 ```bash
 imessage setup
@@ -142,6 +127,7 @@ When the wizard finishes, the container detects the new `config.yaml` and starts
 | Stop it | `imessage stop` |
 | Start it again | `imessage start` |
 | Pull a new image + restart | `imessage update` |
+| Check bind-mount permissions (diagnostic) | `imessage fix-perms` |
 | Re-run the iMessage login flow | `imessage login` |
 | Re-run setup (flip a toggle) | `imessage setup` |
 | Open a debug shell inside | `imessage shell` |
@@ -159,13 +145,12 @@ The `imessage` CLI is a thin wrapper — every subcommand maps to a small number
 | `status` | `docker ps --filter name=^Rustpush-Matrix$` |
 | `shell` | `docker exec -it Rustpush-Matrix bash` |
 | `bbctl <args>` | `docker exec -it Rustpush-Matrix bbctl <args>` |
-| `start` | `docker compose up -d` |
+| `start` | Check + fix bind-mount permissions against compose `user:` directive (verbose output), then `docker compose up -d` |
 | `stop` | `docker compose stop Rustpush-Matrix` |
 | `restart` | `docker compose restart Rustpush-Matrix` |
 | `pull` | `docker compose pull` |
 | `update` | `docker compose pull && docker compose up -d` |
-| `migrate` | Pure host-side script — strips the bare-Linux managed-alias block from `~/.bashrc` / `~/.zshrc`, stops + disables + removes the `mautrix-imessage` systemd unit, rewrites absolute DB paths in config.yaml to `/data`. No `docker` calls. |
-| `fix-perms` | Reads bind-mount source + `user:` from your compose file (via `docker compose config`), then `chown -R <uid>:<gid> <bind source>`. Compose-driven, so it works before the container is ever created. Same CWD rule as `start`. |
+| `fix-perms` | Read bind-mount sources + `user:` from your compose file, report permissions (diagnostic only). |
 | `help` | Prints the subcommand list. |
 
 When `docker compose` is invoked above, the CLI inserts `-f "$IMESSAGE_COMPOSE_FILE"` if that env var is set, otherwise compose uses its default search behavior (current working directory). Container name comes from `${IMESSAGE_CONTAINER:-Rustpush-Matrix}`.
@@ -184,52 +169,6 @@ echo 'export IMESSAGE_COMPOSE_FILE=~/docker/imessage/docker-compose.yml' >> ~/.b
 # or ~/.zshrc — open a new terminal to pick it up
 imessage update                                # now works from anywhere
 ```
-
----
-
-## Migrating from a bare-Linux install
-
-If you already have a bare-Linux install (the systemd-unit + `~/.local/share/mautrix-imessage` setup), you can move to Docker without losing state, login, or the iCloud Keychain trust circle:
-
-### Step 1 — Install the host CLI
-
-Same as the fresh-install Step 1:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/install-imessage.sh | sudo bash
-```
-
-### Step 2 — Run the migration helper
-
-```bash
-imessage migrate
-```
-
-This:
-1. Strips the bare-Linux systemd-based shell aliases from `~/.bashrc` / `~/.zshrc` (they shell out to `systemctl` and would no longer work).
-2. Stops, disables, and removes the `mautrix-imessage` systemd unit (user and system scopes — uses `sudo` only for the system scope).
-3. Confirms your state at `~/.local/share/mautrix-imessage` is intact.
-
-Safe to re-run if something didn't complete the first time.
-
-### Step 3 — Drop in the compose file
-
-```bash
-curl -L https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose.example.yml \
-    -o docker-compose.yml
-```
-
-The default bind mounts already point at your existing state, so no edits to volumes are needed unless your host UID isn't 1000 (set `user:` in compose) or your bare-Linux install used non-default state paths.
-
-### Step 4 — Start
-
-```bash
-imessage start
-```
-
-The bridge resumes against your existing config / session / trustedpeers / sqlite as-is. No re-login, no re-setup. `imessage logs` should show the bridge picking up where it left off within a few seconds.
-
-If you want to flip toggles later: `imessage setup`. If you want to re-login: `imessage login`.
 
 ---
 
@@ -331,7 +270,7 @@ The Mac running the relay is a separate machine from the Docker host. The key ne
 
 **`imessage logs` keeps showing `no /data/config.yaml yet`** — you never finished `imessage setup`, or the wizard exited mid-flow. Run it again; it's safe to re-run.
 
-**Container restarts in a loop** — `imessage logs` shows the actual error. Most common cause: UID mismatch between the host bind-mount sources and the container's user. Run `imessage fix-perms` to chown both bind mounts to the right UID:GID in one step.
+**Container restarts in a loop** — `imessage logs` shows the actual error. If you see permission errors on `/data` or other bind mounts, check that your compose file's `user:` directive matches the actual ownership of the host directories (use `imessage fix-perms` as a diagnostic to report the mismatch). `imessage start` automatically corrects permission mismatches, so if this persists, the issue is likely a runtime problem, not permissions.
 
 **Bridge starts but Beeper doesn't see it** — `imessage logs` should show the appservice connecting. If it doesn't, the registration / login didn't complete. Re-run `imessage setup`.
 

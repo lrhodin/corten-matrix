@@ -56,27 +56,16 @@ DAILY (work from any directory — container looked up by name)
 
 LIFECYCLE (must run from the directory with docker-compose.yml — or set IMESSAGE_COMPOSE_FILE)
     start           → docker compose up -d
+                      Automatically verifies bind-mount permissions match
+                      the container's user: directive; corrects them if needed
+                      with verbose console output.
     stop            → docker compose stop Rustpush-Matrix
     restart         → docker compose restart Rustpush-Matrix
     pull            → docker compose pull
     update          → docker compose pull && docker compose up -d
-    fix-perms       Read the bind mount + user: from your compose file
-                    and chown the host data dir to match. Run before
-                    'imessage start' (especially on first install — the
-                    bridge can't open /data until its host owner matches
-                    the UID compose declares).
-
-ONE-TIME (host-side only — no docker calls)
-    migrate         Migrate from a bare-Linux install:
-                      • strip the bare-Linux managed-alias block from
-                        ~/.bashrc / ~/.zshrc
-                      • stop + disable + remove the mautrix-imessage
-                        systemd unit (user + system scopes)
-                      • rewrite absolute paths in config.yaml to /data
-                      • leave state at ~/.local/share/mautrix-imessage
-                        in place
-                    Then run `imessage fix-perms`, `imessage start`,
-                    and `imessage setup`.
+    fix-perms       Diagnostic: read the bind mount + user: from your
+                    compose file and report permissions without changing
+                    them. Useful for troubleshooting permission mismatches.
 
 OTHER
     help, -h, --help    Print this message.
@@ -293,86 +282,68 @@ for v in svc.get("volumes", []) or []:
     echo "✓ Done. You can now run 'imessage start' (or 'imessage restart' if already up)."
 }
 
-cmd_start()   { compose up -d; }
+cmd_start() {
+    # Check and fix bind-mount permissions before starting.
+    echo "[startup] checking bind-mount permissions..."
+
+    local compose_file="$COMPOSE_FILE"
+    if [ -z "$compose_file" ]; then
+        [ -f docker-compose.yml ] && compose_file="docker-compose.yml"
+        [ -f docker-compose.yaml ] && compose_file="docker-compose.yaml"
+    fi
+
+    if [ -n "$compose_file" ] && [ -f "$compose_file" ]; then
+        # Get the user: directive from compose.
+        local target_user
+        target_user=$(grep "^[[:space:]]*user:" "$compose_file" | head -1 | sed -E 's/^[[:space:]]*user:[[:space:]]*"?([0-9:]+)"?.*/\1/')
+        target_user="${target_user:-1000:1000}"
+
+        # Extract bind-mount paths from volumes section.
+        local in_volumes=0
+        while IFS= read -r line; do
+            if [[ $line =~ ^[[:space:]]*volumes: ]]; then
+                in_volumes=1
+                continue
+            fi
+            if [ "$in_volumes" -eq 1 ]; then
+                if [[ $line =~ ^[[:space:]]*[a-zA-Z] ]] && ! [[ $line =~ ^[[:space:]]*- ]]; then
+                    break
+                fi
+                if [[ $line =~ ^[[:space:]]*-[[:space:]]+ ]]; then
+                    local mount
+                    mount=$(echo "$line" | sed -E 's/^[[:space:]]*-[[:space:]]+([^:]+):.*/\1/')
+                    mount="${mount%\"}"
+                    mount="${mount#\"}"
+                    mount="${mount/#\~/$HOME}"
+
+                    if [ -n "$mount" ]; then
+                        if [ ! -d "$mount" ]; then
+                            echo "[startup] creating $mount"
+                            mkdir -p "$mount" 2>/dev/null || sudo mkdir -p "$mount" 2>/dev/null || true
+                        fi
+
+                        if [ -d "$mount" ]; then
+                            local current
+                            current=$(ls -ldn "$mount" 2>/dev/null | awk '{print $3":"$4}')
+                            if [ "$current" != "$target_user" ]; then
+                                echo "[startup] fixing perms: $mount ($current → $target_user)"
+                                chown -R "$target_user" "$mount" 2>/dev/null || sudo chown -R "$target_user" "$mount" 2>/dev/null || true
+                            fi
+                        fi
+                    fi
+                fi
+            fi
+        done < "$compose_file"
+    fi
+
+    echo "[startup] starting container..."
+    compose up -d
+}
 cmd_stop()    { compose stop "$CONTAINER"; }
 cmd_restart() { compose restart "$CONTAINER"; }
 cmd_pull()    { compose pull; }
 cmd_update()  { compose pull && compose up -d; }
 
-cmd_migrate() {
-    echo "═══════════════════════════════════════════════"
-    echo "  mautrix-imessage → Docker migration (host)"
-    echo "═══════════════════════════════════════════════"
-    echo ""
-
-    # 1. Strip bare-Linux systemd-based shell aliases — they shell out to
-    #    `systemctl ... mautrix-imessage` and will no longer work.
-    local stripped=0
-    while IFS= read -r rc; do
-        [ -z "$rc" ] && continue
-        if strip_marker_block "$rc"; then
-            echo "✓ Removed managed-alias block from $rc"
-            stripped=1
-        fi
-    done < <(detect_rc_files)
-    [ "$stripped" -eq 0 ] && echo "✓ No managed-alias block found — nothing to strip from rc files."
-    echo ""
-
-    # 2. Stop + disable + remove the systemd unit.
-    local touched=0
-    if systemctl --user list-unit-files mautrix-imessage.service 2>/dev/null | grep -q mautrix-imessage; then
-        echo "Stopping + disabling systemd --user unit..."
-        systemctl --user stop mautrix-imessage 2>/dev/null || true
-        systemctl --user disable mautrix-imessage 2>/dev/null || true
-        rm -f "$HOME/.config/systemd/user/mautrix-imessage.service"
-        systemctl --user daemon-reload 2>/dev/null || true
-        echo "✓ systemd --user unit removed."
-        touched=1
-    fi
-    if systemctl list-unit-files mautrix-imessage.service 2>/dev/null | grep -q mautrix-imessage; then
-        echo "Stopping + disabling systemd system unit (sudo)..."
-        sudo systemctl stop mautrix-imessage 2>/dev/null || true
-        sudo systemctl disable mautrix-imessage 2>/dev/null || true
-        sudo rm -f /etc/systemd/system/mautrix-imessage.service
-        sudo systemctl daemon-reload 2>/dev/null || true
-        echo "✓ systemd system unit removed."
-        touched=1
-    fi
-    [ "$touched" -eq 0 ] && echo "✓ No systemd unit found — nothing to tear down."
-    echo ""
-
-    # 3. Sanity-check the state dir.
-    local config="$HOME/.local/share/mautrix-imessage/config.yaml"
-    if [ -d "$HOME/.local/share/mautrix-imessage" ] && [ -f "$config" ]; then
-        echo "✓ State at ~/.local/share/mautrix-imessage looks intact."
-
-        # 3a. Rewrite the absolute database URI in config.yaml. The
-        # bare-Linux install bakes the host appdata path into config
-        # (e.g. file:/root/.local/share/mautrix-imessage/mautrix-imessage.db
-        # or file:/home/<user>/...). Inside the container that path
-        # doesn't exist — the bind mount lives at /data — and SQLite
-        # comes back with "permission denied" on open. Normalize any
-        # absolute file:/sqlite: URI ending in mautrix-imessage.db to
-        # the container's /data path.
-        if grep -qE '(uri: (file|sqlite):/.+/mautrix-imessage\.db)' "$config"; then
-            sed -i -E 's|uri: file:/.+/mautrix-imessage\.db|uri: file:/data/mautrix-imessage.db|' "$config"
-            sed -i -E 's|uri: sqlite:/.+/mautrix-imessage\.db|uri: sqlite:/data/mautrix-imessage.db|' "$config"
-            echo "✓ Rewrote database URI in config.yaml to /data/mautrix-imessage.db"
-        fi
-    else
-        echo "⚠  State directory missing or empty. The bridge will run setup as a fresh install."
-    fi
-    echo ""
-
-    cat <<'EOF'
-Next:
-  1. Make sure your docker-compose.yml points at the existing state path
-     (~/.local/share/mautrix-imessage:/data by default in the example).
-  2. imessage start
-  3. The bridge should resume with no re-login. If you flip toggles or
-     re-login later: imessage setup.
-EOF
-}
 
 # ── dispatch ────────────────────────────────────────────────────────────────
 
@@ -391,7 +362,6 @@ case "$cmd" in
     restart)            cmd_restart "$@" ;;
     pull)               cmd_pull "$@" ;;
     update)             cmd_update "$@" ;;
-    migrate)            cmd_migrate "$@" ;;
     fix-perms)          cmd_fix_perms "$@" ;;
     ""|help|-h|--help)  usage ;;
     *)                  echo "error: unknown command '$cmd'" >&2; usage >&2; exit 2 ;;
