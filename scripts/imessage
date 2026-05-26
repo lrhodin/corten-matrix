@@ -97,7 +97,7 @@ detect_rc_files() {
 }
 
 # strip_marker_block <rc-file>
-# Idempotent: returns 0 if anything was stripped, 1 otherwise.
+# Safe to re-run: returns 0 if anything was stripped, 1 otherwise.
 strip_marker_block() {
     local rc="$1"
     if [ -f "$rc" ] && grep -qF "$MARKER_START" "$rc"; then

@@ -27,7 +27,7 @@ One line:
 curl -fsSL https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/install-imessage.sh | sudo bash
 ```
 
-The installer downloads the `imessage` script, drops it at `/usr/local/bin/imessage` (on `$PATH` by default on every standard Linux distro), verifies it's actually executable, and prints the next step. Idempotent — re-run any time to update to the latest version.
+The installer downloads the `imessage` script, drops it at `/usr/local/bin/imessage` (on `$PATH` by default on every standard Linux distro), verifies it's actually executable, and prints the next step. Safe to re-run any time to update to the latest version.
 
 Verify:
 
@@ -151,7 +151,7 @@ This:
 2. Stops, disables, and removes the `mautrix-imessage` systemd unit (user and system scopes — uses `sudo` only for the system scope).
 3. Confirms your state at `~/.local/share/mautrix-imessage` is intact.
 
-It's idempotent. Safe to re-run if something didn't complete the first time.
+Safe to re-run if something didn't complete the first time.
 
 ### Step 3 — Drop in the compose file
 
@@ -266,7 +266,7 @@ The Mac running the relay is a separate machine from the Docker host. The key ne
 
 **`imessage start` says "Cannot connect to the Docker daemon"** — make sure Docker is running and your user is in the `docker` group. Log out and back in after adding yourself.
 
-**`imessage logs` keeps showing `no /data/config.yaml yet`** — you never finished `imessage setup`, or the wizard exited mid-flow. Run it again; it's idempotent.
+**`imessage logs` keeps showing `no /data/config.yaml yet`** — you never finished `imessage setup`, or the wizard exited mid-flow. Run it again; it's safe to re-run.
 
 **Container restarts in a loop** — `imessage logs` shows the actual error. Most common cause: UID mismatch between the host appdata dir and the container's `PUID`. Check `stat -c '%u:%g' <your host path>` and set `PUID`/`PGID` in compose to match.
 

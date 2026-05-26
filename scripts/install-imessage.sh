@@ -2,8 +2,8 @@
 # ============================================================================
 # install-imessage.sh — bootstrap installer for the `imessage` host CLI.
 #
-# Run this once on the host to put `imessage` on $PATH. It's idempotent —
-# re-run any time to refresh to the latest version.
+# Run this once on the host to put `imessage` on $PATH. Safe to re-run
+# any time to upgrade to the latest version.
 #
 # Usage (safe to pipe through bash; fails fast on any error):
 #
