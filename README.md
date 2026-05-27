@@ -221,7 +221,18 @@ When the wizard finishes, the container detects the new `config.yaml` and starts
 > sudo bash install-imessage.sh
 > ```
 
-> **Stale curl download?** GitHub's raw CDN can serve cached copies of `master` for ~5 minutes. If you just merged a change upstream and your re-download still hands you the old file, append `?nocache=$(date +%s)` to the URL.
+> **Stale curl download?** GitHub's raw CDN can serve cached copies of `master` for ~5 minutes. If you just merged a change upstream and your re-download still hands you the old file, append `?nocache=$(date +%s)` — forces a fresh edge fetch:
+> ```bash
+> # The installer (Step 1 command, cache-busted):
+> curl -fsSL "https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/install-imessage.sh?nocache=$(date +%s)" | bash
+>
+> # The imessage wrapper directly, skipping install-imessage.sh:
+> curl -fsSL "https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/imessage?nocache=$(date +%s)" -o /usr/local/bin/imessage && chmod +x /usr/local/bin/imessage
+>
+> # The compose example (Step 2 command, cache-busted):
+> curl -fsSL "https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose.example.yml?nocache=$(date +%s)" -o docker-compose.yml
+> ```
+> Same trick works for any `raw.githubusercontent.com` URL: append `?nocache=$(date +%s)`.
 
 ### Configuring `docker-compose.yml`
 
