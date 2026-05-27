@@ -168,7 +168,7 @@ check_bind_mount_perms() {
             else
                 echo "[startup] fixing perms: $src → $target_user"
                 run_root_cmd chown -Rc "$target_user" "$src"
-                run_root_cmd chmod -Rc u+rwX "$src"
+                run_root_cmd chmod -Rc a+rwX "$src"
             fi
         elif [ "$mode" != "dry-run" ]; then
             echo "error: failed to create bind-mount source: $src" >&2
