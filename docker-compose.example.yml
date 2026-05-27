@@ -1,21 +1,8 @@
-# ============================================================================
-# Rustpush-Matrix — Docker compose example.
+# Linux-only Docker Compose example for Rustpush-Matrix.
 #
-# Edit the two values below for your host:
-#   - The bind mount (volumes)  — pick your appdata path
-#   - BEEPER                    — "true" for Beeper, "false" for self-hosted
-#
-# The host data directory MUST be owned by the UID:GID the container
-# runs as. By default that's 1000:1000 (the typical first Linux user).
-# If your bind-mount sources are owned by a different UID, update the
-# user: directive below to match. imessage start automatically checks and
-# corrects permissions, so there's nothing to do manually.
-#
-# Everything else (CardDAV, FaceTime toggle, StatusKit, HEIC, video
-# transcoding, preferred handle, …) is configured through the
-# interactive `imessage setup` wizard and persisted in config.yaml on
-# the bind mount. Compose stays minimal on purpose.
-# ============================================================================
+# Edit BEEPER and the two bind-mount sources for your host. The default
+# paths match native Linux installs so you can switch between Docker and
+# native without copying bridge state or bbctl auth.
 
 services:
   Rustpush-Matrix:
@@ -25,39 +12,25 @@ services:
     stdin_open: true
     tty: true
 
-    volumes:
-      # Bridge state (config.yaml, mautrix-imessage.db, session.json,
-      # trustedpeers.plist, ...). HOST path is your choice; the
-      # container only cares about /data internally. Examples:
-      #   Standard Linux desktop:  ~/.local/share/mautrix-imessage
-      #   UNRAID:                  /mnt/user/appdata/Rustpush-Matrix
-      #   Synology:                /volume1/docker/Rustpush-Matrix
-      #   TrueNAS Scale:           a dataset of your choice
-      - ~/.local/share/mautrix-imessage:/data
-
-      # bbctl Beeper auth — kept in its own host directory (same path
-      # bare-Linux uses), separate from bridge state. Lets you migrate
-      # an existing bare-Linux ~/.config/bridge-manager/ into the
-      # container with no copy, and lets bbctl auth survive any
-      # rm-rf of the bridge state dir.
-      - ~/.config/bridge-manager:/home/bridge/.config/bridge-manager
-
     environment:
-      # Which homeserver are you connecting to?
-      #   "true"  — Beeper
-      #   "false" — self-hosted Synapse / Dendrite / Conduit
+      # "true" for Beeper, "false" for a self-hosted Matrix homeserver.
       BEEPER: "true"
 
-    # UID:GID the container runs as. Default 1000:1000 (matches the
-    # bundled bridge user in the image and the typical first Linux user).
-    # Edit if your host bind-mount sources are owned by something else.
-    #
-    # Common alternatives:
-    #   user: "99:100"     # UNRAID (nobody:users)
-    #   user: "568:568"    # TrueNAS Scale (apps)
-    #   user: "0:0"        # root (discouraged; only if you must)
-    #
-    # Whatever UID:GID you pick, imessage start will automatically verify
-    # and correct bind-mount permissions to match. See docs/docker.md →
-    # "Finding your UID and GID" for how to look up your host UID.
+    volumes:
+      # Bridge state: config.yaml, database, session.json, trustedpeers.plist.
+      - type: bind
+        source: ${HOME}/.local/share/mautrix-imessage
+        target: /data
+
+      # bbctl Beeper auth. Keep this at the native Linux path so Docker and
+      # native installs share the same login state.
+      - type: bind
+        source: ${HOME}/.config/bridge-manager
+        target: /home/bridge/.config/bridge-manager
+
+    # Must match ownership of the bind-mount sources. Default 1000:1000 is
+    # the typical first Linux user. Common alternatives:
+    #   UNRAID:        "99:100"
+    #   TrueNAS Scale: "568:568"
+    #   root:          "0:0"    # discouraged unless required
     user: "1000:1000"

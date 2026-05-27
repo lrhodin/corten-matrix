@@ -94,6 +94,40 @@ compose() {
     fi
 }
 
+require_python3() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "error: python3 is required to parse docker compose output." >&2
+        echo "  Install it: apt install python3   (or your distro's equivalent)" >&2
+        exit 1
+    fi
+}
+
+render_compose_mounts() {
+    # Print tab-separated rows:
+    #   USER <uid:gid>
+    #   BIND <host source> <container target>
+    #
+    # Use rendered compose JSON instead of scraping YAML so both short-form
+    # and long-form bind mounts work the same way.
+    require_python3
+    compose config --format json | python3 -c '
+import sys, json
+cfg = json.load(sys.stdin)
+services = cfg.get("services", {})
+svc = services.get("Rustpush-Matrix") or next(iter(services.values()), {})
+user = str(svc.get("user") or "1000:1000")
+if ":" not in user:
+    user = f"{user}:{user}"
+print(f"USER\t{user}")
+for v in svc.get("volumes", []) or []:
+    if isinstance(v, dict) and v.get("type") == "bind":
+        src = v.get("source", "")
+        dst = v.get("target", "")
+        if src:
+            print(f"BIND\t{src}\t{dst}")
+'
+}
+
 # detect_rc_files() — print paths to host shell rc files that exist.
 # Same heuristic the bare-Linux installer uses (case "$SHELL"), but we
 # return all matching files because users may have both.
@@ -188,37 +222,15 @@ EOF
         exit 1
     fi
 
-    if ! command -v python3 >/dev/null 2>&1; then
-        echo "error: python3 is required to parse the compose file." >&2
-        echo "  Install it: apt install python3   (or your distro's equivalent)" >&2
-        exit 1
-    fi
-
     # Pull ALL bind-mount sources and the container user out of the
     # rendered compose JSON. The compose example has two: /data
     # (bridge state) and /home/bridge/.config/bridge-manager (bbctl
     # auth). Both need to be writable by the container's UID:GID.
     local parsed
-    parsed=$(compose config --format json | python3 -c '
-import sys, json
-cfg = json.load(sys.stdin)
-services = cfg.get("services", {})
-svc = services.get("Rustpush-Matrix") or next(iter(services.values()), {})
-user = svc.get("user") or "1000:1000"
-user = str(user)
-if ":" not in user:
-    user = f"{user}:{user}"
-print("USER", user)
-for v in svc.get("volumes", []) or []:
-    if isinstance(v, dict) and v.get("type") == "bind":
-        src = v.get("source", "")
-        dst = v.get("target", "")
-        if src:
-            print("BIND", src, dst)
-') || { echo "error: failed to parse compose config" >&2; exit 1; }
+    parsed=$(render_compose_mounts) || { echo "error: failed to parse compose config" >&2; exit 1; }
 
     local user_dir
-    user_dir=$(printf '%s\n' "$parsed" | awk '$1=="USER"{print $2}')
+    user_dir=$(printf '%s\n' "$parsed" | awk -F '\t' '$1=="USER"{print $2}')
     if ! printf '%s' "$user_dir" | grep -qE '^[0-9]+:[0-9]+$'; then
         echo "error: 'user: $user_dir' in compose isn't numeric UID:GID." >&2
         echo "  Edit docker-compose.yml's 'user:' line to a numeric form like \"1000:1000\"." >&2
@@ -227,7 +239,7 @@ for v in svc.get("volumes", []) or []:
 
     # Collect each bind mount source + its container destination.
     local binds
-    binds=$(printf '%s\n' "$parsed" | awk '$1=="BIND"{print $2" "$3}')
+    binds=$(printf '%s\n' "$parsed" | awk -F '\t' '$1=="BIND"{print $2 "\t" $3}')
     if [ -z "$binds" ]; then
         echo "error: no bind mounts found in compose." >&2
         exit 1
@@ -237,14 +249,14 @@ for v in svc.get("volumes", []) or []:
     echo "Read from your compose project:"
     echo "    container user: $user_dir"
     echo "    bind mounts:"
-    while IFS=' ' read -r src dst; do
+    while IFS=$'\t' read -r src dst; do
         [ -z "$src" ] && continue
         printf '        %-50s → %s\n' "$src" "$dst"
     done <<<"$binds"
 
     echo ""
     echo "About to chown each bind-mount source to $user_dir (recursively):"
-    while IFS=' ' read -r src dst; do
+    while IFS=$'\t' read -r src dst; do
         [ -z "$src" ] && continue
         if [ "$(id -u)" = "0" ]; then
             echo "    chown -R $user_dir $src"
@@ -260,7 +272,7 @@ for v in svc.get("volumes", []) or []:
         *) echo "Aborted."; exit 0 ;;
     esac
 
-    while IFS=' ' read -r src dst; do
+    while IFS=$'\t' read -r src dst; do
         [ -z "$src" ] && continue
         if [ ! -d "$src" ]; then
             echo "  → creating $src"
@@ -286,55 +298,43 @@ cmd_start() {
     # Check and fix bind-mount permissions before starting.
     echo "[startup] checking bind-mount permissions..."
 
-    local compose_file="$COMPOSE_FILE"
-    if [ -z "$compose_file" ]; then
-        [ -f docker-compose.yml ] && compose_file="docker-compose.yml"
-        [ -f docker-compose.yaml ] && compose_file="docker-compose.yaml"
+    if ! compose config --format json >/dev/null 2>&1; then
+        cat >&2 <<EOF
+error: docker compose can't render a compose file from here.
+
+start reads bind mounts from your compose project before starting.
+cd to the directory containing docker-compose.yml, or set
+IMESSAGE_COMPOSE_FILE to its absolute path.
+EOF
+        exit 1
     fi
 
-    if [ -n "$compose_file" ] && [ -f "$compose_file" ]; then
-        # Get the user: directive from compose.
-        local target_user
-        target_user=$(grep "^[[:space:]]*user:" "$compose_file" | head -1 | sed -E 's/^[[:space:]]*user:[[:space:]]*"?([0-9:]+)"?.*/\1/')
-        target_user="${target_user:-1000:1000}"
-
-        # Extract bind-mount paths from volumes section.
-        local in_volumes=0
-        while IFS= read -r line; do
-            if [[ $line =~ ^[[:space:]]*volumes: ]]; then
-                in_volumes=1
-                continue
-            fi
-            if [ "$in_volumes" -eq 1 ]; then
-                if [[ $line =~ ^[[:space:]]*[a-zA-Z] ]] && ! [[ $line =~ ^[[:space:]]*- ]]; then
-                    break
-                fi
-                if [[ $line =~ ^[[:space:]]*-[[:space:]]+ ]]; then
-                    local mount
-                    mount=$(echo "$line" | sed -E 's/^[[:space:]]*-[[:space:]]+([^:]+):.*/\1/')
-                    mount="${mount%\"}"
-                    mount="${mount#\"}"
-                    mount="${mount/#\~/$HOME}"
-
-                    if [ -n "$mount" ]; then
-                        if [ ! -d "$mount" ]; then
-                            echo "[startup] creating $mount"
-                            mkdir -p "$mount" 2>/dev/null || sudo mkdir -p "$mount" 2>/dev/null || true
-                        fi
-
-                        if [ -d "$mount" ]; then
-                            local current
-                            current=$(ls -ldn "$mount" 2>/dev/null | awk '{print $3":"$4}')
-                            if [ "$current" != "$target_user" ]; then
-                                echo "[startup] fixing perms: $mount ($current → $target_user)"
-                                chown -R "$target_user" "$mount" 2>/dev/null || sudo chown -R "$target_user" "$mount" 2>/dev/null || true
-                            fi
-                        fi
-                    fi
-                fi
-            fi
-        done < "$compose_file"
+    local parsed target_user
+    parsed=$(render_compose_mounts) || { echo "error: failed to parse compose config" >&2; exit 1; }
+    target_user=$(printf '%s\n' "$parsed" | awk -F '\t' '$1=="USER"{print $2}')
+    if ! printf '%s' "$target_user" | grep -qE '^[0-9]+:[0-9]+$'; then
+        echo "error: 'user: $target_user' in compose isn't numeric UID:GID." >&2
+        echo "  Edit docker-compose.yml's 'user:' line to a numeric form like \"1000:1000\"." >&2
+        exit 1
     fi
+
+    while IFS=$'\t' read -r kind mount dst; do
+        [ "$kind" = "BIND" ] || continue
+        [ -z "$mount" ] && continue
+        if [ ! -d "$mount" ]; then
+            echo "[startup] creating $mount"
+            mkdir -p "$mount" 2>/dev/null || sudo mkdir -p "$mount" 2>/dev/null || true
+        fi
+
+        if [ -d "$mount" ]; then
+            local current
+            current=$(ls -ldn "$mount" 2>/dev/null | awk '{print $3":"$4}')
+            if [ "$current" != "$target_user" ]; then
+                echo "[startup] fixing perms: $mount ($current → $target_user)"
+                chown -R "$target_user" "$mount" 2>/dev/null || sudo chown -R "$target_user" "$mount" 2>/dev/null || true
+            fi
+        fi
+    done <<<"$parsed"
 
     echo "[startup] starting container..."
     compose up -d

@@ -64,8 +64,12 @@ Open it in your editor:
 
    ```yaml
    volumes:
-     - ~/.local/share/mautrix-imessage:/data
-     - ~/.config/bridge-manager:/home/bridge/.config/bridge-manager
+     - type: bind
+       source: ${HOME}/.local/share/mautrix-imessage
+       target: /data
+     - type: bind
+       source: ${HOME}/.config/bridge-manager
+       target: /home/bridge/.config/bridge-manager
    ```
 
    - `/data` holds bridge state (`config.yaml`, `mautrix-imessage.db`, `session.json`, `trustedpeers.plist`, …). Path matches bare-Linux's `~/.local/share/mautrix-imessage/`, so migrating in either direction is a no-copy operation.
