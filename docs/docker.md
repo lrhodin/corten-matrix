@@ -55,12 +55,12 @@ curl -L https://raw.githubusercontent.com/lrhodin/imessage/master/docker-compose
     -o docker-compose.yml
 ```
 
-### Step 3 — Edit two things in `docker-compose.yml`
+### Step 3 — Edit `docker-compose.yml`
 
-Open it in your editor:
+Open it in your editor. One required edit, one platform-dependent, one optional:
 
-1. **`BEEPER` env var** — set to `"true"` for a Beeper deploy or `"false"` for a self-hosted homeserver.
-2. **The bind mounts** under `volumes:`. There are two by default:
+1. **`BEEPER` env var** *(required)* — set to `"true"` for a Beeper deploy or `"false"` for a self-hosted homeserver.
+2. **The bind mounts** under `volumes:` *(only if you're not on standard Linux)*. There are two by default:
 
    ```yaml
    volumes:
@@ -84,7 +84,7 @@ Open it in your editor:
    | Synology | `/volume1/docker/Rustpush-Matrix/data` | `/volume1/docker/Rustpush-Matrix/bbctl` |
    | TrueNAS / ZFS | dataset of your choice | dataset of your choice |
 
-If your host bind-mount sources are owned by a UID/GID other than `1000:1000` — or if you want the bridge to *write* as a different UID — edit the `PUID:` and `PGID:` env vars in compose. See [Finding your UID and GID](#finding-your-uid-and-gid) for how to look them up. The container's root prelude chowns the bind mounts to whatever you set on first start (and only then), so you don't have to chown anything by hand.
+3. **`PUID` / `PGID`** *(optional, defaults `1000:1000`)* — the UID/GID the bridge runs as. Edit these if you want the bridge to write as a different user (UNRAID `99:100`, TrueNAS `568:568`, etc.). See [Finding your UID and GID](#finding-your-uid-and-gid). You don't need to chown your bind mounts to match — the container's root prelude does that on first start.
 
 ### Step 4 — Start the container
 
@@ -148,7 +148,7 @@ The `imessage` CLI is a thin wrapper — every subcommand maps to a small number
 |---|---|
 | `setup` | `docker exec -it Rustpush-Matrix as-bridge imessage-setup` |
 | `login` | `docker exec -it Rustpush-Matrix as-bridge /entrypoint.sh login` |
-| `logs` | `tail -F <host bind-mount>/logs/bridge.log` (read from host directly; works even when the container is stopped or restart-looping) |
+| `logs` | When the container is running: `docker exec -it Rustpush-Matrix tail -F /data/logs/bridge.log` (inotify across bind mounts is unreliable, so we tail from inside). When the container is stopped or restart-looping: `tail -F <host bind-mount>/logs/bridge.log` from the host. |
 | `status` | `docker ps --filter name=^Rustpush-Matrix$` |
 | `shell` | `docker exec -it Rustpush-Matrix as-bridge bash` |
 | `bbctl <args>` | `docker exec -it Rustpush-Matrix as-bridge bbctl <args>` |
@@ -216,7 +216,7 @@ id -u        # just the UID, e.g. 1000
 id -g        # just the GID, e.g. 1000
 ```
 
-**The UID/GID that owns an existing directory** — most useful before starting the container, to make sure your bind-mount source paths line up with the container's user:
+**The UID/GID that owns an existing directory** — most useful when you want to set `PUID:PGID` to match files that already exist on disk (e.g. state copied from a bare-Linux install):
 
 ```bash
 stat -c '%u:%g' ~/.local/share/mautrix-imessage           # numeric:  1000:1000
@@ -309,7 +309,7 @@ You only need to edit `config.yaml` when the URI's path **doesn't match** your c
 
 Either edit is safe to apply while the container is stopped (`imessage stop`, edit, `imessage start`). The state files (`mautrix-imessage.db`, `session.json`, `trustedpeers.plist`, …) don't need to move — only the URI changes.
 
-**Bridge starts but Beeper doesn't see it** — `imessage logs` should show the appservice connecting. If it doesn't, the registration / login didn't complete. Re-run `imessage setup`.
+**Bridge starts but doesn't show up in your homeserver** — `imessage logs` should show the appservice connecting. If it doesn't, the registration / login didn't complete. On Beeper: re-run `imessage setup`. Self-hosted: confirm the bridge's `as_token`/`hs_token` and namespace from `<bind-mount>/registration.yaml` are loaded by your homeserver and that the homeserver URL in `config.yaml` is reachable from inside the container.
 
 **Need a shell inside the container** — `imessage shell` (drops you into bash as the bridge user).
 
