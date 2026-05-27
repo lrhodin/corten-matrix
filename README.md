@@ -190,7 +190,7 @@ When the script finishes you're already logged in and the bridge is up.
 
 > **Linux only. Don't run the bridge in Docker on macOS** — Docker Desktop on Mac runs the daemon in a slow VM and has flaky bind mounts. Mac users always use `make install` / `make install-beeper`.
 
-The Docker path bundles the same binary (built with `make build` so all rustpush patches apply), runs the existing install scripts inside the container, and stores state on a bind mount you choose — `~/.local/share/mautrix-imessage` by default (matches bare-Linux so migration is trivial), or wherever fits your platform. The image lives at `ghcr.io/lrhodin/imessage` and is built for `linux/amd64` + `linux/arm64`, so it runs on x86_64 boxes as well as ARM hosts. The bridge is driven from the host with a small CLI called `imessage`, which is a thin wrapper around `docker exec` / `docker compose`. Prereqs: Docker Engine 20.10+, `docker compose` v2 (`docker compose version`, not `docker-compose`), a Beeper account or your own Matrix homeserver, and a hardware key extracted once from a Mac ([Step 1 above](#step-1-extract-hardware-key-one-time-on-your-mac)).
+The Docker path bundles the same binary (built with `make build` so all rustpush patches apply), runs the existing install scripts inside the container, and stores state on a bind mount you choose — `~/.local/share/mautrix-imessage` by default (matches bare-Linux so migration is trivial), or wherever fits your platform. The image lives at `ghcr.io/lrhodin/imessage` and is built for `linux/amd64` + `linux/arm64`, so it runs on x86_64 boxes as well as ARM hosts. The bridge is driven from the host with a small CLI called `imessage`, which is a thin wrapper around `docker exec` / `docker compose`. Prereqs: Docker Engine 20.10+ and `docker compose` v2 (`docker compose version`, not `docker-compose`) — install via Docker's official docs at <https://docs.docker.com/engine/install/> if you don't have it yet. Plus a Beeper account or your own Matrix homeserver, and a hardware key extracted once from a Mac ([Step 1 above](#step-1-extract-hardware-key-one-time-on-your-mac)).
 
 ### Install
 
@@ -214,6 +214,13 @@ imessage setup
 
 When the wizard finishes, the container detects the new `config.yaml` and starts the bridge. `imessage logs` shows it running. Send yourself an iMessage to confirm the round trip.
 
+> **Want to read the installer before running it?** Sensible — `curl | bash` is a trust call. Download and inspect first:
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/lrhodin/imessage/master/scripts/install-imessage.sh -o install-imessage.sh
+> less install-imessage.sh
+> sudo bash install-imessage.sh
+> ```
+
 > **Stale curl download?** GitHub's raw CDN can serve cached copies of `master` for ~5 minutes. If you just merged a change upstream and your re-download still hands you the old file, append `?nocache=$(date +%s)` to the URL.
 
 ### Configuring `docker-compose.yml`
@@ -234,19 +241,23 @@ One required edit, one platform-dependent, one optional:
 
 To look up your own: `id -u` / `id -g`, or `stat -c '%u:%g' <path>` for an existing directory.
 
-### Day-to-day commands
+### Commands
 
-| Want to… | Run |
-|---|---|
-| Tail bridge logs | `imessage logs` |
-| Check if it's running | `imessage status` |
-| Restart the bridge | `imessage restart` |
-| Stop / start it | `imessage stop` / `imessage start` |
-| Pull a new image + restart | `imessage update` |
-| Re-run iMessage login | `imessage login` |
-| Re-run setup (flip a toggle) | `imessage setup` |
-| Debug shell inside | `imessage shell` |
-| `bbctl` (Beeper bridge-manager) | `imessage bbctl <args>` |
+The `imessage` CLI is a thin wrapper — every subcommand maps to a small `docker` / `docker compose` invocation. Useful when debugging, when teaching someone else, or when you want to do the same thing manually:
+
+| Want to… | Run | Equivalent raw command |
+|---|---|---|
+| Tail bridge logs | `imessage logs` | When the container is running: `docker exec -it Rustpush-Matrix tail -F /data/logs/bridge.log` (inotify across bind mounts is unreliable, so we tail from inside). When stopped or restart-looping: `tail -F <host bind-mount>/logs/bridge.log` from the host. |
+| Check if it's running | `imessage status` | `docker ps --filter name=^Rustpush-Matrix$` |
+| Restart the bridge | `imessage restart` | `docker compose restart Rustpush-Matrix` |
+| Stop / start it | `imessage stop` / `imessage start` | `docker compose stop Rustpush-Matrix` / `docker compose up -d` (the container's root prelude handles bind-mount perms + host-path symlinks at startup) |
+| Pull a new image + restart | `imessage update` | `docker compose pull && docker compose up -d` |
+| Re-run iMessage login | `imessage login` | `docker exec -it Rustpush-Matrix as-bridge /entrypoint.sh login` |
+| Re-run setup (flip a toggle) | `imessage setup` | `docker exec -it Rustpush-Matrix as-bridge imessage-setup` |
+| Debug shell inside | `imessage shell` | `docker exec -it Rustpush-Matrix as-bridge bash` |
+| `bbctl` (Beeper bridge-manager) | `imessage bbctl <args>` | `docker exec -it Rustpush-Matrix as-bridge bbctl <args>` |
+
+`as-bridge` is a tiny in-container wrapper that re-applies the entrypoint's setpriv drop to `PUID:PGID` — `docker exec` inherits the container's USER (root, so the entrypoint can chown bind mounts at PID 1), so without `as-bridge` every host-side `imessage bbctl …` would run as root inside the container. When the wrapper invokes `docker compose`, it inserts `-f "$IMESSAGE_COMPOSE_FILE"` if that env var is set, otherwise compose looks in the current directory.
 
 `setup` / `login` / `logs` / `status` / `shell` / `bbctl` work from anywhere (found by container name). Lifecycle commands (`start` / `stop` / `restart` / `pull` / `update`) need to be in the `docker-compose.yml` directory, or set `IMESSAGE_COMPOSE_FILE=~/docker/imessage/docker-compose.yml` in your shell rc to run them from anywhere.
 
