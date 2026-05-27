@@ -179,9 +179,10 @@ RUN wget -qO /tmp/AppleRootCA.cer https://www.apple.com/appleca/AppleIncRootCert
     && update-ca-certificates --fresh >/dev/null 2>&1 \
     && rm -f /tmp/AppleRootCA.cer
 
-# Non-root user with a stable UID/GID. Matches the typical first Linux
-# user (1000:1000), so bind mounts on hosts where appdata is also
-# 1000:1000 work without chown gymnastics.
+# Non-root user defined at a stable UID/GID. The container's PID 1 starts
+# as root so the entrypoint can chown bind mounts and create host-path
+# symlinks; it then setpriv-drops to PUID:PGID (defaults 1000:1000, from
+# env vars in compose) and re-execs to run the bridge.
 #
 # Home-directory layout mirrors bare-Linux exactly so install scripts
 # that build $HOME/.local/share/mautrix-imessage/... paths land in
@@ -196,8 +197,7 @@ RUN groupadd --system --gid 1000 bridge \
     && mkdir -p /home/bridge/.local/share /home/bridge/.config \
     && ln -sf /data /home/bridge/.local/share/mautrix-imessage \
     && chown -R bridge:bridge /home/bridge \
-    && mkdir -p /data \
-    && chown bridge:bridge /data
+    && mkdir -p /data
 
 # Copy the built binaries and the existing install scripts. The scripts
 # stay as-is; the entrypoint dispatches to them. Three sections inside
@@ -208,17 +208,23 @@ COPY --from=builder /src/bbctl              /usr/local/bin/bbctl
 COPY --from=builder /src/scripts/install-linux.sh        /opt/imessage/scripts/install-linux.sh
 COPY --from=builder /src/scripts/install-beeper-linux.sh /opt/imessage/scripts/install-beeper-linux.sh
 
-# Entrypoint + the imessage-setup convenience wrapper.
+# Entrypoint + the imessage-setup convenience wrapper + as-bridge.
+#
+# as-bridge re-applies the entrypoint's setpriv drop for any command
+# invoked via `docker exec`. exec inherits the container's USER (root
+# here, because the entrypoint needs root for chown/symlink at PID 1),
+# so without this wrapper a host-side `imessage bbctl …` would run
+# bbctl as root and write root-owned files into the bbctl bind mount.
 COPY scripts/docker-entrypoint.sh /entrypoint.sh
 COPY scripts/imessage-setup.sh    /usr/local/bin/imessage-setup
-RUN chmod +x /entrypoint.sh /usr/local/bin/imessage-setup /opt/imessage/scripts/*.sh
+COPY scripts/as-bridge.sh         /usr/local/bin/as-bridge
+RUN chmod +x /entrypoint.sh /usr/local/bin/imessage-setup /usr/local/bin/as-bridge /opt/imessage/scripts/*.sh
 
 # State directory. WORKDIR /data is load-bearing: Rust hardcodes
 # `state/anisette/` as a relative path (pkg/rustpushgo/src/lib.rs).
-# Don't change it. Initial chown sets ownership for the case where
-# Docker auto-creates the bind mount source; the entrypoint re-chowns
-# on every start to honor PUID/PGID overrides.
-RUN mkdir -p /data && chown bridge:bridge /data
+# Don't change it. The entrypoint chowns this to PUID:PGID on first
+# start (and only when find spots a mismatched file thereafter).
+RUN mkdir -p /data
 
 WORKDIR /data
 VOLUME ["/data"]
@@ -227,16 +233,19 @@ EXPOSE 29325
 # XDG env vars left unset on purpose. User config persistence is defined by
 # docker-compose.yml bind mounts, not by image-level path overrides.
 
-# Container runs as the bridge user (UID:GID 1000:1000) from PID 1.
-# No privilege transitions, no gosu — what Docker starts is what runs.
+# No USER directive — PID 1 enters /entrypoint.sh as root so it can chown
+# bind mounts to PUID:PGID and create the host-source → /data symlink.
+# The prelude then `setpriv`s to PUID:PGID (defaults 1000:1000) and
+# re-execs the script for the actual bridge run. Override the target
+# UID/GID via env vars in docker-compose.yml:
 #
-# Override via `user:` in docker-compose.yml for hosts where the
-# appdata directory is owned by a different UID:
-#   user: "99:100"    # UNRAID
-#   user: "0:0"       # root
-# Whichever you pick, the host data directory must be chowned to
-# match (sudo chown -R <uid>:<gid> /path/to/data/dir).
-USER bridge
+#   environment:
+#     PUID: "99"       # UNRAID nobody
+#     PGID: "100"      # UNRAID users
+#
+# Both fixes (perms + symlink) are conditional — they no-op when the
+# bind mount is already in the right shape, so the prelude is a quiet
+# `find -quit` on subsequent starts.
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["run"]

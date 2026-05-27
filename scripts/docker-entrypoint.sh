@@ -12,16 +12,97 @@
 #             in compose selects which.
 #   login   — re-run only the iMessage login flow.
 #
-# Host-side concerns (shell aliases, bare-Linux migration, fixing data
-# dir permissions) live in the `imessage` host CLI script in this repo
-# (scripts/imessage). The container only does container things.
+# Privilege model:
+#   The image's USER is root so PID 1 enters this script with full
+#   privileges. The root prelude below — gated on `id -u = 0` and a
+#   needs-fix check — chowns bind mounts to PUID:PGID and creates a
+#   host-source → /data symlink so absolute paths baked into
+#   config.yaml by the bare-Linux installer (e.g. file:/root/.local/
+#   share/mautrix-imessage/mautrix-imessage.db) resolve inside the
+#   container. Then setpriv drops to PUID:PGID and re-execs this
+#   script. The second pass skips the prelude and runs the bridge as
+#   the configured user.
 #
-# The container runs as the `bridge` user (UID:GID 1000:1000) from PID
-# 1, set via USER in the Dockerfile. No privilege transitions. Users
-# who need a different UID/GID override via `user:` in compose AND
-# chown their data dir to match (`imessage fix-perms` automates this).
+#   `docker exec` invocations from the host wrapper run as root by
+#   default (the container's USER), so they go through
+#   /usr/local/bin/as-bridge which applies the same setpriv drop.
 # ============================================================================
 set -euo pipefail
+
+# ── Root prelude ────────────────────────────────────────────────────────────
+# Only runs on the first pass (real container start, before setpriv). After
+# the re-exec we're running as PUID:PGID and the `id -u = 0` check skips
+# this whole block.
+#
+# Every fix below is conditional — chown only when find spots a mismatched
+# file; symlink only when readlink doesn't already match. Repeat invocations
+# (`docker restart`, `compose up -d` against an unchanged container) cost a
+# single find -quit each and exit silently.
+if [ "$(id -u)" = "0" ]; then
+    PUID="${PUID:-1000}"
+    PGID="${PGID:-1000}"
+
+    if ! printf '%s' "$PUID" | grep -qE '^[0-9]+$' || ! printf '%s' "$PGID" | grep -qE '^[0-9]+$'; then
+        echo "[entrypoint] PUID/PGID must be numeric (got PUID=$PUID PGID=$PGID)" >&2
+        exit 1
+    fi
+
+    # find -quit returns the first path that fails ANY of the four criteria
+    # (wrong uid, wrong gid, dir without 0777, file without 0666). If
+    # nothing fails, the find returns empty and we skip the recursive
+    # chown/chmod entirely — the common steady-state case.
+    needs_fix() {
+        local dir="$1" uid="$2" gid="$3"
+        [ -d "$dir" ] || return 1
+        local bad
+        bad=$(find "$dir" \( \
+            ! -user "$uid" -o \
+            ! -group "$gid" -o \
+            \( -type d ! -perm -0777 \) -o \
+            \( ! -type d ! -perm -0666 \) \
+        \) -print -quit 2>/dev/null || true)
+        [ -n "$bad" ]
+    }
+
+    for dir in /data /home/bridge/.config/bbctl; do
+        if needs_fix "$dir" "$PUID" "$PGID"; then
+            echo "[entrypoint] fixing perms: $dir → $PUID:$PGID"
+            chown -R "$PUID:$PGID" "$dir"
+            chmod -R a+rwX "$dir"
+        fi
+    done
+
+    # Mirror the host bind-mount source path inside the container, pointing
+    # at /data. Lets absolute paths from a bare-Linux install (e.g. config
+    # has `uri: file:/root/.local/share/mautrix-imessage/mautrix-imessage.db`)
+    # resolve when the bridge runs in Docker. /proc/self/mountinfo field 4
+    # is the host-side source for bind mounts; field 5 is the mount point.
+    host_src=$(awk '$5 == "/data" { print $4; exit }' /proc/self/mountinfo)
+    if [ -n "$host_src" ] && [ "$host_src" != "/data" ]; then
+        case "$host_src" in
+            /*)
+                current=$(readlink "$host_src" 2>/dev/null || true)
+                if [ "$current" != "/data" ]; then
+                    if [ -e "$host_src" ] && [ ! -L "$host_src" ]; then
+                        echo "[entrypoint] WARN: $host_src exists and is not a symlink; skipping host-path link" >&2
+                    else
+                        echo "[entrypoint] linking $host_src → /data"
+                        mkdir -p "$(dirname "$host_src")"
+                        ln -sfn /data "$host_src"
+                    fi
+                fi
+                ;;
+        esac
+    fi
+
+    # --clear-groups (not --init-groups): --init-groups looks PUID up in
+    # /etc/passwd via getpwuid, which fails for arbitrary UIDs without an
+    # /etc/passwd entry (UNRAID 99:100, TrueNAS 568:568, etc.). --clear-groups
+    # drops all supplementary groups; the bridge doesn't need any inside
+    # this container.
+    export HOME=/home/bridge
+    exec setpriv --reuid "$PUID" --regid "$PGID" --clear-groups -- "$0" "$@"
+fi
 
 BIN=/usr/local/bin/mautrix-imessage-v2
 DATA_DIR=/data
