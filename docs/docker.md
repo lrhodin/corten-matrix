@@ -284,9 +284,32 @@ The Mac running the relay is a separate machine from the Docker host. The key ne
 
 **Container restarts in a loop** — `imessage logs` shows the actual error. The container's root prelude chowns bind mounts to `PUID:PGID` and creates the host-path symlink on every start where they're not already right, so persistent permission errors usually mean either (a) the bind mount itself isn't writable by root (read-only filesystem, immutable bits, SELinux/AppArmor denials) or (b) the bridge is failing for unrelated reasons. Read the actual error from `imessage logs`.
 
-**Bridge starts but Beeper doesn't see it** — `imessage logs` should show the appservice connecting. If it doesn't, the registration / login didn't complete. Re-run `imessage setup`.
+**`unable to open database file: permission denied` or `no such file or directory`** — this is a `config.yaml` path issue, not a bind-mount permission issue. Bridge config lives at `/data/config.yaml` inside the container, which is `<your host bind-mount source>/config.yaml` on disk. Open it and look at the two `uri:` lines:
 
-**"403 Forbidden" or "401 Unauthorized" from Apple IDS** — your hardware key may have aged out or been invalidated. Re-extract the key on the Mac and re-run `imessage login`.
+```yaml
+uri: file:/root/.local/share/mautrix-imessage/mautrix-imessage.db
+# or:
+uri: sqlite:/root/.local/share/mautrix-imessage/mautrix-imessage.db
+```
+
+The bare-Linux installer bakes an **absolute** host path into those URIs when it runs. The container's root prelude handles the common case automatically: it reads the bind mount's host source from `/proc/self/mountinfo` and creates a symlink at that path inside the container pointing to `/data`. So if your compose has `source: /root/.local/share/mautrix-imessage`, that exact path resolves inside the container without editing config.
+
+You only need to edit `config.yaml` when the URI's path **doesn't match** your compose bind-mount source — most commonly when you copied state from another machine, or when the original native install ran under a different `$HOME`. Two ways to fix:
+
+- **Relative path (recommended):** edit each `uri:` line so the path is just the filename, no directories:
+  ```yaml
+  uri: file:mautrix-imessage.db
+  ```
+  The bridge resolves relative paths against its working directory, which is `/data`. Works on any host without further edits.
+
+- **Or rewrite to the new absolute path:** swap the old path for `/data` (or your current host bind-mount source):
+  ```yaml
+  uri: file:/data/mautrix-imessage.db
+  ```
+
+Either edit is safe to apply while the container is stopped (`imessage stop`, edit, `imessage start`). The state files (`mautrix-imessage.db`, `session.json`, `trustedpeers.plist`, …) don't need to move — only the URI changes.
+
+**Bridge starts but Beeper doesn't see it** — `imessage logs` should show the appservice connecting. If it doesn't, the registration / login didn't complete. Re-run `imessage setup`.
 
 **Need a shell inside the container** — `imessage shell` (drops you into bash as the bridge user).
 
