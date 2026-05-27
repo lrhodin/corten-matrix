@@ -25,8 +25,8 @@ services:
       # bbctl Beeper auth. Keep this at the native Linux path so Docker and
       # native installs share the same login state.
       - type: bind
-        source: ${HOME}/.config/bridge-manager
-        target: /home/bridge/.config/bridge-manager
+        source: ${HOME}/.config/bbctl
+        target: /home/bridge/.config/bbctl
 
     # Must match ownership of the bind-mount sources. Default 1000:1000 is
     # the typical first Linux user. Common alternatives:

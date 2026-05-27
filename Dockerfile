@@ -189,16 +189,16 @@ RUN wget -qO /tmp/AppleRootCA.cer https://www.apple.com/appleca/AppleIncRootCert
 #
 #   $HOME                                       = /home/bridge
 #   /home/bridge/.local/share/mautrix-imessage  → symlink to /data
-#   /home/bridge/.config/bridge-manager         ← compose bind mount
+#   /home/bridge/.config/bbctl                  ← compose bind mount
 #                                                  for bbctl Beeper auth
 #
-# bbctl writes auth credentials to $HOME/.config/bridge-manager — same
+# bbctl writes auth credentials to $HOME/.config/bbctl/config.json — same
 # path as bare-Linux. The compose example bind-mounts the host's
-# ~/.config/bridge-manager directly there, so existing bare-Linux auth
+# ~/.config/bbctl directly there, so existing bare-Linux auth
 # migrates without copy, and Docker auth persists across restarts.
 RUN groupadd --system --gid 1000 bridge \
     && useradd --system --uid 1000 --gid 1000 --create-home --shell /bin/bash bridge \
-    && mkdir -p /home/bridge/.local/share /home/bridge/.config/bridge-manager \
+    && mkdir -p /home/bridge/.local/share /home/bridge/.config/bbctl \
     && ln -sf /data /home/bridge/.local/share/mautrix-imessage \
     && chown -R bridge:bridge /home/bridge \
     && mkdir -p /data \
@@ -230,7 +230,7 @@ VOLUME ["/data"]
 EXPOSE 29325
 
 # XDG env vars left unset on purpose — bbctl uses its default of
-# $HOME/.config/bridge-manager, which is bind-mounted from the host
+# $HOME/.config/bbctl/config.json, which is bind-mounted from the host
 # via compose. Same path as bare-Linux, so auth migrates cleanly.
 
 # Container runs as the bridge user (UID:GID 1000:1000) from PID 1.

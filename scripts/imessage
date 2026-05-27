@@ -224,7 +224,7 @@ EOF
 
     # Pull ALL bind-mount sources and the container user out of the
     # rendered compose JSON. The compose example has two: /data
-    # (bridge state) and /home/bridge/.config/bridge-manager (bbctl
+    # (bridge state) and /home/bridge/.config/bbctl (bbctl
     # auth). Both need to be writable by the container's UID:GID.
     local parsed
     parsed=$(render_compose_mounts) || { echo "error: failed to parse compose config" >&2; exit 1; }

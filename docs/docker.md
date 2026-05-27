@@ -68,18 +68,18 @@ Open it in your editor:
        source: ${HOME}/.local/share/mautrix-imessage
        target: /data
      - type: bind
-       source: ${HOME}/.config/bridge-manager
-       target: /home/bridge/.config/bridge-manager
+       source: ${HOME}/.config/bbctl
+       target: /home/bridge/.config/bbctl
    ```
 
    - `/data` holds bridge state (`config.yaml`, `mautrix-imessage.db`, `session.json`, `trustedpeers.plist`, …). Path matches bare-Linux's `~/.local/share/mautrix-imessage/`, so migrating in either direction is a no-copy operation.
-   - `/home/bridge/.config/bridge-manager` holds `bbctl`'s Beeper auth — same path bare-Linux puts it at (`~/.config/bridge-manager/`). Kept separate from bridge state on purpose: a bare-Linux user migrating their existing `~/.config/bridge-manager/` keeps their Beeper login, and `imessage bbctl logout` doesn't touch bridge state.
+   - `/home/bridge/.config/bbctl` holds `bbctl`'s Beeper auth — same path bare-Linux puts it at (`~/.config/bbctl/`). Kept separate from bridge state on purpose: a bare-Linux user migrating their existing `~/.config/bbctl/` keeps their Beeper login, and `imessage bbctl logout` doesn't touch bridge state.
 
    For non-default platforms, change the left side of each line:
 
    | Platform | Bridge state path | bbctl path |
    |---|---|---|
-   | Standard Linux | `~/.local/share/mautrix-imessage` | `~/.config/bridge-manager` |
+   | Standard Linux | `~/.local/share/mautrix-imessage` | `~/.config/bbctl` |
    | UNRAID | `/mnt/user/appdata/Rustpush-Matrix/data` | `/mnt/user/appdata/Rustpush-Matrix/bbctl` |
    | Synology | `/volume1/docker/Rustpush-Matrix/data` | `/volume1/docker/Rustpush-Matrix/bbctl` |
    | TrueNAS / ZFS | dataset of your choice | dataset of your choice |
