@@ -140,6 +140,27 @@ run_root_cmd() {
     fi
 }
 
+bind_mount_needs_repair() {
+    local src="$1"
+    local target_user="$2"
+    local uid="${target_user%%:*}"
+    local gid="${target_user##*:}"
+    local first_bad
+
+    # Match the repair policy below:
+    #   chown -R UID:GID
+    #   chmod -R a+rwX
+    # Directories need rwx for all so SQLite can create journal/WAL files;
+    # regular files need rw for all for NAS/user-namespace bind mounts.
+    first_bad=$(find "$src" \( \
+        ! -user "$uid" -o \
+        ! -group "$gid" -o \
+        \( -type d ! -perm -0777 \) -o \
+        \( ! -type d ! -perm -0666 \) \
+    \) -print -quit 2>/dev/null || true)
+    [ -n "$first_bad" ]
+}
+
 check_bind_mount_perms() {
     local parsed="$1"
     local target_user="$2"
@@ -162,10 +183,12 @@ check_bind_mount_perms() {
             if [ "$mode" = "dry-run" ]; then
                 if [ "$(id -u)" = "0" ]; then
                     echo "    chown -R $target_user $src"
+                    echo "    chmod -R a+rwX $src"
                 else
                     echo "    sudo chown -R $target_user $src"
+                    echo "    sudo chmod -R a+rwX $src"
                 fi
-            else
+            elif bind_mount_needs_repair "$src" "$target_user"; then
                 echo "[startup] fixing perms: $src → $target_user"
                 run_root_cmd chown -Rc "$target_user" "$src"
                 run_root_cmd chmod -Rc a+rwX "$src"
