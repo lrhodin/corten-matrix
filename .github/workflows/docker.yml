@@ -1,10 +1,12 @@
 # ============================================================================
 # docker.yml — build + push the mautrix-imessage-v2 image to GHCR.
 #
-# Manual dispatch ONLY. This workflow does NOT auto-run on push or PR —
-# each run takes ~15-20 min cold and shouldn't fire on every commit.
-# Trigger via Actions → docker → "Run workflow" when you want a new
-# image published.
+# Manual dispatch ONLY. Each arch builds natively on its own hosted runner
+# (ubuntu-latest for amd64, ubuntu-24.04-arm for arm64 — both free on
+# public repos), then a small merge job stitches the per-arch digests into
+# one multi-arch manifest under the requested tags. Avoids the ~2 h QEMU
+# emulation cost the previous all-in-one job paid for arm64. Cold runs
+# land around ~10 min; warm runs ~5 min.
 #
 # After the first successful push, set the GHCR package visibility to
 # Public via the GitHub UI (one-time): Package settings → Change visibility.
@@ -28,12 +30,86 @@ concurrency:
   group: docker-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  IMAGE: ghcr.io/lrhodin/imessage
+
 jobs:
-  build-and-push:
-    name: Build & push image
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            scope: linux-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            scope: linux-arm64
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # push-by-digest=true: each per-arch job uploads its image blob to
+      # GHCR keyed only by digest (no tags). The merge job below assembles
+      # those digests into a tagged multi-arch manifest. name-canonical
+      # ensures the pushed name matches IMAGE exactly so imagetools can
+      # reference it by `IMAGE@sha256:...` afterwards.
+      #
+      # provenance: false — build-push-action@v6's default SLSA provenance
+      # attestation makes each per-arch push land as an OCI index (image
+      # manifest + attestation manifest). `steps.build.outputs.digest`
+      # would then point at that index, and `imagetools create` would
+      # build a manifest list of indexes, which some runtimes pull oddly.
+      # The Docker docs' multi-runner example disables provenance here for
+      # exactly this reason. The old single-job workflow had provenance
+      # on, so dropping it isn't a regression worth defending.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.scope }}
+
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.scope }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge manifest & push tags
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -48,35 +124,20 @@ jobs:
       - name: Resolve image tags
         id: tags
         run: |
-          IMAGE=ghcr.io/lrhodin/imessage
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          TAGS="$IMAGE:sha-$SHORT_SHA"
+          TAG_ARGS="-t ${IMAGE}:sha-${SHORT_SHA}"
           EXTRA="${{ inputs.tag }}"
           if [ -n "$EXTRA" ]; then
-            TAGS="$TAGS,$IMAGE:$EXTRA"
+            TAG_ARGS="$TAG_ARGS -t ${IMAGE}:${EXTRA}"
           fi
-          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
-          echo "Will push: $TAGS"
+          echo "tag_args=$TAG_ARGS" >> "$GITHUB_OUTPUT"
+          echo "Will push: $TAG_ARGS"
 
-      - name: Set up QEMU (cross-arch emulation for arm64 build)
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create ${{ steps.tags.outputs.tag_args }} \
+            $(printf "${IMAGE}@sha256:%s " *)
 
-      - name: Build & push (linux/amd64, linux/arm64)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          # arm64 exists so the image runs on Oracle Cloud's free-tier
-          # Ampere VMs (4 OCPU + 24 GB RAM, perpetually free — the natural
-          # place to park this bridge if you don't have a Linux box at
-          # home) and Raspberry Pi 4/5. rustpush + open-absinthe +
-          # unicorn-engine all compile from source, so cold arm64 builds
-          # via QEMU take ~25-30 min. The GHA cache (cache-to:
-          # type=gha,mode=max) brings warm runs back in line with amd64.
-          # Manual-dispatch only, so this only fires when you ask for it.
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Inspect resulting image
+        run: docker buildx imagetools inspect ${IMAGE}:sha-$(echo "${{ github.sha }}" | cut -c1-7)

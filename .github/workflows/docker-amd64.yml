@@ -63,10 +63,11 @@ jobs:
         with:
           context: .
           push: true
-          # amd64 only — no QEMU, no arm64. Shares the GHA cache namespace
-          # with the multi-arch `docker` workflow so warm builds reuse the
-          # rustpush + cargo + go layers either way.
+          # amd64 only — no QEMU, no arm64. Shares the `linux-amd64` GHA
+          # cache scope with the multi-arch `docker` workflow's amd64
+          # matrix leg so warm builds reuse the rustpush + cargo + go
+          # layers either way.
           platforms: linux/amd64
           tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=linux-amd64
+          cache-to: type=gha,mode=max,scope=linux-amd64
