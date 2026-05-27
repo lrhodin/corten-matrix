@@ -212,7 +212,7 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 
 		// Only create a text part if there's actual text content
 		if msg.Text != "" || msg.Subject != "" {
-			cm, err := convertChatDBMessage(ctx, params.Portal, intent, msg)
+			cm, err := convertChatDBMessage(ctx, params.Portal, intent, msg, c.Main.Config.URLPreviewsInBackfill)
 			if err == nil {
 				backfillMessages = append(backfillMessages, &bridgev2.BackfillMessage{
 					ConvertedMessage: cm,
@@ -348,7 +348,7 @@ func chatDBMakeEventSender(msg *imessage.Message, c *IMClient) bridgev2.EventSen
 	}
 }
 
-func convertChatDBMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *imessage.Message) (*bridgev2.ConvertedMessage, error) {
+func convertChatDBMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *imessage.Message, urlPreviewsInBackfill bool) (*bridgev2.ConvertedMessage, error) {
 	content := &event.MessageEventContent{
 		MsgType: event.MsgText,
 		Body:    msg.Text,
@@ -367,9 +367,11 @@ func convertChatDBMessage(ctx context.Context, portal *bridgev2.Portal, intent b
 	}
 
 	// URL preview: detect URL and fetch og: metadata + image
-	if detectedURL := urlRegex.FindString(msg.Text); detectedURL != "" {
-		content.BeeperLinkPreviews = []*event.BeeperLinkPreview{
-			fetchURLPreview(ctx, portal.Bridge, intent, portal.MXID, detectedURL),
+	if urlPreviewsInBackfill {
+		if detectedURL := urlRegex.FindString(msg.Text); detectedURL != "" {
+			content.BeeperLinkPreviews = []*event.BeeperLinkPreview{
+				fetchURLPreview(ctx, portal.Bridge, intent, portal.MXID, detectedURL),
+			}
 		}
 	}
 

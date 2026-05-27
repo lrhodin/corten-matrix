@@ -25,6 +25,14 @@ heic_conversion: false
 # JPEG output quality for HEIC/HEIF conversion (1–100). Default is 95.
 heic_jpeg_quality: 95
 
+# Fetch link previews (og:/twitter: tags + thumbnail) for URL-bearing
+# messages during backfill. Each URL triggers up to three HTTP round-trips
+# (homeserver preview, page fetch, image download + re-upload) inline with
+# conversion — on a slow uplink this dominates backfill time. Set to false
+# to skip previews during backfill only; live inbound messages and outbound
+# edits still build previews normally.
+url_previews_in_backfill: true
+
 # Override the outgoing iMessage identity (what recipients see your messages "from").
 # Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
 # Leave empty to use the handle chosen during login.

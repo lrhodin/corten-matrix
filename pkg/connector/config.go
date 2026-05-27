@@ -49,6 +49,16 @@ type IMConfig struct {
 	// converting HEIC/HEIF images. Default is 95.
 	HEICJPEGQuality int `yaml:"heic_jpeg_quality"`
 
+	// URLPreviewsInBackfill controls whether the bridge fetches link-preview
+	// metadata (og:/twitter: tags + thumbnail image) for messages that
+	// contain a URL during backfill. Each URL-bearing message triggers up to
+	// three HTTP round-trips (homeserver preview, page metadata, image
+	// download + re-upload) inline with conversion, which on a slow uplink
+	// dominates backfill wall-clock time. Setting this to false skips
+	// preview generation for backfilled history only; live inbound messages
+	// and outbound edits still build previews normally. Default true.
+	URLPreviewsInBackfill bool `yaml:"url_previews_in_backfill"`
+
 	// PreferredHandle overrides the outgoing iMessage identity.
 	// Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
 	// If empty, the handle chosen during login is used.
@@ -181,6 +191,7 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "video_transcoding")
 	helper.Copy(up.Bool, "heic_conversion")
 	helper.Copy(up.Int, "heic_jpeg_quality")
+	helper.Copy(up.Bool, "url_previews_in_backfill")
 	helper.Copy(up.Str, "preferred_handle")
 	helper.Copy(up.Str, "facetime_display_name")
 	helper.Copy(up.Bool, "disable_facetime")

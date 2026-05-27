@@ -7237,9 +7237,11 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 			textContent.Format = event.FormatHTML
 			textContent.FormattedBody = formattedBody
 		}
-		if detectedURL := urlRegex.FindString(row.Text); detectedURL != "" {
-			textContent.BeeperLinkPreviews = []*event.BeeperLinkPreview{
-				fetchURLPreview(ctx, c.Main.Bridge, c.Main.Bridge.Bot, "", detectedURL),
+		if c.Main.Config.URLPreviewsInBackfill {
+			if detectedURL := urlRegex.FindString(row.Text); detectedURL != "" {
+				textContent.BeeperLinkPreviews = []*event.BeeperLinkPreview{
+					fetchURLPreview(ctx, c.Main.Bridge, c.Main.Bridge.Bot, "", detectedURL),
+				}
 			}
 		}
 		messages = append(messages, &bridgev2.BackfillMessage{
