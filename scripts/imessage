@@ -159,21 +159,15 @@ check_bind_mount_perms() {
         fi
 
         if [ -d "$src" ]; then
-            local current
-            current=$(ls -ldn "$src" 2>/dev/null | awk '{print $3":"$4}')
-            if [ "$current" != "$target_user" ]; then
-                if [ "$mode" = "dry-run" ]; then
-                    if [ "$(id -u)" = "0" ]; then
-                        echo "    chown -R $target_user $src"
-                    else
-                        echo "    sudo chown -R $target_user $src"
-                    fi
+            if [ "$mode" = "dry-run" ]; then
+                if [ "$(id -u)" = "0" ]; then
+                    echo "    chown -R $target_user $src"
                 else
-                    echo "[startup] fixing perms: $src ($current → $target_user)"
-                    run_root_cmd chown -R "$target_user" "$src"
+                    echo "    sudo chown -R $target_user $src"
                 fi
-            elif [ "$mode" = "verbose" ]; then
-                echo "  ✓ $src"
+            else
+                echo "[startup] fixing perms: $src → $target_user"
+                run_root_cmd chown -R "$target_user" "$src"
             fi
         elif [ "$mode" != "dry-run" ]; then
             echo "error: failed to create bind-mount source: $src" >&2
@@ -287,7 +281,7 @@ EOF
     user_dir=$(printf '%s\n' "$parsed" | awk -F '\t' '$1=="USER"{print $2}')
     if ! printf '%s' "$user_dir" | grep -qE '^[0-9]+:[0-9]+$'; then
         echo "error: 'user: $user_dir' in compose isn't numeric UID:GID." >&2
-        echo "  Edit docker-compose.yml's 'user:' line to a numeric form like \"1000:1000\"." >&2
+        echo "  Set PUID and PGID to numeric values, e.g. PUID=1000 and PGID=1000." >&2
         exit 1
     fi
 
@@ -345,7 +339,7 @@ EOF
     target_user=$(printf '%s\n' "$parsed" | awk -F '\t' '$1=="USER"{print $2}')
     if ! printf '%s' "$target_user" | grep -qE '^[0-9]+:[0-9]+$'; then
         echo "error: 'user: $target_user' in compose isn't numeric UID:GID." >&2
-        echo "  Edit docker-compose.yml's 'user:' line to a numeric form like \"1000:1000\"." >&2
+        echo "  Set PUID and PGID to numeric values, e.g. PUID=1000 and PGID=1000." >&2
         exit 1
     fi
 

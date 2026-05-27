@@ -84,7 +84,7 @@ Open it in your editor:
    | Synology | `/volume1/docker/Rustpush-Matrix/data` | `/volume1/docker/Rustpush-Matrix/bbctl` |
    | TrueNAS / ZFS | dataset of your choice | dataset of your choice |
 
-If your host bind-mount sources are owned by a UID other than `1000` (UNRAID is often `99:100`, for example), update the `user:` directive in compose to match. See [Finding your UID and GID](#finding-your-uid-and-gid) for how to look up the right values.
+If your host bind-mount sources are owned by a UID/GID other than `1000:1000`, set `PUID` and `PGID` to match. You can put them in a `.env` file next to `docker-compose.yml`, or export them in your shell. See [Finding your UID and GID](#finding-your-uid-and-gid) for how to look up the right values.
 
 ### Step 4 — Start the container
 
@@ -178,17 +178,20 @@ imessage update                                # now works from anywhere
 
 ## How the privilege model works
 
-The container runs as the `bridge` user (UID:GID `1000:1000`) from PID 1 — set via `USER bridge` in the Dockerfile. **No root process, ever.** No `gosu`, no privilege transitions, no setuid binaries in the image.
+The container runs as the UID/GID rendered from compose's `user:` field. By default, the compose example uses `1000:1000`, matching the bundled `bridge` user in the image and the typical first Linux user. There is no `gosu`, no privilege transition, and no setuid wrapper.
 
-To run as a different UID/GID, override with Docker's `user:` directive in `docker-compose.yml`:
+To run as any other UID/GID, set `PUID` and `PGID`:
 
-```yaml
-user: "99:100"     # UNRAID (nobody:users)
-user: "568:568"    # TrueNAS Scale
-user: "0:0"        # root (discouraged — loses the non-root containment)
+```bash
+cat > .env <<'EOF'
+PUID=99
+PGID=100
+EOF
 ```
 
-Whichever UID:GID you pick, the host bind-mount source paths must be chowned to match. `imessage start` and `imessage fix-perms` read compose, find every bind-mount source, and chown each to the right UID:GID. Use numeric IDs, not names like `nobody:users`, because numeric IDs work consistently across the host and container boundary.
+That example is UNRAID's `nobody:users`. TrueNAS Scale is commonly `PUID=568` and `PGID=568`. Root is `PUID=0` and `PGID=0`, but it is discouraged unless required.
+
+Whichever UID/GID you pick, the host bind-mount source paths must be chowned to match. `imessage start` and `imessage fix-perms` read rendered compose output, find every bind-mount source, and chown each to the resolved UID:GID. Use numeric IDs, not names like `nobody:users`, because numeric IDs work consistently across the host and container boundary.
 
 ---
 
@@ -212,9 +215,9 @@ stat -c '%U:%G' ~/.local/share/mautrix-imessage           # by name:  david:davi
 ls -ldn         ~/.local/share/mautrix-imessage           # numeric, with perms
 ```
 
-If those don't match what the container runs as (default `1000:1000`, override via `user:` in compose), the container can't read/write — fix in one of two ways:
+If those don't match what the container runs as (default `1000:1000`, or whatever `PUID:PGID` resolves to), the container can't read/write — fix in one of two ways:
 
-- Run `imessage fix-perms` (recommended — reads compose, chowns every bind-mount source to match the `user:` directive).
+- Run `imessage start` or `imessage fix-perms` (recommended — reads compose, chowns every bind-mount source to match the resolved `PUID:PGID`).
 - Or manually: `sudo chown -R <uid>:<gid> <bind-mount-path>`.
 
 **For another user** (e.g. you'll run Docker as a separate service account):
@@ -246,10 +249,13 @@ imessage fix-perms     # chowns every bind mount in compose to 1000:1000
 
 This is the cleanest split: bridge runs non-root, your root login has full read access (because root bypasses owner checks), and `imessage` host commands keep working.
 
-**Option B — run the container as root via `user: "0:0"`**
+**Option B — run the container as root via `PUID=0` and `PGID=0`**
 
-```yaml
-user: "0:0"
+```bash
+cat > .env <<'EOF'
+PUID=0
+PGID=0
+EOF
 ```
 
 The container then runs everything as root. Functionally fine (Apple's servers don't care), but you lose the non-root containment that the image gives you by default. Use Option A unless you specifically can't.
