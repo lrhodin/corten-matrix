@@ -3986,6 +3986,24 @@ func (c *IMClient) finishRestoreBackfillPipeline(portalID string) {
 	c.restorePipelinesMu.Unlock()
 }
 
+// activeRestorePortalIDs returns a snapshot of portal IDs with an active
+// restore pipeline. The privacy scrubber excludes these so a long backfill
+// (large portal, many thousands of messages) can't be re-scrubbed mid-flight,
+// which would interact with cloudRowToBackfillMessages' BodyScrubbed skip to
+// silently drop the un-backfilled tail.
+func (c *IMClient) activeRestorePortalIDs() []string {
+	c.restorePipelinesMu.Lock()
+	defer c.restorePipelinesMu.Unlock()
+	if len(c.restorePipelines) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(c.restorePipelines))
+	for pid := range c.restorePipelines {
+		out = append(out, pid)
+	}
+	return out
+}
+
 func (c *IMClient) notifyRestoreStatus(opts restorePipelineOptions, format string, args ...any) {
 	if opts.Notify == nil {
 		return

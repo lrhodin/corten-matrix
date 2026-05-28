@@ -3208,36 +3208,56 @@ func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (
 //
 // Chunked to avoid long-running DB locks on the first post-deploy run, which
 // may scrub the entire backlog of already-delivered messages at once.
-func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID string, graceWindow time.Duration) (int64, error) {
+func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID string, graceWindow time.Duration, excludePortals []string) (int64, error) {
 	cutoff := time.Now().Add(-graceWindow).UnixMilli()
 	var total int64
 	// Small chunks + a brief yield between chunks so the scrubber doesn't
 	// contend with live upsertMessageBatch / APNs ingestion when the
 	// first-boot backlog is large.
 	const chunkSize = 1000
+
+	// Build optional NOT IN clause for portals with active restore pipelines.
+	// Large portals (50k+ messages) can take many minutes to backfill, and
+	// the updated_ts grace window only buys ~5 min; without this exclusion
+	// the scrubber would re-scrub partway through, and cloudRowToBackfillMessages'
+	// BodyScrubbed skip would silently drop the un-backfilled tail.
+	exclusionSQL := ""
+	args := []any{s.loginID, cutoff, bridgeID}
+	if len(excludePortals) > 0 {
+		placeholders := make([]string, 0, len(excludePortals))
+		for _, pid := range excludePortals {
+			args = append(args, pid)
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+		}
+		exclusionSQL = " AND portal_id NOT IN (" + strings.Join(placeholders, ",") + ")"
+	}
+	args = append(args, chunkSize)
+	limitPlaceholder := fmt.Sprintf("$%d", len(args))
+
+	query := `
+		UPDATE cloud_message
+		SET text=NULL,
+		    subject=NULL,
+		    sender='',
+		    tapback_emoji=NULL,
+		    body_scrubbed=TRUE
+		WHERE login_id=$1
+		  AND guid IN (
+		    SELECT guid FROM cloud_message
+		    WHERE login_id=$1
+		      AND body_scrubbed=FALSE
+		      AND updated_ts < $2
+		      AND EXISTS (
+		        SELECT 1 FROM message
+		        WHERE bridge_id=$3
+		          AND id=cloud_message.guid
+		          AND (room_receiver=$1 OR room_receiver='')
+		      )` + exclusionSQL + `
+		    LIMIT ` + limitPlaceholder + `
+		  )
+	`
 	for {
-		result, err := s.db.Exec(ctx, `
-			UPDATE cloud_message
-			SET text=NULL,
-			    subject=NULL,
-			    sender='',
-			    tapback_emoji=NULL,
-			    body_scrubbed=TRUE
-			WHERE login_id=$1
-			  AND guid IN (
-			    SELECT guid FROM cloud_message
-			    WHERE login_id=$1
-			      AND body_scrubbed=FALSE
-			      AND updated_ts < $2
-			      AND EXISTS (
-			        SELECT 1 FROM message
-			        WHERE bridge_id=$3
-			          AND id=cloud_message.guid
-			          AND (room_receiver=$1 OR room_receiver='')
-			      )
-			    LIMIT $4
-			  )
-		`, s.loginID, cutoff, bridgeID, chunkSize)
+		result, err := s.db.Exec(ctx, query, args...)
 		if err != nil {
 			return total, fmt.Errorf("failed to scrub bridged bodies: %w", err)
 		}
