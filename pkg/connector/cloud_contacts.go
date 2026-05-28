@@ -734,9 +734,9 @@ func downloadContactPhotos(contacts []*imessage.Contact, log zerolog.Logger, aut
 				data, _, err = downloadURL(ctx, c.AvatarURL)
 			}
 			if err != nil {
-				log.Debug().Err(err).
+				log.Debug().Err(sanitizeURLError(err, c.AvatarURL)).
 					Str("name", c.Name()).
-					Str("url", c.AvatarURL).
+					Str("url_host", logSafeURL(c.AvatarURL)).
 					Msg("Failed to download contact photo URL")
 				return
 			}

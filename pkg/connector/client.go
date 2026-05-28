@@ -5373,7 +5373,7 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 				desc = lp.Description
 				log.Debug().Bool("has_title", title != "").Bool("has_description", desc != "").Msg("Got URL preview from homeserver for outbound")
 			} else if err != nil {
-				log.Debug().Err(err).Msg("Failed to fetch URL preview from homeserver for outbound")
+				log.Debug().Err(sanitizeURLError(err, fetchURL, detectedURL)).Msg("Failed to fetch URL preview from homeserver for outbound")
 			}
 		}
 		// Fall back to our own og: scraping if homeserver didn't provide metadata
