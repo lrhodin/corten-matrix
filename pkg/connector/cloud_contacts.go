@@ -171,25 +171,6 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 	}
 	c.lastSync = time.Now()
 
-	// Debug: log all email keys and a sample of phone keys
-	emailKeys := make([]string, 0, len(c.byEmail))
-	for k := range c.byEmail {
-		emailKeys = append(emailKeys, k)
-	}
-	log.Debug().Strs("email_keys", emailKeys).Msg("CardDAV email lookup keys")
-
-	// Debug: log contacts with their phone/email for troubleshooting
-	for _, contact := range allContacts {
-		if contact.HasName() {
-			log.Debug().
-				Str("first", contact.FirstName).
-				Str("last", contact.LastName).
-				Strs("phones", contact.Phones).
-				Strs("emails", contact.Emails).
-				Msg("CardDAV contact loaded")
-		}
-	}
-
 	log.Info().
 		Int("contacts", len(allContacts)).
 		Int("phone_keys", len(c.byPhone)).

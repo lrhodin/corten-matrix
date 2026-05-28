@@ -148,19 +148,6 @@ func (c *externalCardDAVClient) SyncContacts(log zerolog.Logger) error {
 	}
 	c.lastSync = time.Now()
 
-	// Debug logging
-	for _, contact := range allContacts {
-		if contact.HasName() {
-			log.Debug().
-				Str("first", contact.FirstName).
-				Str("last", contact.LastName).
-				Strs("phones", contact.Phones).
-				Strs("emails", contact.Emails).
-				Bool("has_photo", contact.Avatar != nil).
-				Msg("External CardDAV contact loaded")
-		}
-	}
-
 	log.Info().
 		Int("contacts", len(allContacts)).
 		Int("phone_keys", len(c.byPhone)).

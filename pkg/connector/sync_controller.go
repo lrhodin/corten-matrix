@@ -1795,6 +1795,12 @@ func (c *IMClient) runPostSyncHousekeeping(ctx context.Context, log zerolog.Logg
 		log.Info().Int64("scrubbed", scrubbed).Msg("Scrubbed plaintext from bridged cloud_message rows")
 	}
 
+	// Privacy: scrub plaintext from the un-backfillable tail (rows older than
+	// the newest MaxInitialMessages per portal, which backward backfill can
+	// never reach when a cap is set). No-op when backfill is uncapped. Runs
+	// here only — plaintext enters cloud_message exclusively via CloudKit sync.
+	c.runUnbridgedTailScrub(ctx, log)
+
 	// Delete cloud_message rows whose portal_id has no cloud_chat entry.
 	if deleted, err := c.cloudStore.deleteOrphanedMessages(ctx); err != nil {
 		log.Warn().Err(err).Msg("Failed to delete orphaned cloud messages")

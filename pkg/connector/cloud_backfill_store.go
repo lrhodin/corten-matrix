@@ -2319,9 +2319,9 @@ func (s *cloudBackfillStore) getNewestBackfillableMessageTimestamp(ctx context.C
 		// body_scrubbed rows had content at bridge time; treat them as contentful
 		// so a fully-bridged-then-scrubbed portal's newest timestamp survives
 		// (used by queueRecoveredPortalResync to gate ChatResync events).
-		// tapback_type IS NULL excludes scrubbed reactions, which aren't
-		// "content" in the same sense.
-		baseQuery += " AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '' OR (body_scrubbed = TRUE AND tapback_type IS NULL))"
+		// tapback_type < 2000 (or NULL) keeps regular messages and excludes
+		// scrubbed reactions (>= 2000), which aren't "content" in the same sense.
+		baseQuery += " AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '' OR (body_scrubbed = TRUE AND (tapback_type IS NULL OR tapback_type < 2000)))"
 	}
 	var ts sql.NullInt64
 	err := s.db.QueryRow(ctx, baseQuery, s.loginID, portalID).Scan(&ts)
@@ -2421,7 +2421,7 @@ func (s *cloudBackfillStore) hasContentfulMessages(ctx context.Context, portalID
 		SELECT COUNT(*)
 		FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
-		  AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '' OR (body_scrubbed = TRUE AND tapback_type IS NULL))
+		  AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '' OR (body_scrubbed = TRUE AND (tapback_type IS NULL OR tapback_type < 2000)))
 	`, s.loginID, portalID).Scan(&count)
 	if err != nil {
 		return false, err
@@ -2439,7 +2439,7 @@ func (s *cloudBackfillStore) countBackfillableMessages(ctx context.Context, port
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
 	`
 	if requireContentful {
-		query += " AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '' OR (body_scrubbed = TRUE AND tapback_type IS NULL))"
+		query += " AND (COALESCE(text, '') <> '' OR COALESCE(attachments_json, '') <> '' OR (body_scrubbed = TRUE AND (tapback_type IS NULL OR tapback_type < 2000)))"
 	}
 	var count int
 	if err := s.db.QueryRow(ctx, query, s.loginID, portalID).Scan(&count); err != nil {
@@ -3257,10 +3257,10 @@ func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (
 // and which were ingested at least graceWindow ago. The grace window is a
 // buffer against bridgev2 racing the scrubber on freshly-ingested messages.
 //
-// SMS reaction quoting (HandleMatrixReaction for IsSms portals needs the
-// original body to format "Loved 'x'") goes through getReactionTargetBody
-// which falls back to fetching the body from the Matrix room via
-// Bot.GetEvent — the body still exists where the bridge posted it.
+// SMS reaction quoting (HandleMatrixReaction for IsSms portals quotes the
+// original body as "Loved 'x'") reads cloud_message.text; once scrubbed it
+// degrades to the unquoted reaction text, matching master's behavior when the
+// body isn't locally available.
 //
 // Intentionally NOT scrubbed: attachments_json. It contains CloudKit
 // record_names that AttachmentRetrier needs to repull files from Apple when
@@ -3283,7 +3283,7 @@ func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (
 // Using updated_ts (not created_ts) gives the bridgev2 backfill pipeline a
 // fresh 5-min window to read the re-populated text before the next
 // scrubber tick wipes it again — the restore-chat race documented in the
-// privacy audit. The EXISTS gate against bridgev2's `message` table is the
+// privacy audit. The membership check against bridgev2's `message` table is the
 // load-bearing safety check; the timestamp window just buys backfill time.
 //
 // Chunked to avoid long-running DB locks on the first post-deploy run, which
@@ -3321,6 +3321,14 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	// state hasn't changed under us. Required because SQLite's IN-subquery
 	// materializes the guid list once, then applies the UPDATE without
 	// re-evaluating the predicate per row.
+	// Match bridged rows by membership in the set of guids that have a `message`
+	// row, computed ONCE per chunk, instead of a per-row correlated EXISTS with
+	// UPPER()+LIKE (which can't use an index and ran ~25s over a 40k-row backlog,
+	// tripping dbutil's 1s slow-query warning every chunk). bridgev2 stores the
+	// base message id in `id`; part-suffixed ids (`<guid>_<part>`) are normalised
+	// back to the base guid via substr-to-first-underscore (guids are UUIDs, no
+	// underscores). UPPER() on both sides preserves the APNs-uppercase vs
+	// CloudKit-mixed-case matching the EXISTS form had.
 	query := `
 		UPDATE cloud_message
 		SET text=NULL,
@@ -3335,17 +3343,16 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		    SELECT guid FROM cloud_message
 		    WHERE login_id=$1
 		      AND body_scrubbed=FALSE
-		      AND tapback_type IS NULL
+		      AND (tapback_type IS NULL OR tapback_type < 2000)
 		      AND updated_ts < $2
 		      AND (
 		        deleted=TRUE
-		        OR EXISTS (
-		          SELECT 1 FROM message
-		          WHERE bridge_id=$3
-		            AND (
-		              UPPER(id)=UPPER(cloud_message.guid)
-		              OR UPPER(id) LIKE UPPER(cloud_message.guid) || '\_%' ESCAPE '\'
-		            )
+		        OR UPPER(guid) IN (
+		          SELECT UPPER(id) FROM message
+		          WHERE bridge_id=$3 AND (room_receiver=$1 OR room_receiver='')
+		          UNION
+		          SELECT UPPER(substr(id, 1, instr(id, '_') - 1)) FROM message
+		          WHERE bridge_id=$3 AND instr(id, '_') > 0
 		            AND (room_receiver=$1 OR room_receiver='')
 		        )
 		      )` + exclusionSQL + `
@@ -3366,6 +3373,120 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		case <-ctx.Done():
 			return total, ctx.Err()
 		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	return total, nil
+}
+
+// scrubUnbridgedTail nulls plaintext on cloud_message rows that fall OUTSIDE
+// the newest keepPerPortal messages of their portal — the tail that backfill
+// can never reach. scrubBridgedBodies only clears rows already delivered to
+// Matrix (its EXISTS gate), which leaves the bulk of a CloudKit-synced history
+// (everything beyond the per-chat backfill cap) sitting in plaintext forever.
+//
+// Safe to call ONLY when the operator capped Backfill.MaxInitialMessages: in
+// that mode FetchMessages short-circuits backward backfill to empty, so the
+// sole reader of cloud_message content is the no-anchor forward path via
+// listLatestMessages, which returns exactly the newest `count` rows ordered by
+// (timestamp_ms DESC, guid DESC) over the non-deleted, contentful population.
+// We mirror that: per portal we find the threshold timestamp (the
+// keepPerPortal-th newest row) and scrub only rows strictly OLDER than it.
+// Rows at the threshold timestamp are kept, so the retained set is always
+// >= keepPerPortal and can never include a row forward backfill would deliver.
+//
+// New messages that arrived while the bridge was down become the NEWEST rows in
+// their portal once CloudKit sync ingests them, so they sit above the threshold
+// and are never scrubbed (their fresh updated_ts also keeps them inside the
+// grace window) — they still backfill normally. Tapbacks are left alone for
+// parity with scrubBridgedBodies; restore re-population still works because
+// runRestoreBackfillPipeline clears body_scrubbed and re-fetches from CloudKit.
+//
+// Per-portal and indexed on (login_id, portal_id, timestamp_ms) so each
+// statement stays well under dbutil's 1s slow-query log threshold — unlike a
+// global window-function scan over the whole table.
+func (s *cloudBackfillStore) scrubUnbridgedTail(ctx context.Context, keepPerPortal int, graceWindow time.Duration, excludePortals []string) (int64, error) {
+	if keepPerPortal <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-graceWindow).UnixMilli()
+	exclude := make(map[string]struct{}, len(excludePortals))
+	for _, pid := range excludePortals {
+		exclude[pid] = struct{}{}
+	}
+
+	// Only portals whose contentful row count exceeds the cap have an
+	// unreachable tail; the rest are entirely within the backfill window.
+	rows, err := s.db.Query(ctx, `
+		SELECT portal_id FROM cloud_message
+		WHERE login_id=$1 AND deleted=FALSE AND record_name <> '' AND portal_id IS NOT NULL
+		GROUP BY portal_id
+		HAVING COUNT(*) > $2
+	`, s.loginID, keepPerPortal)
+	if err != nil {
+		return 0, fmt.Errorf("list portals for tail scrub: %w", err)
+	}
+	var portals []string
+	for rows.Next() {
+		var pid string
+		if err := rows.Scan(&pid); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		portals = append(portals, pid)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	const chunkSize = 1000
+	var total int64
+	for _, pid := range portals {
+		if _, skip := exclude[pid]; skip {
+			continue
+		}
+		// Threshold = timestamp of the keepPerPortal-th newest contentful row.
+		// Walks keepPerPortal index entries; rows strictly older are unreachable.
+		var threshold int64
+		err := s.db.QueryRow(ctx, `
+			SELECT timestamp_ms FROM cloud_message
+			WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND record_name <> ''
+			ORDER BY timestamp_ms DESC, guid DESC
+			LIMIT 1 OFFSET $3
+		`, s.loginID, pid, keepPerPortal-1).Scan(&threshold)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue // fewer than keepPerPortal rows now (raced a deletion)
+		} else if err != nil {
+			return total, fmt.Errorf("tail-scrub threshold for portal %s: %w", pid, err)
+		}
+		for {
+			result, err := s.db.Exec(ctx, `
+				UPDATE cloud_message
+				SET text=NULL, subject=NULL, sender='', tapback_emoji=NULL, body_scrubbed=TRUE
+				WHERE login_id=$1 AND portal_id=$2
+				  AND body_scrubbed=FALSE AND (tapback_type IS NULL OR tapback_type < 2000)
+				  AND updated_ts < $3 AND timestamp_ms < $4
+				  AND guid IN (
+				    SELECT guid FROM cloud_message
+				    WHERE login_id=$1 AND portal_id=$2
+				      AND body_scrubbed=FALSE AND (tapback_type IS NULL OR tapback_type < 2000)
+				      AND updated_ts < $3 AND timestamp_ms < $4
+				    LIMIT $5
+				  )
+			`, s.loginID, pid, cutoff, threshold, chunkSize)
+			if err != nil {
+				return total, fmt.Errorf("scrub unbridged tail for portal %s: %w", pid, err)
+			}
+			n, _ := result.RowsAffected()
+			total += n
+			if n < chunkSize {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return total, ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
 		}
 	}
 	return total, nil

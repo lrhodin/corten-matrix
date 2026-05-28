@@ -4055,6 +4055,34 @@ func (c *IMClient) activeRestorePortalIDs() []string {
 	return out
 }
 
+// runUnbridgedTailScrub clears plaintext from cloud_message rows older than the
+// newest MaxInitialMessages of each portal — the history beyond the per-chat
+// backfill cap that backward backfill can never deliver (FetchMessages
+// short-circuits backward requests when the cap is set). Gated on a configured
+// cap: with backfill uncapped (MaxInitialMessages == math.MaxInt32) backward
+// backfill is live, so the tail is still reachable and must NOT be scrubbed.
+//
+// Called from post-sync housekeeping only: plaintext enters cloud_message
+// exclusively via CloudKit sync (live APNs messages persist text=NULL stubs),
+// so the tail can only grow when a sync runs — a periodic timer would just
+// re-scan an unchanged table.
+func (c *IMClient) runUnbridgedTailScrub(ctx context.Context, log zerolog.Logger) {
+	if c.cloudStore == nil {
+		return
+	}
+	keepN := c.Main.Bridge.Config.Backfill.MaxInitialMessages
+	if keepN <= 0 || keepN >= math.MaxInt32 {
+		return
+	}
+	scrubbed, err := c.cloudStore.scrubUnbridgedTail(ctx, keepN, bodyScrubGracePeriod, c.activeRestorePortalIDs())
+	if err != nil {
+		log.Warn().Err(err).Msg("Unbridged-tail scrub failed")
+	} else if scrubbed > 0 {
+		log.Info().Int64("scrubbed", scrubbed).Int("keep_per_portal", keepN).
+			Msg("Scrubbed plaintext from unreachable backfill tail")
+	}
+}
+
 func (c *IMClient) notifyRestoreStatus(opts restorePipelineOptions, format string, args ...any) {
 	if opts.Notify == nil {
 		return
@@ -7304,26 +7332,34 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 	return messages
 }
 
+// cloudReactionMinType is the lowest tapback_type that denotes a real reaction.
+// Regular messages are stored with tapback_type NULL or 0; reactions occupy
+// 2000-2006 (add) and 3000-3006 (remove). Every "is this a reaction?" decision
+// goes through isCloudReactionRow so the NULL-vs-0 representation can't be
+// mistaken for a reaction (which previously let the privacy scrubber skip every
+// type-0 message — i.e. nearly all of them).
+const cloudReactionMinType uint32 = 2000
+
+func isCloudReactionRow(tapbackType *uint32) bool {
+	return tapbackType != nil && *tapbackType >= cloudReactionMinType
+}
+
 func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMessageRow, groupDisplayName string) []*bridgev2.BackfillMessage {
-	// Privacy: a body_scrubbed row was already bridged to Matrix (the
-	// scrubber's EXISTS predicate requires a bridgev2 `message` row for the
-	// same GUID before clearing text/subject/sender/tapback_emoji). Emitting
-	// here would produce empty-body events. Skip — bridgev2 already has the
-	// message and would dedup anyway under aggressive-dedup, plus this avoids
-	// the empty-body cliff for any backfill path that lands on a scrubbed row
-	// whose bridgev2 counterpart got purged. Restore-chat clears
-	// body_scrubbed before re-fetching from CloudKit, so the user-initiated
-	// restore path is unaffected.
+	// Privacy: a body_scrubbed regular message was already bridged to Matrix
+	// (the scrubber requires a bridgev2 `message` row for the same GUID before
+	// clearing text/subject/sender). Emitting here would produce empty-body
+	// events. Skip — bridgev2 already has the message and would dedup anyway
+	// under aggressive-dedup, plus this avoids the empty-body cliff for any
+	// backfill path that lands on a scrubbed row whose bridgev2 counterpart got
+	// purged. Restore-chat clears body_scrubbed before re-fetching from
+	// CloudKit, so the user-initiated restore path is unaffected.
 	//
-	// Exception: scrubbed tapbacks (tapback_type set) — fall through to
-	// cloudTapbackToBackfill which derives the emoji from tapback_type
-	// alone for the standard reactions (heart/like/dislike/laugh/excl/q).
-	// Custom-emoji (type 6) degrades to thumbs-up if tapback_emoji was
-	// scrubbed, but the reaction still lands in Matrix. The scrubber's
-	// `AND tapback_type IS NULL` predicate means this path is only reached
-	// via inline soft-delete (which also sets deleted=TRUE, filtered out
-	// of backfill queries), so it's defense-in-depth.
-	if row.BodyScrubbed && row.TapbackType == nil {
+	// Exception: scrubbed reactions (tapback_type >= 2000) — fall through to
+	// cloudTapbackToBackfill which derives the emoji from tapback_type alone for
+	// the standard reactions (heart/like/dislike/laugh/excl/q). Custom-emoji
+	// (type 6) degrades to thumbs-up if tapback_emoji was scrubbed, but the
+	// reaction still lands in Matrix.
+	if row.BodyScrubbed && !isCloudReactionRow(row.TapbackType) {
 		return nil
 	}
 
@@ -7335,9 +7371,9 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 	// silently emit no events for it, bridgev2 would treat the empty
 	// result as "no more history" and mark forward backfill done — losing
 	// the row permanently from Matrix. Detected as: real-message shape
-	// (HasBody=TRUE, not tapback) but empty body+attachments after a
+	// (HasBody=TRUE, not a reaction) but empty body+attachments after a
 	// supposed restore re-population.
-	if row.HasBody && row.TapbackType == nil &&
+	if row.HasBody && !isCloudReactionRow(row.TapbackType) &&
 		strings.TrimSpace(row.Text) == "" && row.Subject == "" && row.AttachmentsJSON == "" {
 		return nil
 	}
