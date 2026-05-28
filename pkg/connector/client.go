@@ -1341,7 +1341,12 @@ func (c *IMClient) Connect(ctx context.Context) {
 		// goroutine against the new stopChan; an idempotent scrubber UPDATE
 		// means overlapping ticks during transient reconnect are harmless.
 		// sync.Once is wrong here because it never re-fires post-Disconnect.
-		go c.runBodyScrubLoop(log.With().Str("component", "body_scrub").Logger(), c.stopChan)
+		// Skip the scrubber entirely when privacy is disabled for debugging —
+		// the scrub functions already no-op in that mode, but not launching the
+		// loop avoids pointless 5-minute ticks.
+		if !debugDisablePrivacy {
+			go c.runBodyScrubLoop(log.With().Str("component", "body_scrub").Logger(), c.stopChan)
+		}
 	} else {
 		if !c.Main.Config.CloudKitBackfill {
 			log.Info().Msg("CloudKit backfill disabled by config — skipping cloud sync")
@@ -1489,6 +1494,14 @@ func statusKitModeLabel(mode *string) string {
 // call back into Rust (e.g. ResolveHandle), would block the receive loop and
 // can deadlock on a single-threaded tokio runtime. All non-trivial work is
 // therefore dispatched to a goroutine immediately after the fast dedup check.
+// debugDisablePrivacy is a process-global DEVELOPMENT-ONLY switch mirroring
+// IMConfig.DebugDisablePrivacy. It lives at package scope (rather than being
+// threaded through every call site) so the free log helpers below — which have
+// no access to config — can honor it. Set once in IMConnector.Start() before
+// any login connects; read-only afterward, so no synchronization is needed.
+// When true the log anonymizers below pass values through verbatim.
+var debugDisablePrivacy bool
+
 // logSafeHandle returns a stable, opaque UUID-form token derived from a user
 // handle (phone number or email) so logs can correlate a user across lines
 // without recording the PII itself. Deterministic per handle and not reversible
@@ -1496,6 +1509,9 @@ func statusKitModeLabel(mode *string) string {
 func logSafeHandle(handle string) string {
 	if handle == "" {
 		return ""
+	}
+	if debugDisablePrivacy {
+		return handle
 	}
 	sum := sha256.Sum256([]byte(handle))
 	return fmt.Sprintf("%x-%x-%x-%x-%x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])

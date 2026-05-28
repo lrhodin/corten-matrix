@@ -102,6 +102,29 @@ type IMConfig struct {
 	// CardDAV is an external CardDAV server for contact name resolution.
 	// When configured, this is used instead of iCloud CardDAV contacts.
 	CardDAV CardDAVConfig `yaml:"carddav"`
+
+	// DebugDisablePrivacy is a DEVELOPMENT-ONLY switch that reverts the
+	// bridge's privacy protections so plaintext is observable for debugging.
+	// MUST be false in any real deployment. Default false. When true:
+	//
+	//   1. Logs are no longer anonymized — raw iMessage handles
+	//      (phone numbers / emails) and full URLs appear verbatim in logs
+	//      instead of opaque tokens / scheme+host forms.
+	//   2. The periodic body scrubber is disabled — plaintext message
+	//      bodies (text/subject/sender) downloaded into the local
+	//      cloud_message side-cache are NOT cleared after Matrix delivery,
+	//      so they persist in mautrix-imessage.db.
+	//   3. On the next CloudKit sync the bridge re-fills already-scrubbed
+	//      rows: it clears the body_scrubbed flags and resets the CloudKit
+	//      continuation tokens, forcing a full re-page that re-downloads the
+	//      plaintext that was previously cleared. This is a one-shot per flip
+	//      (once no scrubbed rows remain, sync goes back to incremental).
+	//
+	// Notes: only the CloudKit backfill source caches plaintext locally, so
+	// effects 2 and 3 are CloudKit-specific (the chatdb source never stores
+	// message bodies in our DB). This does NOT undo deletes/unsends — content
+	// you delete or retract is still purged. Re-deletes nothing from Matrix.
+	DebugDisablePrivacy bool `yaml:"debug_disable_privacy"`
 }
 
 // CardDAVConfig configures an external CardDAV server for contact name resolution.
@@ -201,6 +224,7 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Str, "carddav", "url")
 	helper.Copy(up.Str, "carddav", "username")
 	helper.Copy(up.Str, "carddav", "password_encrypted")
+	helper.Copy(up.Bool, "debug_disable_privacy")
 }
 
 func (c *IMConnector) GetConfig() (string, any, up.Upgrader) {

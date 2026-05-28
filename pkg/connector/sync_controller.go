@@ -1839,6 +1839,31 @@ func (c *IMClient) runCloudSyncOnceSerialized(ctx context.Context, log zerolog.L
 // continuation tokens mean CloudKit only returns changes since last sync.
 func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isBootstrap bool) error {
 	if isBootstrap {
+		// DEVELOPMENT-ONLY re-fill: when privacy is disabled, undo the scrubber's
+		// NULLing so plaintext returns to the local cache. clearAllBodyScrub flips
+		// body_scrubbed off (non-deleted rows only — deletes stay purged); the
+		// upsert's ON CONFLICT clause then writes Apple's text back instead of
+		// preserving the NULL. That only takes effect once CloudKit re-delivers
+		// the records, so we also reset the continuation tokens to force a full
+		// re-page. Self-limiting: once every row is re-filled (scrubber stays off
+		// in this mode) clearAllBodyScrub reports 0 and we leave sync incremental,
+		// so this full re-download happens at most once per flip, not every boot.
+		// Caveat: if the re-page is interrupted mid-sync, some rows are left
+		// body_scrubbed=FALSE with text still NULL; the next boot's n=0 short-
+		// circuit then skips the token reset, so those rows stay empty until the
+		// next full sync (e.g. a sync-version bump). Acceptable for a debug knob.
+		if debugDisablePrivacy {
+			if n, err := c.cloudStore.clearAllBodyScrub(ctx); err != nil {
+				log.Warn().Err(err).Msg("debug_disable_privacy: failed to clear body-scrub flags for re-fill")
+			} else if n > 0 {
+				if err := c.cloudStore.clearSyncTokens(ctx); err != nil {
+					log.Warn().Err(err).Msg("debug_disable_privacy: cleared scrub flags but failed to reset sync tokens")
+				} else {
+					log.Warn().Int64("rows", n).Msg("debug_disable_privacy: cleared body-scrub flags and reset CloudKit sync tokens — forcing a full re-page to re-fill plaintext")
+				}
+			}
+		}
+
 		isFresh := false
 		hasOwnPortal := false
 		if portals, err := c.Main.Bridge.GetAllPortalsWithMXID(ctx); err == nil {

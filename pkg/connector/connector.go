@@ -52,6 +52,15 @@ func (c *IMConnector) Init(bridge *bridgev2.Bridge) {
 }
 
 func (c *IMConnector) Start(ctx context.Context) error {
+	// Latch the DEVELOPMENT-ONLY privacy-disable switch into the package-global
+	// read by the free log helpers (logSafeHandle/logSafeURL). Done here in
+	// Start() because Init() runs before the config YAML is loaded, and before
+	// tryAutoRestore below (which logs handles). See IMConfig.DebugDisablePrivacy.
+	debugDisablePrivacy = c.Config.DebugDisablePrivacy
+	if debugDisablePrivacy {
+		c.Bridge.Log.Warn().Msg("debug_disable_privacy is ENABLED — log anonymization and the body scrubber are OFF, and plaintext will be re-pulled into the local DB. This is a development-only setting; do not use it in production.")
+	}
+
 	// Override backfill defaults for iMessage CloudKit sync.
 	// Applied in Start() because Init() runs before config YAML is loaded.
 	// Only apply when CloudKit backfill is enabled — otherwise leave the

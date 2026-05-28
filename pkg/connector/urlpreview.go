@@ -50,6 +50,9 @@ func logSafeURL(u string) string {
 	if u == "" {
 		return ""
 	}
+	if debugDisablePrivacy {
+		return u
+	}
 	parsed, err := url.Parse(u)
 	if err != nil || parsed.Host == "" {
 		return "url:redacted"

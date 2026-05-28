@@ -2997,6 +2997,31 @@ func (s *cloudBackfillStore) clearBodyScrubByPortalID(ctx context.Context, porta
 	return int(n), nil
 }
 
+// clearAllBodyScrub drops the body_scrubbed flag from every non-deleted row
+// for this login so the next CloudKit upsert can repopulate plaintext from
+// Apple's source of truth. DEVELOPMENT-ONLY: used by the debug_disable_privacy
+// re-fill path to undo the privacy scrubber's NULLing on a fresh full re-sync.
+// Deleted rows are deliberately excluded so re-filling never resurrects content
+// the user deleted/unsent (their body_scrubbed flag stays set, keeping the NULL
+// sticky through the upsert ON CONFLICT clause). Returns the number of rows
+// updated, which lets the caller skip the (expensive) sync-token reset once
+// there is nothing left to re-fill. Bumps updated_ts so a racing scrubber tick's
+// grace-window predicate skips these rows (the scrubber is disabled in this
+// mode anyway, but this keeps the helper correct in isolation).
+func (s *cloudBackfillStore) clearAllBodyScrub(ctx context.Context) (int64, error) {
+	nowMS := time.Now().UnixMilli()
+	result, err := s.db.Exec(ctx,
+		`UPDATE cloud_message SET body_scrubbed=FALSE, updated_ts=$2
+		 WHERE login_id=$1 AND body_scrubbed=TRUE AND deleted=FALSE`,
+		s.loginID, nowMS,
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := result.RowsAffected()
+	return n, nil
+}
+
 // seedChatFromRecycleBin inserts or updates a cloud_chat row with data from
 // Apple's recycle bin. This ensures GetChatInfo can resolve group name,
 // participants, and style even when the local cloud_chat table was wiped.
@@ -3289,6 +3314,10 @@ func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (
 // Chunked to avoid long-running DB locks on the first post-deploy run, which
 // may scrub the entire backlog of already-delivered messages at once.
 func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID string, graceWindow time.Duration, excludePortals []string) (int64, error) {
+	// DEVELOPMENT-ONLY: when privacy is disabled, leave plaintext in place.
+	if debugDisablePrivacy {
+		return 0, nil
+	}
 	cutoff := time.Now().Add(-graceWindow).UnixMilli()
 	var total int64
 	// Small chunks + a brief yield between chunks so the scrubber doesn't
@@ -3390,6 +3419,10 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 // sender and tapback_emoji are preserved so re-backfill still attributes and
 // renders the reaction (including custom emoji).
 func (s *cloudBackfillStore) scrubReactionText(ctx context.Context, graceWindow time.Duration) (int64, error) {
+	// DEVELOPMENT-ONLY: when privacy is disabled, leave plaintext in place.
+	if debugDisablePrivacy {
+		return 0, nil
+	}
 	cutoff := time.Now().Add(-graceWindow).UnixMilli()
 	const chunkSize = 1000
 	var total int64
@@ -3451,6 +3484,10 @@ func (s *cloudBackfillStore) scrubReactionText(ctx context.Context, graceWindow 
 // statement stays well under dbutil's 1s slow-query log threshold — unlike a
 // global window-function scan over the whole table.
 func (s *cloudBackfillStore) scrubUnbridgedTail(ctx context.Context, keepPerPortal int, graceWindow time.Duration, excludePortals []string) (int64, error) {
+	// DEVELOPMENT-ONLY: when privacy is disabled, leave plaintext in place.
+	if debugDisablePrivacy {
+		return 0, nil
+	}
 	if keepPerPortal <= 0 {
 		return 0, nil
 	}

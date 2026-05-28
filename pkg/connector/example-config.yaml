@@ -68,6 +68,22 @@ statuskit_share_on_startup: true
 # 4-service identity is unaffected, so peer reshare eligibility is kept).
 statuskit_notifications: true
 
+# DEVELOPMENT ONLY — leave this false in any real deployment.
+# Reverts the bridge's privacy protections so plaintext is observable for
+# debugging. When true:
+#   1. Logs are NOT anonymized — raw iMessage handles (phone/email) and full
+#      URLs appear verbatim instead of opaque tokens / scheme+host forms.
+#   2. The periodic body scrubber is disabled — plaintext message bodies
+#      cached locally (in the cloud_message table of mautrix-imessage.db)
+#      are no longer cleared after delivery to Matrix, so they persist.
+#   3. On the next CloudKit sync, rows that were already scrubbed are
+#      re-filled: the scrub flags are cleared and the CloudKit sync tokens
+#      are reset, forcing a full re-page that re-downloads the plaintext.
+# Only the CloudKit backfill source caches plaintext locally, so effects 2
+# and 3 are CloudKit-specific. Does NOT undo deletes/unsends, and does NOT
+# re-deliver anything to Matrix.
+debug_disable_privacy: false
+
 # External CardDAV server for contact name resolution.
 # Works with Google (app passwords), Nextcloud, Radicale, Fastmail, etc.
 # When configured, this is used instead of iCloud contacts.
