@@ -1541,6 +1541,10 @@ func (c *IMClient) runBodyScrubLoop(log zerolog.Logger, stopChan <-chan struct{}
 			} else if rscrubbed > 0 {
 				log.Info().Int64("scrubbed", rscrubbed).Msg("Scrubbed plaintext from reaction cloud_message rows")
 			}
+			// Tail scrub must run here too, not just post-sync: rows synced just
+			// before a post-sync pass are still inside the grace window and get
+			// skipped, so without a later periodic pass they'd never be scrubbed.
+			c.runUnbridgedTailScrub(ctx, log)
 			cancel()
 		}
 	}
@@ -1810,8 +1814,9 @@ func (c *IMClient) runPostSyncHousekeeping(ctx context.Context, log zerolog.Logg
 
 	// Privacy: scrub plaintext from the un-backfillable tail (rows older than
 	// the newest MaxInitialMessages per portal, which backward backfill can
-	// never reach when a cap is set). No-op when backfill is uncapped. Runs
-	// here only — plaintext enters cloud_message exclusively via CloudKit sync.
+	// never reach when a cap is set). No-op when backfill is uncapped. Also
+	// runs on the periodic ticker (runBodyScrubLoop) to catch rows that were
+	// inside the grace window during this pass.
 	c.runUnbridgedTailScrub(ctx, log)
 
 	// Delete cloud_message rows whose portal_id has no cloud_chat entry.

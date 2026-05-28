@@ -4062,10 +4062,12 @@ func (c *IMClient) activeRestorePortalIDs() []string {
 // cap: with backfill uncapped (MaxInitialMessages == math.MaxInt32) backward
 // backfill is live, so the tail is still reachable and must NOT be scrubbed.
 //
-// Called from post-sync housekeeping only: plaintext enters cloud_message
-// exclusively via CloudKit sync (live APNs messages persist text=NULL stubs),
-// so the tail can only grow when a sync runs — a periodic timer would just
-// re-scan an unchanged table.
+// Runs both from post-sync housekeeping (to catch a freshly-synced backlog) and
+// on the periodic scrub ticker. The ticker pass is essential, not redundant:
+// rows synced just before the post-sync pass are still inside the grace window
+// and get skipped there, so without a later periodic pass they would never be
+// scrubbed. The per-portal indexed query is cheap and scrubs nothing once a
+// portal has converged.
 func (c *IMClient) runUnbridgedTailScrub(ctx context.Context, log zerolog.Logger) {
 	if c.cloudStore == nil {
 		return
