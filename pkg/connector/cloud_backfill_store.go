@@ -2905,10 +2905,17 @@ func (s *cloudBackfillStore) undeleteCloudMessagesByPortalID(ctx context.Context
 // After restore completes and the messages are re-bridged, the periodic
 // scrubBridgedBodies tick re-scrubs them (within bodyScrubInterval).
 func (s *cloudBackfillStore) clearBodyScrubByPortalID(ctx context.Context, portalID string) (int, error) {
+	// Bump updated_ts alongside the flag clear so the scrubber's grace
+	// window predicate (updated_ts < now-graceWindow) skips these rows on
+	// the next tick. Without this, a scrubber tick that races between
+	// clearBodyScrubByPortalID and the restore's CloudKit upsert would
+	// see body_scrubbed=FALSE + old updated_ts and re-scrub before upsert
+	// could repopulate text.
+	nowMS := time.Now().UnixMilli()
 	result, err := s.db.Exec(ctx,
-		`UPDATE cloud_message SET body_scrubbed=FALSE
+		`UPDATE cloud_message SET body_scrubbed=FALSE, updated_ts=$3
 		 WHERE login_id=$1 AND portal_id=$2 AND body_scrubbed=TRUE`,
-		s.loginID, portalID,
+		s.loginID, portalID, nowMS,
 	)
 	if err != nil {
 		return 0, err
@@ -3234,6 +3241,13 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	args = append(args, chunkSize)
 	limitPlaceholder := fmt.Sprintf("$%d", len(args))
 
+	// The outer UPDATE re-checks body_scrubbed=FALSE AND updated_ts < cutoff
+	// at write time so concurrent upsert / clearBodyScrubByPortalID between
+	// subquery eval and outer apply can't be silently overwritten. The
+	// subquery picks candidate guids; the outer WHERE confirms the row's
+	// state hasn't changed under us. Required because SQLite's IN-subquery
+	// materializes the guid list once, then applies the UPDATE without
+	// re-evaluating the predicate per row.
 	query := `
 		UPDATE cloud_message
 		SET text=NULL,
@@ -3242,6 +3256,8 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		    tapback_emoji=NULL,
 		    body_scrubbed=TRUE
 		WHERE login_id=$1
+		  AND body_scrubbed=FALSE
+		  AND updated_ts < $2
 		  AND guid IN (
 		    SELECT guid FROM cloud_message
 		    WHERE login_id=$1

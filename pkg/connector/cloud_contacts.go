@@ -682,7 +682,7 @@ func (c *cloudContactsClient) downloadAuthURL(ctx context.Context, targetURL str
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("HTTP %d fetching %s", resp.StatusCode, targetURL)
+		return nil, fmt.Errorf("HTTP %d fetching %s", resp.StatusCode, logSafeURL(targetURL))
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
 }

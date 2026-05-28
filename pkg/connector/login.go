@@ -838,7 +838,7 @@ func completeLoginWithMeta(
 		meta.AccountADSID = result.AccountPersist.Adsid
 		meta.AccountDSID = result.AccountPersist.Dsid
 		meta.AccountSPDBase64 = result.AccountPersist.SpdBase64
-		log.Info().Str("dsid", meta.AccountDSID).Msg("iCloud account credentials available for TokenProvider")
+		log.Info().Bool("has_dsid", meta.AccountDSID != "").Msg("iCloud account credentials available for TokenProvider")
 		// Also capture the MobileMe delegate so it can be seeded on restore
 		if result.TokenProvider != nil && *result.TokenProvider != nil {
 			tp := *result.TokenProvider

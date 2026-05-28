@@ -263,6 +263,7 @@ type IMClient struct {
 	// attachment_retrier.go.
 	pendingAttachments *pendingAttachmentStore
 	retrierOnce        sync.Once
+	bodyScrubOnce      sync.Once
 
 	// Ford key cache — reimplementation of the 94f7b8e Ford cross-batch
 	// deduplication fix in Go. Populated aggressively during CloudKit
@@ -1305,7 +1306,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 		cloudContacts := newCloudContactsClient(c.client, log)
 		if cloudContacts != nil {
 			c.contacts = cloudContacts
-			log.Info().Str("url", cloudContacts.baseURL).Msg("Cloud contacts available (iCloud CardDAV)")
+			log.Info().Str("url_host", logSafeURL(cloudContacts.baseURL)).Msg("Cloud contacts available (iCloud CardDAV)")
 			if syncErr := cloudContacts.SyncContacts(log); syncErr != nil {
 				log.Warn().Err(syncErr).Msg("Initial CardDAV sync failed")
 			} else {
@@ -1335,7 +1336,12 @@ func (c *IMClient) Connect(ctx context.Context) {
 		c.setCloudSyncDone()
 	} else if cloudStoreReady && c.Main.Config.UseCloudKitBackfill() {
 		c.startCloudSyncController(log)
-		go c.runBodyScrubLoop(log.With().Str("component", "body_scrub").Logger())
+		// sync.Once mirrors the retrierOnce pattern above — Connect can be
+		// re-invoked (reconnect, relogin, session restore) and two scrubber
+		// goroutines on the same table would chunk-interleave wastefully.
+		c.bodyScrubOnce.Do(func() {
+			go c.runBodyScrubLoop(log.With().Str("component", "body_scrub").Logger())
+		})
 	} else {
 		if !c.Main.Config.CloudKitBackfill {
 			log.Info().Msg("CloudKit backfill disabled by config — skipping cloud sync")
@@ -3748,20 +3754,22 @@ func (c *IMClient) handleMessageDelete(log zerolog.Logger, msg rustpushgo.Wrappe
 			Str("portal_id", string(portalKey.ID)).
 			Msg("Sending redaction for deleted message")
 
-		// Scrub-before-emit: once we QueueRemoteEvent MessageRemove, bridgev2
-		// will (asynchronously) delete its own message row, and once that's
-		// gone the periodic scrubber's EXISTS check against bridgev2 message
-		// is permanently FALSE for this guid — meaning a scrub failure here
-		// would leave plaintext in cloud_message until next bridge restart.
-		// Scrub first so a DB error is observable while the row still has a
-		// bridgev2 counterpart to retry against.
+		// Scrub-before-emit, fail-closed: once we QueueRemoteEvent
+		// MessageRemove, bridgev2 will (asynchronously) delete its own message
+		// row, and once that's gone the periodic scrubber's EXISTS check
+		// against bridgev2 message is permanently FALSE for this guid. If
+		// scrub fails here, emitting the remove would create a permanent
+		// plaintext leak — instead, skip the emit so the Matrix message
+		// stays visible. A subsequent Apple-side delete of the same UUID
+		// (or bridge restart with retry) will re-trigger this path.
 		if c.cloudStore != nil {
-			scrubCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			scrubCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			err := c.cloudStore.softDeleteMessageByGUID(scrubCtx, targetUUID)
 			cancel()
 			if err != nil {
-				log.Warn().Err(err).Str("target_uuid", targetUUID).
-					Msg("Failed to scrub plaintext for deleted message — periodic scrubber will retry while bridgev2 row exists")
+				log.Error().Err(err).Str("target_uuid", targetUUID).
+					Msg("Skipping MessageRemove emit because cloud_message scrub failed — preserving privacy at the cost of a stale Matrix event")
+				continue
 			}
 		}
 

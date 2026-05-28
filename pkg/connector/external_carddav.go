@@ -543,7 +543,7 @@ func tryWellKnown(wellKnownURL, username, password string, log zerolog.Logger) (
 		}
 	}
 
-	return "", fmt.Errorf(".well-known not available at %s", wellKnownURL)
+	return "", fmt.Errorf(".well-known not available at %s", logSafeURL(wellKnownURL))
 }
 
 // resolveRedirect resolves a potentially relative redirect Location.
