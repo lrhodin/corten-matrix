@@ -2772,11 +2772,11 @@ func (s *cloudBackfillStore) debugFindPortalsByIdentifierSuffix(ctx context.Cont
 // record has synced, and whether it's filtered/deleted). Used by !msg-debug
 // to distinguish "chat not synced yet" from "chat synced but messages missing".
 type debugChatInfo struct {
-	Found      bool
-	Deleted    bool
-	IsFiltered int64
+	Found       bool
+	Deleted     bool
+	IsFiltered  int64
 	CloudChatID string
-	GroupID    string
+	GroupID     string
 }
 
 func (s *cloudBackfillStore) debugChatInfo(ctx context.Context, portalID string) (debugChatInfo, error) {
@@ -3371,20 +3371,39 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	return total, nil
 }
 
+// orphanStubReapAge is how long a NULL-portal soft-delete stub must sit before
+// deleteOrphanedMessages reaps it. softDeleteMessageByGUID stub-inserts a
+// deleted=TRUE row with portal_id NULL when an Apple-side delete arrives for a
+// guid CloudKit hasn't synced yet, so the future upsert preserves the deletion.
+// A real CloudKit row would set portal_id non-NULL via the upsert; a stub still
+// NULL after this window means the row never arrived and (since Apple already
+// deleted the message) never will — only the in-flight sync that raced the
+// delete could repopulate it, and that resolves within one sync cycle. 24h is
+// far past that, so reaping here cannot strand the deletion or re-bridge a body.
+const orphanStubReapAge = 24 * time.Hour
+
 // deleteOrphanedMessages hard-deletes cloud_message rows that are already
 // soft-deleted (deleted=TRUE) AND whose portal_id has no matching cloud_chat
 // entry. This is conservative: DM portals legitimately have messages without
 // cloud_chat rows, so we only clean up rows that are BOTH orphaned AND already
 // marked deleted (from tombstone processing or portal deletion).
+//
+// NULL-portal stubs are a separate case: `portal_id NOT IN (...)` can't catch
+// them because SQL's `NULL NOT IN (...)` is NULL (never TRUE), so they're
+// reaped via the age-gated `portal_id IS NULL` branch instead.
 func (s *cloudBackfillStore) deleteOrphanedMessages(ctx context.Context) (int64, error) {
+	stubCutoff := time.Now().Add(-orphanStubReapAge).UnixMilli()
 	result, err := s.db.Exec(ctx, `
 		DELETE FROM cloud_message
 		WHERE login_id=$1
 		  AND deleted=TRUE
-		  AND portal_id NOT IN (
-			SELECT DISTINCT portal_id FROM cloud_chat WHERE login_id=$1
+		  AND (
+		    portal_id NOT IN (
+		      SELECT DISTINCT portal_id FROM cloud_chat WHERE login_id=$1
+		    )
+		    OR (portal_id IS NULL AND created_ts < $2)
 		  )
-	`, s.loginID)
+	`, s.loginID, stubCutoff)
 	if err != nil {
 		return 0, fmt.Errorf("failed to delete orphaned messages: %w", err)
 	}
