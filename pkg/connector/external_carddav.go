@@ -119,7 +119,7 @@ func (c *externalCardDAVClient) SyncContacts(log zerolog.Logger) error {
 	for _, abURL := range addressBooks {
 		contacts, fetchErr := c.fetchAllVCards(log, abURL)
 		if fetchErr != nil {
-			log.Warn().Err(fetchErr).Str("address_book_host", logSafeURL(abURL)).Msg("External CardDAV: failed to fetch vCards")
+			log.Warn().Err(sanitizeURLError(fetchErr, abURL)).Str("address_book_host", logSafeURL(abURL)).Msg("External CardDAV: failed to fetch vCards")
 			continue
 		}
 		allContacts = append(allContacts, contacts...)
@@ -231,7 +231,7 @@ func (c *externalCardDAVClient) discoverPrincipal(log zerolog.Logger) (string, e
 
 	href := extractPropValue(data, "current-user-principal")
 	if href == "" {
-		log.Debug().Str("body", string(data[:min(len(data), 2000)])).Msg("External CardDAV: PROPFIND response (no principal)")
+		log.Debug().Int("body_bytes", len(data)).Msg("External CardDAV: PROPFIND response (no principal)")
 		return "", fmt.Errorf("no current-user-principal in response")
 	}
 
@@ -370,7 +370,7 @@ func (c *externalCardDAVClient) parseAddressBookList(data []byte, homeSetURL str
 			}
 			if ps.Prop.ResourceType.AddressBook != nil {
 				log.Debug().
-					Str("href", href).
+					Str("address_book_host", logSafeURL(href)).
 					Str("name", ps.Prop.DisplayName).
 					Msg("External CardDAV: found address book")
 				addressBooks = append(addressBooks, href)

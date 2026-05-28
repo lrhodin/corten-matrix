@@ -3757,27 +3757,19 @@ func (c *IMClient) handleMessageDelete(log zerolog.Logger, msg rustpushgo.Wrappe
 		Msg("Processing per-message delete")
 
 	for _, targetUUID := range msg.DeleteMessageUuids {
-		portalKey := c.resolvePortalByTargetMessage(log, targetUUID)
-		if portalKey.ID == "" {
-			log.Debug().
-				Str("target_uuid", targetUUID).
-				Msg("Message UUID not found in bridge DB, skipping")
-			continue
-		}
-
-		log.Info().
-			Str("target_uuid", targetUUID).
-			Str("portal_id", string(portalKey.ID)).
-			Msg("Sending redaction for deleted message")
-
-		// Scrub-before-emit, fail-closed: once we QueueRemoteEvent
-		// MessageRemove, bridgev2 will (asynchronously) delete its own message
-		// row, and once that's gone the periodic scrubber's EXISTS check
-		// against bridgev2 message is permanently FALSE for this guid. If
-		// scrub fails here, emitting the remove would create a permanent
-		// plaintext leak — instead, skip the emit so the Matrix message
-		// stays visible. A subsequent Apple-side delete of the same UUID
-		// (or bridge restart with retry) will re-trigger this path.
+		// Scrub-before-portal-resolve: Apple-side delete can arrive while
+		// the targeted message is still sitting in pendingPortalMsgs for a
+		// not-yet-created portal (CloudKit sync hadn't finished when APNs
+		// delivered it), or before any cloud_message ingest has happened
+		// at all. If we waited for portal resolution we'd skip the scrub
+		// and the message would later bridge to Matrix with the body Apple
+		// has already deleted on the user's devices. softDeleteMessageByGUID
+		// also stub-inserts a deleted=TRUE row for guids not yet in
+		// cloud_message so the future CloudKit upsert preserves the
+		// deletion via its ON CONFLICT CASE.
+		//
+		// Fail-closed: skip the MessageRemove emit on scrub error so we
+		// don't strand plaintext post-bridgev2-row-deletion.
 		if c.cloudStore != nil {
 			scrubCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			err := c.cloudStore.softDeleteMessageByGUID(scrubCtx, targetUUID)
@@ -3788,6 +3780,19 @@ func (c *IMClient) handleMessageDelete(log zerolog.Logger, msg rustpushgo.Wrappe
 				continue
 			}
 		}
+
+		portalKey := c.resolvePortalByTargetMessage(log, targetUUID)
+		if portalKey.ID == "" {
+			log.Debug().
+				Str("target_uuid", targetUUID).
+				Msg("Message UUID not found in bridge DB, scrub applied; skipping Matrix MessageRemove emit")
+			continue
+		}
+
+		log.Info().
+			Str("target_uuid", targetUUID).
+			Str("portal_id", string(portalKey.ID)).
+			Msg("Sending redaction for deleted message")
 
 		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.MessageRemove{
 			EventMeta: simplevent.EventMeta{

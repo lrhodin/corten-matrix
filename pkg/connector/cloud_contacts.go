@@ -116,7 +116,7 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 	// Step 1: Get the principal URL
 	principalURL, err := c.discoverPrincipal(log)
 	if err != nil {
-		log.Warn().Err(err).Msg("CardDAV: failed to discover principal URL")
+		log.Warn().Err(sanitizeURLError(err, c.baseURL+"/")).Msg("CardDAV: failed to discover principal URL")
 		return err
 	}
 	log.Debug().Str("principal_host", logSafeURL(principalURL)).Msg("CardDAV: discovered principal URL")
@@ -124,7 +124,7 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 	// Step 2: Get the address book home set
 	homeSetURL, err := c.discoverAddressBookHome(log, principalURL)
 	if err != nil {
-		log.Warn().Err(err).Msg("CardDAV: failed to discover address book home")
+		log.Warn().Err(sanitizeURLError(err, principalURL)).Msg("CardDAV: failed to discover address book home")
 		return err
 	}
 	log.Debug().Str("home_set_host", logSafeURL(homeSetURL)).Msg("CardDAV: discovered address book home")
@@ -132,7 +132,7 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 	// Step 3: List address books
 	addressBooks, err := c.listAddressBooks(log, homeSetURL)
 	if err != nil {
-		log.Warn().Err(err).Msg("CardDAV: failed to list address books")
+		log.Warn().Err(sanitizeURLError(err, homeSetURL)).Msg("CardDAV: failed to list address books")
 		return err
 	}
 	log.Debug().Int("count", len(addressBooks)).Msg("CardDAV: found address books")
@@ -142,7 +142,7 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 	for _, abURL := range addressBooks {
 		contacts, fetchErr := c.fetchAllVCards(log, abURL)
 		if fetchErr != nil {
-			log.Warn().Err(fetchErr).Str("address_book_host", logSafeURL(abURL)).Msg("CardDAV: failed to fetch vCards")
+			log.Warn().Err(sanitizeURLError(fetchErr, abURL)).Str("address_book_host", logSafeURL(abURL)).Msg("CardDAV: failed to fetch vCards")
 			continue
 		}
 		allContacts = append(allContacts, contacts...)
@@ -269,7 +269,7 @@ func (c *cloudContactsClient) discoverPrincipal(log zerolog.Logger) (string, err
 
 	href := extractPropValue(data, "current-user-principal")
 	if href == "" {
-		log.Debug().Str("body", string(data[:min(len(data), 2000)])).Msg("CardDAV: PROPFIND response (no principal found)")
+		log.Debug().Int("body_bytes", len(data)).Msg("CardDAV: PROPFIND response (no principal found)")
 		return "", fmt.Errorf("no current-user-principal in response")
 	}
 
@@ -303,7 +303,7 @@ func (c *cloudContactsClient) discoverAddressBookHome(log zerolog.Logger, princi
 
 	href := extractPropValue(data, "addressbook-home-set")
 	if href == "" {
-		log.Debug().Str("body", string(data[:min(len(data), 2000)])).Msg("CardDAV: PROPFIND response (no home set found)")
+		log.Debug().Int("body_bytes", len(data)).Msg("CardDAV: PROPFIND response (no home set found)")
 		return "", fmt.Errorf("no addressbook-home-set in response")
 	}
 
@@ -480,7 +480,7 @@ func (c *cloudContactsClient) parseAddressBookList(data []byte, homeSetURL strin
 			}
 			if ps.Prop.ResourceType.AddressBook != nil {
 				log.Debug().
-					Str("href", href).
+					Str("address_book_host", logSafeURL(href)).
 					Str("name", ps.Prop.DisplayName).
 					Msg("CardDAV: found address book")
 				addressBooks = append(addressBooks, href)

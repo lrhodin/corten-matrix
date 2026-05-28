@@ -1809,7 +1809,7 @@ func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid s
 	// can store them lower/mixed; a case-sensitive = miss would silently
 	// no-op and let the fail-closed delete path proceed thinking it scrubbed.
 	// Matches the case-handling in getMessageTextByGUID/getMessageTimestampByGUID.
-	_, err := s.db.Exec(ctx,
+	res, err := s.db.Exec(ctx,
 		`UPDATE cloud_message
 		 SET deleted=TRUE,
 		     text=NULL, subject=NULL, sender='',
@@ -1821,9 +1821,28 @@ func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid s
 	if err != nil {
 		return fmt.Errorf("soft-delete message %s: %w", guid, err)
 	}
-	// Note: zero rows affected is NOT an error — the caller's contract is
-	// "ensure plaintext for guid is scrubbed". If the row never existed
-	// (filtered chat, never-bridged guid), the postcondition holds.
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		return nil
+	}
+	// Stub-insert path: Apple-side delete can arrive before CloudKit sync
+	// ever populates cloud_message (typical for messages sent and quickly
+	// retracted on the iPhone, or for portals still pending creation that
+	// hold the original in pendingPortalMsgs). Drop a deleted=TRUE stub
+	// so the future CloudKit upsert's ON CONFLICT CASE preserves the
+	// deletion (excluded.deleted ignored when cloud_message.deleted=TRUE).
+	// Without this stub the row would arrive live and bridge the body
+	// Apple already deleted on the user's devices.
+	nowMS := time.Now().UnixMilli()
+	_, err = s.db.Exec(ctx,
+		`INSERT OR IGNORE INTO cloud_message
+			(login_id, guid, timestamp_ms, is_from_me, deleted, body_scrubbed, created_ts, updated_ts)
+		 VALUES ($1, $2, $3, FALSE, TRUE, TRUE, $4, $4)`,
+		s.loginID, guid, nowMS, nowMS,
+	)
+	if err != nil {
+		return fmt.Errorf("stub-insert deleted message %s: %w", guid, err)
+	}
 	return nil
 }
 
