@@ -1017,11 +1017,11 @@ func (c *IMClient) Connect(ctx context.Context) {
 	if c.handle != "" {
 		if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.PreferredHandle != c.handle {
 			meta.PreferredHandle = c.handle
-			log.Info().Str("handle", c.handle).Msg("Persisted selected handle to metadata")
+			log.Info().Str("handle", logSafeHandle(c.handle)).Msg("Persisted selected handle to metadata")
 		}
 	}
 
-	log.Info().Str("selected_handle", c.handle).Strs("handles", handles).Msg("Connected to iMessage")
+	log.Info().Str("selected_handle", logSafeHandle(c.handle)).Strs("handles", logSafeHandles(handles)).Msg("Connected to iMessage")
 
 	// Pre-mint the OpenBubbles-style rotating FaceTime link slots ("next"
 	// for outbound, "nextincomingcall" for inbound). Done in the
@@ -1038,7 +1038,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 				return
 			}
 			premintFaceTimeLinks(ft, handle)
-			log.Info().Str("handle", handle).Msg("Pre-minted FaceTime link slots (next, nextincomingcall)")
+			log.Info().Str("handle", logSafeHandle(handle)).Msg("Pre-minted FaceTime link slots (next, nextincomingcall)")
 		}(c.handle)
 	}
 
@@ -1279,7 +1279,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 		extContacts := newExternalCardDAVClient(c.Main.Config.CardDAV, log)
 		if extContacts != nil {
 			c.contacts = extContacts
-			log.Info().Str("email", c.Main.Config.CardDAV.Email).Msg("Using external CardDAV for contacts")
+			log.Info().Str("email", logSafeHandle(c.Main.Config.CardDAV.Email)).Msg("Using external CardDAV for contacts")
 			if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
 				log.Warn().Err(syncErr).Msg("Initial external CardDAV sync failed")
 			} else {
@@ -1501,6 +1501,16 @@ func logSafeHandle(handle string) string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])
 }
 
+// logSafeHandles maps logSafeHandle over a slice for logging handle lists
+// (e.g. a portal's participants) without recording the raw PII.
+func logSafeHandles(handles []string) []string {
+	out := make([]string, len(handles))
+	for i, h := range handles {
+		out[i] = logSafeHandle(h)
+	}
+	return out
+}
+
 func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	log := c.UserLogin.Log.With().
 		Str("component", "statuskit").
@@ -1622,7 +1632,7 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			if cached, ok := c.statusKitPortalCache.Load(key); ok {
 				if p := findPortal(cached.(networkid.PortalID)); p != nil {
 					portal = p
-					log.Info().Str("user", user).Str("portal_id", string(p.ID)).Msg("StatusKit: resolved via learned sender cache")
+					log.Info().Str("user", logSafeHandle(user)).Str("portal_id", string(p.ID)).Msg("StatusKit: resolved via learned sender cache")
 					break
 				}
 			}
@@ -1651,7 +1661,7 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			// previously-resolved handles.
 			if portal == nil {
 				if altPortal := c.resolveStatusPortalViaIDSCached(ctx, log, user); altPortal != nil {
-					log.Info().Str("user", user).Msg("StatusKit: resolved mailto→tel via IDS correlation")
+					log.Info().Str("user", logSafeHandle(user)).Msg("StatusKit: resolved mailto→tel via IDS correlation")
 					portal = altPortal
 				}
 			}
@@ -2027,7 +2037,7 @@ func (c *IMClient) resolveStatusPortalViaIDS(ctx context.Context, log zerolog.Lo
 	// already cached (common when the contact has sent messages before),
 	// this resolves instantly and we skip the slow validate_targets call.
 	if aliases := c.client.ResolveHandleCached(user, knownHandles); len(aliases) > 0 {
-		log.Info().Str("user", user).Int("aliases", len(aliases)).Msg("StatusKit IDS fallback: resolved from cache (no network)")
+		log.Info().Str("user", logSafeHandle(user)).Int("aliases", len(aliases)).Msg("StatusKit IDS fallback: resolved from cache (no network)")
 		if portal := c.findPortalForAliases(ctx, log, user, aliases); portal != nil {
 			return portal
 		}
@@ -2037,7 +2047,7 @@ func (c *IMClient) resolveStatusPortalViaIDS(ctx context.Context, log zerolog.Lo
 	// caller is responsible for applying a timeout.
 	aliases, err := c.client.ResolveHandle(user, knownHandles)
 	if err != nil {
-		log.Warn().Err(err).Str("user", user).Msg("StatusKit IDS fallback: ResolveHandle failed")
+		log.Warn().Err(err).Str("user", logSafeHandle(user)).Msg("StatusKit IDS fallback: ResolveHandle failed")
 		return nil
 	}
 	return c.findPortalForAliases(ctx, log, user, aliases)
@@ -3613,7 +3623,7 @@ func (c *IMClient) handleFaceTimeMissedNotice(log zerolog.Logger, msg rustpushgo
 	}
 	if err == nil && portal != nil && portal.MXID != "" {
 		if sendErr := sendNotice(portal.MXID); sendErr == nil {
-			log.Info().Str("sender", senderHandle).Str("portal_mxid", string(portal.MXID)).Bool("has_callback", senderHandle != "" && c.handle != "").Msg("FaceTimeMissed: posted missed call notice to portal")
+			log.Info().Str("sender", logSafeHandle(senderHandle)).Str("portal_mxid", string(portal.MXID)).Bool("has_callback", senderHandle != "" && c.handle != "").Msg("FaceTimeMissed: posted missed call notice to portal")
 			return
 		}
 	}
@@ -3626,7 +3636,7 @@ func (c *IMClient) handleFaceTimeMissedNotice(log zerolog.Logger, msg rustpushgo
 		log.Warn().Err(sendErr).Msg("FaceTimeMissed: failed to send management room notice")
 		return
 	}
-	log.Info().Str("sender", senderHandle).Str("management_room", string(mgmtRoom)).Bool("has_callback", senderHandle != "" && c.handle != "").Msg("FaceTimeMissed: posted missed call notice to management room")
+	log.Info().Str("sender", logSafeHandle(senderHandle)).Str("management_room", string(mgmtRoom)).Bool("has_callback", senderHandle != "" && c.handle != "").Msg("FaceTimeMissed: posted missed call notice to management room")
 }
 
 func (c *IMClient) handleFaceTimeAnsweredElsewhereNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
@@ -3647,7 +3657,7 @@ func (c *IMClient) handleFaceTimeAnsweredElsewhereNotice(log zerolog.Logger, msg
 	senderHandle := ptrStringOr(msg.Sender, "")
 	if err == nil && portal != nil && portal.MXID != "" {
 		if sendErr := sendNotice(portal.MXID); sendErr == nil {
-			log.Info().Str("sender", senderHandle).Str("portal_mxid", string(portal.MXID)).Msg("FaceTimeAnsweredElsewhere: posted notice to portal")
+			log.Info().Str("sender", logSafeHandle(senderHandle)).Str("portal_mxid", string(portal.MXID)).Msg("FaceTimeAnsweredElsewhere: posted notice to portal")
 			return
 		}
 	}
@@ -3660,7 +3670,7 @@ func (c *IMClient) handleFaceTimeAnsweredElsewhereNotice(log zerolog.Logger, msg
 		log.Warn().Err(sendErr).Msg("FaceTimeAnsweredElsewhere: failed to send management room notice")
 		return
 	}
-	log.Info().Str("sender", senderHandle).Str("management_room", string(mgmtRoom)).Msg("FaceTimeAnsweredElsewhere: posted notice to management room")
+	log.Info().Str("sender", logSafeHandle(senderHandle)).Str("management_room", string(mgmtRoom)).Msg("FaceTimeAnsweredElsewhere: posted notice to management room")
 }
 
 // makeDeletePortalKey constructs a PortalKey from the delete/recover-specific

@@ -58,7 +58,7 @@ func newExternalCardDAVClient(cfg CardDAVConfig, log zerolog.Logger) *externalCa
 	if url == "" {
 		discovered, err := DiscoverCardDAVURL(cfg.Email, username, password, log)
 		if err != nil {
-			log.Warn().Err(err).Str("email", cfg.Email).Msg("CardDAV auto-discovery failed")
+			log.Warn().Err(err).Str("email", logSafeHandle(cfg.Email)).Msg("CardDAV auto-discovery failed")
 			return nil
 		}
 		url = discovered

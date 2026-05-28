@@ -209,7 +209,7 @@ func (c *IMClient) handleSharedProfile(log zerolog.Logger, msg rustpushgo.Wrappe
 		return
 	}
 	sender := *msg.Sender
-	log = log.With().Str("sender", sender).Logger()
+	log = log.With().Str("sender", logSafeHandle(sender)).Logger()
 
 	if msg.ShareProfileRecordKey == nil || msg.ShareProfileDecryptionKey == nil {
 		log.Debug().Msg("ShareProfile message has no record/decryption key, ignoring")

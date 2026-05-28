@@ -924,7 +924,7 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 //     contract with peer iOS.
 func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respectSpacing bool, bypassLatch bool) {
 	if c.client == nil || c.handle == "" {
-		log.Warn().Bool("client_nil", c.client == nil).Str("handle", c.handle).Msg("StatusKit invite: skipped (client or handle not ready)")
+		log.Warn().Bool("client_nil", c.client == nil).Str("handle", logSafeHandle(c.handle)).Msg("StatusKit invite: skipped (client or handle not ready)")
 		return
 	}
 	// Mark the sweep as running so the new-portal hook
@@ -933,7 +933,7 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 	// this gate, a bootstrap burst of fresh DM portals would race the sweep
 	// and spawn unpaced concurrent invites.
 	c.statusKitSweepRunning.Store(true)
-	log.Info().Str("handle", c.handle).Msg("StatusKit invite: starting")
+	log.Info().Str("handle", logSafeHandle(c.handle)).Msg("StatusKit invite: starting")
 	defer func() {
 		c.statusKitSweepRunning.Store(false)
 		if r := recover(); r != nil {
@@ -1095,7 +1095,7 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 		// callers both miss the latch and double-invoke. Peer iOS treats
 		// repeat invites as spam.
 		if _, loaded := c.inviteInFlight.LoadOrStore(h, struct{}{}); loaded {
-			log.Debug().Str("handle", h).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: skipping — already in flight")
+			log.Debug().Str("handle", logSafeHandle(h)).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: skipping — already in flight")
 			continue
 		}
 		inviteDone := make(chan error, 1)
@@ -1118,7 +1118,7 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 		case err := <-inviteDone:
 			if err != nil {
 				failCount++
-				log.Warn().Err(err).Str("sender", sender).Str("handle", h).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: failed for handle")
+				log.Warn().Err(err).Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(h)).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: failed for handle")
 			} else {
 				okCount++
 				// Write both keys:
@@ -1128,12 +1128,12 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 				//   useful for debug timelines)
 				c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitInvitedOkKeyPrefix+h), nowStr)
 				c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitLastInviteKeyPrefix+h), nowStr)
-				log.Info().Str("sender", sender).Str("handle", h).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: ok for handle")
-				log.Info().Str("handle", h).Msg("StatusKit: latch set on dispatch — relies on 4h retry if peer doesn't reciprocate")
+				log.Info().Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(h)).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: ok for handle")
+				log.Info().Str("handle", logSafeHandle(h)).Msg("StatusKit: latch set on dispatch — relies on 4h retry if peer doesn't reciprocate")
 			}
 		case <-time.After(perInviteTimeout):
 			timeoutCount++
-			log.Warn().Str("sender", sender).Str("handle", h).Int("i", i+1).Int("total", len(pending)).Dur("timeout", perInviteTimeout).Msg("StatusKit invite: timed out for handle — abandoning this handle, continuing sweep")
+			log.Warn().Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(h)).Int("i", i+1).Int("total", len(pending)).Dur("timeout", perInviteTimeout).Msg("StatusKit invite: timed out for handle — abandoning this handle, continuing sweep")
 		case <-c.stopChan:
 			log.Info().Int("done", i).Int("total", len(pending)).Msg("StatusKit invite: bridge stopping, aborting sweep")
 			return
@@ -1149,7 +1149,7 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 			}
 		}
 	}
-	log.Info().Int("pending", len(pending)).Int("ok", okCount).Int("failed", failCount).Int("timed_out", timeoutCount).Str("sender", sender).Msg("Sent StatusKit key invites one-per-handle (pending-only, paced)")
+	log.Info().Int("pending", len(pending)).Int("ok", okCount).Int("failed", failCount).Int("timed_out", timeoutCount).Str("sender", logSafeHandle(sender)).Msg("Sent StatusKit key invites one-per-handle (pending-only, paced)")
 	if okCount > 0 {
 		c.publishStatusKitAvailableAfterInvite(log, "invite sweep")
 	}
@@ -1236,7 +1236,7 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	// emit unpaced FFI calls. The next sweep (or the soft-expired
 	// re-invite path) will pick this peer up if needed.
 	if c.statusKitSweepRunning.Load() {
-		log.Debug().Str("handle", handle).Msg("StatusKit invite (new portal): sweep in progress; skipping")
+		log.Debug().Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): sweep in progress; skipping")
 		return
 	}
 
@@ -1245,7 +1245,7 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	if sk, skErr := c.client.GetStatuskitClient(); skErr == nil && sk != nil {
 		for _, known := range sk.GetKnownHandles() {
 			if known == handle {
-				log.Debug().Str("handle", handle).Msg("StatusKit invite (new portal): peer already keyed; skipping")
+				log.Debug().Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): peer already keyed; skipping")
 				return
 			}
 		}
@@ -1261,11 +1261,11 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 			}
 		}
 		if reshareSeen {
-			log.Debug().Str("handle", handle).Msg("StatusKit invite (new portal): reshare already seen; skipping")
+			log.Debug().Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): reshare already seen; skipping")
 			return
 		}
 		if ts, parseErr := time.Parse(time.RFC3339, latchedAt); parseErr == nil && now.Sub(ts) < statusKitInvitedOkTTL {
-			log.Debug().Str("handle", handle).Time("latched_at", ts).Msg("StatusKit invite (new portal): dispatch latch within TTL; skipping")
+			log.Debug().Str("handle", logSafeHandle(handle)).Time("latched_at", ts).Msg("StatusKit invite (new portal): dispatch latch within TTL; skipping")
 			return
 		}
 	}
@@ -1279,12 +1279,12 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	// parent select can return on its 30s timeout while the FFI is still
 	// running, and we must not free the slot until the FFI itself ends.
 	if _, loaded := c.inviteInFlight.LoadOrStore(handle, struct{}{}); loaded {
-		log.Debug().Str("handle", handle).Msg("StatusKit invite (new portal): already in flight; skipping")
+		log.Debug().Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): already in flight; skipping")
 		return
 	}
 
 	sender := c.handle
-	log.Info().Str("sender", sender).Str("handle", handle).Msg("StatusKit invite (new portal): dispatching")
+	log.Info().Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): dispatching")
 
 	const perInviteTimeout = 30 * time.Second
 	inviteDone := make(chan error, 1)
@@ -1303,16 +1303,16 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	select {
 	case err := <-inviteDone:
 		if err != nil {
-			log.Warn().Err(err).Str("sender", sender).Str("handle", handle).Msg("StatusKit invite (new portal): failed")
+			log.Warn().Err(err).Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): failed")
 			return
 		}
 		nowStr := now.Format(time.RFC3339)
 		c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitInvitedOkKeyPrefix+handle), nowStr)
 		c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitLastInviteKeyPrefix+handle), nowStr)
-		log.Info().Str("sender", sender).Str("handle", handle).Msg("StatusKit invite (new portal): ok")
+		log.Info().Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): ok")
 		c.publishStatusKitAvailableAfterInvite(log, "new portal invite")
 	case <-time.After(perInviteTimeout):
-		log.Warn().Str("sender", sender).Str("handle", handle).Dur("timeout", perInviteTimeout).Msg("StatusKit invite (new portal): timed out — abandoning")
+		log.Warn().Str("sender", logSafeHandle(sender)).Str("handle", logSafeHandle(handle)).Dur("timeout", perInviteTimeout).Msg("StatusKit invite (new portal): timed out — abandoning")
 	case <-c.stopChan:
 		return
 	}
