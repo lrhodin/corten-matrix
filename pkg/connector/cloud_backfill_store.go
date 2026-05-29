@@ -486,7 +486,11 @@ func (s *cloudBackfillStore) upsertChat(
 				THEN excluded.group_photo_guid
 				ELSE cloud_chat.group_photo_guid
 			END,
-			participants_json=excluded.participants_json,
+			participants_json=CASE
+				WHEN COALESCE(cloud_chat.participants_json, '') IN ('', '[]')
+				THEN excluded.participants_json
+				ELSE cloud_chat.participants_json
+			END,
 			updated_ts=CASE
 				WHEN excluded.updated_ts >= COALESCE(cloud_chat.updated_ts, 0)
 				THEN excluded.updated_ts
@@ -825,7 +829,11 @@ func (s *cloudBackfillStore) upsertChatBatch(ctx context.Context, chats []cloudC
 				THEN excluded.group_photo_guid
 				ELSE cloud_chat.group_photo_guid
 			END,
-			participants_json=excluded.participants_json,
+			participants_json=CASE
+				WHEN COALESCE(cloud_chat.participants_json, '') IN ('', '[]')
+				THEN excluded.participants_json
+				ELSE cloud_chat.participants_json
+			END,
 			updated_ts=CASE
 				WHEN excluded.updated_ts >= COALESCE(cloud_chat.updated_ts, 0)
 				THEN excluded.updated_ts
@@ -3114,7 +3122,7 @@ func (s *cloudBackfillStore) seedChatFromRecycleBin(ctx context.Context, portalI
 			portal_id=EXCLUDED.portal_id,
 			display_name=COALESCE(EXCLUDED.display_name, cloud_chat.display_name),
 			group_photo_guid=COALESCE(EXCLUDED.group_photo_guid, cloud_chat.group_photo_guid),
-			participants_json=CASE WHEN EXCLUDED.participants_json <> '[]' THEN EXCLUDED.participants_json ELSE cloud_chat.participants_json END,
+			participants_json=CASE WHEN COALESCE(cloud_chat.participants_json, '') IN ('', '[]') THEN EXCLUDED.participants_json ELSE cloud_chat.participants_json END,
 			deleted=FALSE,
 			updated_ts=EXCLUDED.updated_ts
 	`, s.loginID, chatID, portalID, groupID, dnPtr, photoPtr, participantsJSON, nowMS)
