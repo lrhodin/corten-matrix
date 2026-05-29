@@ -32,6 +32,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/provisionutil"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/lrhodin/imessage/imessage"
 )
@@ -95,6 +96,7 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 		)
 	}
 	cmds = append(cmds,
+		cmdSetPowerLevel,
 		cmdSharedAlbums,
 		cmdSharedSubscribe,
 		cmdSharedSubscribeToken,
@@ -130,6 +132,68 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 //
 // No aliases — `start-chat` is the single canonical command name. Synonyms
 // just teach users multiple ways to do the same thing and clutter help.
+// cmdSetPowerLevel shadows bridgev2's built-in `set-pl` (registered first by
+// the Processor, then overwritten by us in PostInit — same pattern as
+// cmdStartChat). The built-in sets the level as the bot, whose event the
+// framework filters out before the connector's HandleMatrixPowerLevels could
+// react — so set-pl would only get rubberbanded on the next resync. This
+// version sets the level then immediately snaps it back to the hardened policy
+// (reset + m.notice), so it happens the instant the command runs.
+var cmdSetPowerLevel = &commands.FullHandler{
+	Func: fnSetPowerLevel,
+	Name: "set-pl",
+	Aliases: []string{"set-power-level"},
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionAdmin,
+		Description: "Change a power level. Bridge-managed rooms snap it back to the default.",
+		Args:        "[_user ID_] <_power level_>",
+	},
+	RequiresAdmin:  true,
+	RequiresPortal: true,
+}
+
+func fnSetPowerLevel(ce *commands.Event) {
+	login := ce.User.GetDefaultLogin()
+	if login == nil {
+		ce.Reply("No active login found.")
+		return
+	}
+	client, ok := login.Client.(*IMClient)
+	if !ok || client == nil {
+		ce.Reply("Bridge client not available.")
+		return
+	}
+	if ce.Portal == nil {
+		ce.Reply("That command can only be run in portal rooms.")
+		return
+	}
+	var target id.UserID
+	var level int
+	var err error
+	switch len(ce.Args) {
+	case 1:
+		target = ce.User.MXID
+		level, err = strconv.Atoi(ce.Args[0])
+	case 2:
+		target = id.UserID(ce.Args[0])
+		if _, _, perr := target.Parse(); perr != nil {
+			ce.Reply("Invalid user ID %q", ce.Args[0])
+			return
+		}
+		level, err = strconv.Atoi(ce.Args[1])
+	default:
+		ce.Reply("**Usage:** `set-pl [user] <level>`")
+		return
+	}
+	if err != nil {
+		ce.Reply("Invalid power level.")
+		return
+	}
+	if rbErr := client.rubberbandSetPowerLevel(ce.Ctx, ce.Portal, target, level); rbErr != nil {
+		ce.Reply("Failed to set power level: %v", rbErr)
+	}
+}
+
 var cmdStartChat = &commands.FullHandler{
 	Name: "start-chat",
 	Func: fnStartChat,

@@ -6559,6 +6559,38 @@ func (c *IMClient) resetEscalatedUsers(ctx context.Context, portal *bridgev2.Por
 	return true
 }
 
+// rubberbandSetPowerLevel is the instant path for the `set-pl` command. The
+// framework sends set-pl's change as the bot and filters bot-sent events before
+// HandleMatrixPowerLevels would see them, so the connector's own set-pl command
+// (cmdSetPowerLevel) calls this directly: apply the requested level just long
+// enough to be visible, then snap the room back to the hardened policy —
+// resetting the just-granted level and posting the m.notice via the Custom hook.
+func (c *IMClient) rubberbandSetPowerLevel(ctx context.Context, portal *bridgev2.Portal, target id.UserID, level int) error {
+	if portal == nil || portal.MXID == "" {
+		return fmt.Errorf("no portal room")
+	}
+	pl, err := c.Main.Bridge.Matrix.GetPowerLevels(ctx, portal.MXID)
+	if err != nil {
+		return fmt.Errorf("failed to get power levels: %w", err)
+	}
+	botMXID := c.Main.Bridge.Bot.GetMXID()
+	pl.EnsureUserLevel(botMXID, botPowerLevel)
+
+	// Apply the requested level first so the change is briefly visible.
+	if pl.EnsureUserLevelAs(botMXID, target, level) {
+		if _, err := c.Main.Bridge.Bot.SendState(ctx, portal.MXID, event.StatePowerLevels, "", &event.Content{Parsed: pl}, time.Time{}); err != nil {
+			return fmt.Errorf("failed to set power level: %w", err)
+		}
+	}
+	// Snap back to the hardened policy (Custom hook resets + posts the notice).
+	if c.hardenedPowerLevels(ctx, portal).Apply(botMXID, pl) {
+		if _, err := c.Main.Bridge.Bot.SendState(ctx, portal.MXID, event.StatePowerLevels, "", &event.Content{Parsed: pl}, time.Time{}); err != nil {
+			return fmt.Errorf("failed to re-assert hardened power levels: %w", err)
+		}
+	}
+	return nil
+}
+
 // HandleMatrixPowerLevels implements bridgev2.PowerLevelHandlingNetworkAPI.
 // iMessage has no power-level concept, so the change is never bridged to the
 // network. Instead this callback is the immediate "rubberband" for homeservers
