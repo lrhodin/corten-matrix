@@ -292,12 +292,6 @@ type IMClient struct {
 	recentOutboundUnsends     map[string]time.Time
 	recentOutboundUnsendsLock sync.Mutex
 
-	// Power-level reset notice de-dup: keyed by "roomID|userID" -> time.Time of
-	// the last "power-level changes are disabled" m.notice we posted, so a room
-	// whose power levels keep getting re-escalated doesn't spam the timeline.
-	// sync.Map zero value is ready to use; no constructor init required.
-	plResetNotices sync.Map
-
 	// Outbound delete echo suppression: tracks portal IDs where a chat delete
 	// SMS portal tracking: portal IDs known to be SMS-only contacts
 	smsPortals     map[string]bool
@@ -6443,11 +6437,6 @@ const (
 	// then rubberbanded by HandleMatrixPowerLevels.
 	plLockLevel = 9000
 
-	// plResetNoticeCooldown rate-limits the "power-level changes are disabled"
-	// m.notice per room+user, so a room whose levels keep getting re-escalated
-	// (e.g. an admin-API loop) doesn't spam the timeline.
-	plResetNoticeCooldown = 10 * time.Minute
-
 	// botPowerLevel mirrors the level bridgev2 assigns the bridge bot in every
 	// portal at creation. It must stay above plLockLevel so the bot can always
 	// re-assert the hardened power levels.
@@ -6551,16 +6540,13 @@ func (c *IMClient) resetEscalatedUsers(ctx context.Context, portal *bridgev2.Por
 		if ctx != nil {
 			notifyCtx = context.WithoutCancel(ctx)
 		}
+		body := fmt.Sprintf("⚠️ Power-level changes are disabled in bridge chats. Your power level remains at %d.", baseline)
 		for _, userID := range demoted {
 			c.UserLogin.Log.Info().
 				Stringer("user_id", userID).
 				Stringer("room_id", roomID).
 				Int("baseline", baseline).
 				Msg("Reset escalated Matrix power level back to room default")
-			if !c.shouldSendPLResetNotice(roomID, userID) {
-				continue
-			}
-			body := fmt.Sprintf("⚠️ Power-level changes are disabled in bridge chats. Your power level remains at %d.", baseline)
 			go func() {
 				if _, err := c.Main.Bridge.Bot.SendMessage(notifyCtx, roomID, event.EventMessage, &event.Content{
 					Parsed: &event.MessageEventContent{MsgType: event.MsgNotice, Body: body},
@@ -6570,21 +6556,6 @@ func (c *IMClient) resetEscalatedUsers(ctx context.Context, portal *bridgev2.Por
 			}()
 		}
 	}
-	return true
-}
-
-// shouldSendPLResetNotice rate-limits the power-level-reset m.notice per
-// room+user using plResetNoticeCooldown, so re-escalation loops don't spam the
-// timeline. Returns true if a notice should be sent now.
-func (c *IMClient) shouldSendPLResetNotice(room id.RoomID, user id.UserID) bool {
-	key := string(room) + "|" + string(user)
-	now := time.Now()
-	if v, ok := c.plResetNotices.Load(key); ok {
-		if last, ok := v.(time.Time); ok && now.Sub(last) < plResetNoticeCooldown {
-			return false
-		}
-	}
-	c.plResetNotices.Store(key, now)
 	return true
 }
 
