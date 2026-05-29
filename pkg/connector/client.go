@@ -7394,11 +7394,13 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 	// purged. Restore-chat clears body_scrubbed before re-fetching from
 	// CloudKit, so the user-initiated restore path is unaffected.
 	//
-	// Exception: scrubbed reactions (tapback_type >= 2000) — fall through to
-	// cloudTapbackToBackfill which derives the emoji from tapback_type alone for
-	// the standard reactions (heart/like/dislike/laugh/excl/q). Custom-emoji
-	// (type 6) degrades to thumbs-up if tapback_emoji was scrubbed, but the
-	// reaction still lands in Matrix.
+	// Exception: scrubbed reactions (tapback_type >= 2000) fall through to
+	// cloudTapbackToBackfill and render identically to master. scrubReactionText
+	// (the only scrub touching a live reaction) clears text/subject only — it
+	// preserves tapback_emoji — so custom-emoji reactions (type 6) keep their
+	// emoji. The paths that DO null tapback_emoji all also set deleted=TRUE, and
+	// every backfill reader filters deleted=FALSE, so an emoji-nulled reaction is
+	// never re-rendered. Net: reaction rendering is unchanged from master.
 	if row.BodyScrubbed && !isCloudReactionRow(row.TapbackType) {
 		return nil
 	}
