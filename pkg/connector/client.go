@@ -2496,6 +2496,16 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	sender = c.canonicalizeDMSender(portalKey, sender)
 
+	// Keep the stored gid: group roster in sync with the sender's current view
+	// of the conversation. Only trust live (non-stored) messages — a stored
+	// backfill message carries the membership as it was at that message's time,
+	// which may be older than the current roster. This is what retroactively
+	// drops a member who already left (or was never removed from the stale
+	// insert-once roster) the next time anyone in the group sends a message.
+	if !msg.IsStoredMessage {
+		c.persistGroupParticipantsIfChanged(string(portalKey.ID), msg.Participants)
+	}
+
 	// Eagerly learn sender-handle → portal mapping for StatusKit presence
 	// correlation. A peer iPhone that reshares Focus keys addresses the APS
 	// payload to whichever of the user's handles they use to reach them — so
@@ -3092,6 +3102,13 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 	deduped := c.buildCanonicalParticipantList(msg.NewParticipants)
 	newPortalIDStr := strings.Join(deduped, ",")
 	oldPortalIDStr := string(oldPortalKey.ID)
+
+	// Refresh the persisted roster for a gid: portal immediately on an explicit
+	// membership change, so the outbound recipient list drops a departed member
+	// even if the portal is not re-keyed (gid: portals keep a stable ID; only
+	// comma-separated portals re-key below). No-op for comma portals, which
+	// derive recipients from the portal ID itself.
+	c.persistGroupParticipantsIfChanged(oldPortalIDStr, msg.NewParticipants)
 
 	// If the portal ID changed (member added/removed), re-key it in the DB.
 	finalPortalKey := oldPortalKey
@@ -9653,6 +9670,53 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 		Participants: participants,
 		IsSms:        isSms,
 	}
+}
+
+// persistGroupParticipantsIfChanged keeps cloud_chat.participants_json — the
+// source of truth for a gid: group's OUTBOUND recipient list (see
+// portalToConversation) — in sync with the freshest authoritative roster.
+//
+// The real-time persist in makePortalKey is insert-once, so without this a
+// member who leaves (or is added) is never dropped from / added to the send
+// list: the bridge keeps encrypting every outgoing message to the stale
+// roster, so the departed member keeps receiving messages. handleMessage calls
+// this on every live group message, which also self-heals a membership change
+// that arrived while the bridge was offline (delivered later as a stored
+// message and skipped by handleParticipantChange).
+//
+// gid-only: comma-separated portal IDs encode their members in the ID itself
+// and re-key via ReIDPortal, so their participants_json is not the send source
+// and must not be touched here.
+func (c *IMClient) persistGroupParticipantsIfChanged(portalID string, participants []string) {
+	if c.cloudStore == nil || !strings.HasPrefix(portalID, "gid:") {
+		return
+	}
+	// A real group roster always has at least two members. Guard against a
+	// fluke partial/control-message list shrinking the stored roster.
+	normalized := make([]string, 0, len(participants))
+	for _, p := range participants {
+		if n := normalizeIdentifierForPortalID(p); n != "" {
+			normalized = append(normalized, n)
+		}
+	}
+	if len(normalized) < 2 {
+		return
+	}
+	go func(pid string, parts []string) {
+		oldCount, updated, err := syncStoredGroupRoster(context.Background(), c.cloudStore, pid, parts, c.isMyHandle)
+		if err != nil {
+			c.Main.Bridge.Log.Warn().Err(err).Str("portal_id", pid).
+				Msg("group roster sync: failed to refresh stored participants")
+			return
+		}
+		if updated {
+			c.Main.Bridge.Log.Info().
+				Str("portal_id", pid).
+				Int("old_count", oldCount).
+				Int("new_count", len(parts)).
+				Msg("group roster sync: refreshed stored participants (membership changed)")
+		}
+	}(portalID, normalized)
 }
 
 // resolveGroupMembers returns the participant list for a group portal.

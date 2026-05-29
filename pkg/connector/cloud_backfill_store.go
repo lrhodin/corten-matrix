@@ -1492,6 +1492,69 @@ func (s *cloudBackfillStore) getChatParticipantsByPortalID(ctx context.Context, 
 	return normalized, nil
 }
 
+// updateChatParticipants overwrites the persisted participant roster for an
+// existing cloud_chat row, touching only participants_json (and updated_ts).
+//
+// Unlike upsertChat it never clobbers record_name / display_name / group_id /
+// service, so it is safe to call from the real-time message path on every
+// membership change. participants_json is the SOLE source of the outbound
+// recipient list for gid: group portals (see portalToConversation), and the
+// real-time persist in makePortalKey is insert-once — so without this a member
+// who leaves is never dropped from the send list and keeps receiving messages.
+//
+// It targets the same row getChatParticipantsByPortalID reads: primary match
+// by portal_id, with a gid:<uuid> fallback to group_id / cloud_chat_id. No row
+// is created if none exists — first-time creation stays owned by makePortalKey.
+func (s *cloudBackfillStore) updateChatParticipants(ctx context.Context, portalID string, participants []string) error {
+	participantsJSON, err := json.Marshal(participants)
+	if err != nil {
+		return err
+	}
+	nowMS := time.Now().UnixMilli()
+	res, err := s.db.Exec(ctx,
+		`UPDATE cloud_chat SET participants_json=$3, updated_ts=$4 WHERE login_id=$1 AND portal_id=$2`,
+		s.loginID, portalID, string(participantsJSON), nowMS,
+	)
+	if err != nil {
+		return err
+	}
+	// Fallback for gid: portals whose row is keyed by group_id / cloud_chat_id
+	// rather than portal_id (mirrors getChatParticipantsByPortalID's fallback).
+	if strings.HasPrefix(portalID, "gid:") {
+		if affected, aErr := res.RowsAffected(); aErr == nil && affected == 0 {
+			uuid := strings.TrimPrefix(portalID, "gid:")
+			if _, err = s.db.Exec(ctx,
+				`UPDATE cloud_chat SET participants_json=$3, updated_ts=$4 WHERE login_id=$1 AND (LOWER(group_id)=LOWER($2) OR LOWER(cloud_chat_id)=LOWER($2))`,
+				s.loginID, uuid, string(participantsJSON), nowMS,
+			); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// syncStoredGroupRoster is the testable core of the self-heal: it reads the
+// stored roster for portalID and overwrites it with `normalized` (a roster of
+// pre-normalized member IDs) when they differ as sets. It is a no-op — writing
+// nothing and reporting updated=false — when no row exists yet (first-time
+// creation is owned by makePortalKey's insert path) or when the rosters already
+// match (ignoring self-handle representation, via isSelf). Returns the old
+// member count for logging and whether an update was written.
+func syncStoredGroupRoster(ctx context.Context, store *cloudBackfillStore, portalID string, normalized []string, isSelf func(string) bool) (oldCount int, updated bool, err error) {
+	existing, err := store.getChatParticipantsByPortalID(ctx, portalID)
+	if err != nil {
+		return 0, false, err
+	}
+	if len(existing) == 0 || participantSetsMatch(existing, normalized, isSelf) {
+		return len(existing), false, nil
+	}
+	if err := store.updateChatParticipants(ctx, portalID, normalized); err != nil {
+		return len(existing), false, err
+	}
+	return len(existing), true, nil
+}
+
 // getDisplayNameByPortalID returns the CloudKit display_name for a given portal_id.
 // This is the user-set group name (cv_name from the iMessage protocol), NOT an
 // auto-generated label. Returns empty string if none found or if the group is unnamed.
