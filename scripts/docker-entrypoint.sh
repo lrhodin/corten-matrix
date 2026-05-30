@@ -30,15 +30,19 @@
 set -euo pipefail
 
 # ── Root prelude ────────────────────────────────────────────────────────────
-# Only runs on the first pass (real container start, before setpriv). After
-# the re-exec we're running as PUID:PGID and the `id -u = 0` check skips
-# this whole block.
+# Only runs on the first pass (real container start, before setpriv). The
+# ENTRYPOINT_PRIV_DROPPED sentinel — exported just before the re-exec and
+# preserved across it by setpriv — marks that the drop already happened, so
+# this block is skipped on the second pass. We can't rely on `id -u != 0` for
+# that: with PUID=0 the re-exec stays uid 0, so an `id -u = 0` guard alone
+# would re-enter the prelude forever (infinite setpriv loop, container never
+# reaches the dispatcher).
 #
 # Every fix below is conditional — chown only when find spots a mismatched
 # file; symlink only when readlink doesn't already match. Repeat invocations
 # (`docker restart`, `compose up -d` against an unchanged container) cost a
 # single find -quit each and exit silently.
-if [ "$(id -u)" = "0" ]; then
+if [ "$(id -u)" = "0" ] && [ -z "${ENTRYPOINT_PRIV_DROPPED:-}" ]; then
     PUID="${PUID:-1000}"
     PGID="${PGID:-1000}"
 
@@ -111,6 +115,7 @@ if [ "$(id -u)" = "0" ]; then
     # drops all supplementary groups; the bridge doesn't need any inside
     # this container.
     export HOME=/home/bridge
+    export ENTRYPOINT_PRIV_DROPPED=1
     exec setpriv --reuid "$PUID" --regid "$PGID" --clear-groups -- "$0" "$@"
 fi
 
