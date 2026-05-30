@@ -69,5 +69,7 @@ jobs:
           # layers either way.
           platforms: linux/amd64
           tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
           cache-from: type=gha,scope=linux-amd64
           cache-to: type=gha,mode=max,scope=linux-amd64

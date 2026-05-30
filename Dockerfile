@@ -56,17 +56,39 @@ RUN wget -qO /tmp/AppleRootCA.cer https://www.apple.com/appleca/AppleIncRootCert
     && rm -f /tmp/AppleRootCA.cer
 
 WORKDIR /src
-COPY . /src
 
-# Stub out bootstrap-linux.sh inside the builder. Every dep it would
-# install is already in the apt layer above, but its dedup leaves
-# APT_PACKAGES=" " (single space) when nothing's missing, so the
-# `[ -n "$APT_PACKAGES" ]` guard fires and the script tries to `sudo
-# apt-get install` an empty list. sudo isn't in the builder image
-# either. Bypassing the whole script is cleaner than installing sudo +
-# fixing the dedup bug upstream.
-RUN echo '#!/bin/bash' > scripts/bootstrap-linux.sh \
+# Layered copy so the expensive Rust/Go build below is NOT invalidated by edits
+# to runtime scripts (docker-entrypoint.sh, healthcheck.sh, install-*.sh), docs,
+# or anything outside the actual compile inputs. The runtime stage copies those
+# files straight from the build context, so the builder never needs them. We
+# also deliberately omit .git — it changes on every commit and would bust the
+# whole build; the commit is injected via the GIT_COMMIT build-arg at the final
+# (cheap) link step instead.
+
+# Stub bootstrap-linux.sh: check-deps-linux runs it to install host deps, but
+# every dep is already in the apt layer above (its dedup also mis-handles an
+# empty list, and there's no sudo in the builder). A no-op stub is cleaner.
+# scripts/ is otherwise not copied into the builder.
+RUN mkdir -p scripts \
+    && echo '#!/bin/bash' > scripts/bootstrap-linux.sh \
     && chmod +x scripts/bootstrap-linux.sh
+
+# ── Layer 1: clone + patch rustpush at the pinned SHA ───────────────────────
+# This is the slow, network-bound step. It depends only on the Makefile, the
+# SHA pin, and our open-absinthe overlay (rustpush/) — none of which change on a
+# typical commit — so it stays cached instead of re-cloning on every build.
+COPY Makefile ./
+COPY third_party/rustpush-upstream.sha ./third_party/rustpush-upstream.sha
+COPY rustpush/ ./rustpush/
+RUN make ensure-rustpush-source
+
+# ── Layer 2: the compile inputs (Go + Rust source) ──────────────────────────
+COPY go.mod go.sum Info.plist ./
+COPY nac-validation/ ./nac-validation/
+COPY pkg/            ./pkg/
+COPY cmd/            ./cmd/
+COPY imessage/       ./imessage/
+COPY ipc/            ./ipc/
 
 # Build with BuildKit cache mounts. CI exports these as part of
 # `cache-to: type=gha,mode=max` so subsequent runs reuse compiled
@@ -87,16 +109,18 @@ RUN echo '#!/bin/bash' > scripts/bootstrap-linux.sh \
 # refuses to git clone into the non-empty dir. Cargo handles those
 # artifacts in pkg/rustpushgo/target anyway.
 #
-# `make build` runs ensure-rustpush-source → clones rustpush at the
-# pinned SHA, overlays open-absinthe, applies every sed patch — then
-# cargo build, then go build. Network is required during this step
-# (cache mounts don't replace network access for git clones).
+# cargo build + go build. ensure-rustpush-source already ran in Layer 1 (its
+# clone is present and the patches are idempotent), so it's a fast no-op here.
+# GIT_COMMIT only feeds the Go ldflags version stamp, so a new commit re-links
+# the Go binary in seconds instead of rebuilding rustpush — that's the whole
+# point of injecting it here rather than copying .git into an earlier layer.
+ARG GIT_COMMIT=unknown
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,target=/src/pkg/rustpushgo/target,sharing=locked \
     --mount=type=cache,target=/root/go,sharing=locked \
     --mount=type=cache,target=/root/.cache/go-build,sharing=locked \
-    make build
+    make build COMMIT=$GIT_COMMIT
 
 # Verify every rustpush patch landed in the cloned source tree. Mirrors
 # the `verify-rustpush-patches` job in .github/workflows/ci.yml exactly
