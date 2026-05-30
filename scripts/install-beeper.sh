@@ -151,10 +151,22 @@ if [ -n "$EXISTING_BRIDGE" ] && [ ! -f "$CONFIG" ]; then
     echo ""
     echo "⚠  Found existing '$BRIDGE_NAME' registration on server but no local config."
     echo "   Deleting old registration to avoid orphaned rooms..."
-    "$BBCTL" delete "$BRIDGE_NAME"
-    echo "✓ Old registration cleaned up"
-    echo "   Waiting for server-side deletion to complete..."
-    sleep 5
+    # bbctl whoami can list a registration that the server can no longer
+    # delete (404 M_NOT_FOUND) — the appservice record is already gone but
+    # still shows in whoami.  Don't let that abort the install under set -e:
+    # a 404 means it's already deleted, and any other error is non-fatal
+    # because config regeneration re-registers anyway (worst case: a few
+    # orphaned rooms, far better than a failed setup).
+    if DELETE_OUT=$("$BBCTL" delete "$BRIDGE_NAME" 2>&1); then
+        echo "✓ Old registration cleaned up"
+        echo "   Waiting for server-side deletion to complete..."
+        sleep 5
+    elif echo "$DELETE_OUT" | grep -qi "not found\|M_NOT_FOUND\|404"; then
+        echo "✓ Registration already absent on server — continuing"
+    else
+        echo "⚠  Could not delete old registration: $DELETE_OUT"
+        echo "   Continuing anyway — config regeneration will re-register."
+    fi
 fi
 
 # ── Generate config via bbctl ─────────────────────────────────
