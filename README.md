@@ -603,6 +603,24 @@ At the end of every install run, the installer offers to drop four aliases into 
 
 The prompt defaults to **no** — answer `y` to install. The aliases are wrapped in a marker comment block (`# >>> mautrix-imessage shortcuts (managed) >>>` … `# <<< mautrix-imessage shortcuts (managed) <<<`), so re-running an installer and answering `y` replaces (rather than duplicates) the entries. If you skipped them on first install, just re-run and say `y`. To remove them later, delete the marker block from your `~/.zshrc` or `~/.bashrc` by hand — the installer doesn't have an "uninstall aliases" path. Bash and Zsh are auto-detected from `$SHELL`; other shells get a clean skip message. After install, open a new terminal — or `source ~/.zshrc` (or `~/.bashrc`) in your current one — to pick the aliases up.
 
+**Adding them by hand.** The installer auto-detects your shell and the systemd scope, which can misfire in containers — e.g. an LXC / Proxmox guest entered via `pct enter`, where `$SHELL` is unset and there's no per-user systemd session. If the prompt skips you, or the installed aliases don't control the service, paste the lines into your `~/.bashrc` or `~/.zshrc` yourself. Use the `--user` form for a user service, or the `sudo` form when the bridge runs as a **system** service (the usual case in an LXC container, or any install done as root):
+
+```bash
+# User service (systemctl --user) — typical desktop / VM install
+alias start-imessage='systemctl --user start mautrix-imessage'
+alias stop-imessage='systemctl --user stop mautrix-imessage'
+alias restart-imessage='systemctl --user restart mautrix-imessage'
+alias imessage-log='journalctl --user -u mautrix-imessage -f'
+
+# System service — LXC container or root install
+alias start-imessage='sudo systemctl start mautrix-imessage'
+alias stop-imessage='sudo systemctl stop mautrix-imessage'
+alias restart-imessage='sudo systemctl restart mautrix-imessage'
+alias imessage-log='sudo journalctl -u mautrix-imessage -f'
+```
+
+Pick one block (not both). Re-`source` the file or open a new terminal to pick the aliases up.
+
 The raw equivalents (and other knobs) are below if you'd rather wire your own thing.
 
 ### macOS
