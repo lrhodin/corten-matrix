@@ -85,6 +85,13 @@ if [ "$(id -u)" = "0" ] && [ -z "${ENTRYPOINT_PRIV_DROPPED:-}" ]; then
     [ -e /data/logs/bridge.log ] || : > /data/logs/bridge.log
     chown "$PUID:$PGID" /data/logs /data/logs/bridge.log 2>/dev/null || true
 
+    # A setup lock present at container start is ALWAYS stale: `imessage setup`
+    # runs as a `docker exec` child, never as part of PID 1, so a lock can't
+    # have survived a (re)start. Clear it here so cmd_run isn't wedged waiting
+    # on a lock whose setup process is long gone (the EXIT-trap cleanup in
+    # cmd_setup doesn't fire on Ctrl-C / closed exec session / SIGKILL).
+    rm -f /data/.setup-in-progress 2>/dev/null || true
+
     # Mirror the host bind-mount source path inside the container, pointing
     # at /data. Lets absolute paths from a bare-Linux install (e.g. config
     # has `uri: file:/root/.local/share/mautrix-imessage/mautrix-imessage.db`)
@@ -139,6 +146,26 @@ SETUP_LOCK="$DATA_DIR/.setup-in-progress"
 # share/mautrix-imessage is symlinked to /data, so the bridge writes it here.
 SESSION_FILE="$DATA_DIR/session.json"
 
+# A setup lock is honored only while the setup process that created it is still
+# alive. cmd_setup records its PID in the lock; `imessage setup` runs as a
+# `docker exec` child in PID 1's namespace, so cmd_run can see it via /proc. An
+# interrupted setup (Ctrl-C, closed exec session, SIGKILL) never runs its
+# EXIT-trap cleanup, leaving the lock behind — without this check that stale
+# lock wedges cmd_run forever and the bridge never starts. A PID-less lock
+# (pre-upgrade format, or one left by an older image) is likewise treated as
+# stale and cleared.
+setup_in_progress() {
+    [ -f "$SETUP_LOCK" ] || return 1
+    local pid
+    pid=$(cat "$SETUP_LOCK" 2>/dev/null || true)
+    if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+        return 0
+    fi
+    rm -f "$SETUP_LOCK"
+    echo "[entrypoint] cleared stale setup lock (setup PID '${pid:-none}' not running)"
+    return 1
+}
+
 CMD="${1:-run}"
 shift || true
 
@@ -184,7 +211,7 @@ cmd_run() {
     # completes, drops the lock, writes the session, and cmd_run starts the
     # bridge on its own.
     local warned=0
-    while [ ! -f "$CONFIG" ] || [ -f "$SETUP_LOCK" ] || [ ! -f "$SESSION_FILE" ]; do
+    while [ ! -f "$CONFIG" ] || setup_in_progress || [ ! -f "$SESSION_FILE" ]; do
         if [ "$warned" -eq 0 ]; then
             echo "waiting for setup — run 'imessage setup' from the host (no config.yaml or no completed iMessage login yet)."
             warned=1
@@ -232,10 +259,19 @@ EOF
             ;;
     esac
 
-    # Hold the setup lock so cmd_run (PID 1) doesn't race-start the
-    # bridge when the install script writes config.yaml partway through.
-    : > "$SETUP_LOCK"
+    # Hold the setup lock so cmd_run (PID 1) doesn't race-start the bridge when
+    # the install script writes config.yaml partway through. Record our PID so
+    # cmd_run / the healthcheck can tell a live setup from a stale lock left by
+    # an interrupted run (the EXIT trap below only fires on a clean exit).
+    echo $$ > "$SETUP_LOCK"
+    # Remove the lock on a clean exit AND on the common interrupts — Ctrl-C
+    # (INT), `docker stop` (TERM), a disconnected exec session (HUP) — by
+    # turning each signal into a normal exit so the EXIT handler runs. SIGKILL
+    # can't be trapped, but cmd_run's PID-liveness check and the boot-time clear
+    # reclaim a lock left behind that way, so a leaked lock can never wedge the
+    # bridge regardless of how setup dies.
     trap 'rm -f "$SETUP_LOCK"' EXIT
+    trap 'exit 130' INT TERM HUP
 
     export IN_DOCKER=1
     cd "$DATA_DIR"
