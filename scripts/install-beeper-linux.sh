@@ -1067,12 +1067,9 @@ fi
 if [ -z "${IN_DOCKER:-}" ]; then
 # ── Optional shell shortcuts (asked before preferred handle so the
 #    handle prompt remains the last interactive step) ─────────────
-# Detect the systemd scope the shortcuts should target. Prefer an already-
-# installed unit's scope; on a first-time install (no unit yet) fall back to
-# the same probe the systemd setup below uses, so the aliases match the scope
-# the service is actually installed under. In an LXC container / as root there
-# is no --user session, so the bridge runs as a system service and the
-# shortcuts must use sudo systemctl.
+# Detect existing systemd scope from installed unit files. If neither
+# scope has the unit yet (first-time install before systemd setup),
+# default to --user (the common path for non-root installs).
 _SHORTCUT_SYSCTL=""
 _SHORTCUT_JCTL=""
 if systemctl --user list-unit-files mautrix-imessage.service 2>/dev/null | grep -q mautrix-imessage; then
@@ -1081,12 +1078,9 @@ if systemctl --user list-unit-files mautrix-imessage.service 2>/dev/null | grep 
 elif systemctl list-unit-files mautrix-imessage.service 2>/dev/null | grep -q mautrix-imessage; then
     _SHORTCUT_SYSCTL="sudo systemctl"
     _SHORTCUT_JCTL="sudo journalctl"
-elif systemctl --user status >/dev/null 2>&1; then
+else
     _SHORTCUT_SYSCTL="systemctl --user"
     _SHORTCUT_JCTL="journalctl --user"
-else
-    _SHORTCUT_SYSCTL="sudo systemctl"
-    _SHORTCUT_JCTL="sudo journalctl"
 fi
 
 echo ""
@@ -1095,24 +1089,13 @@ echo "  start-imessage     stop-imessage     restart-imessage     imessage-log"
 read -r -p "Add them? [y/N]: " _shortcut_ans
 case "$_shortcut_ans" in
     [yY]|[yY][eE][sS])
-        # $SHELL is set by the login process and is empty when a container is
-        # entered via `pct enter`/`lxc-attach`/`lxc exec` (no login ran). Fall
-        # back to the passwd database, then the parent process, so the shell is
-        # detected even in those LXC sessions.
-        USER_SHELL="${SHELL:-}"
-        if [ -z "$USER_SHELL" ]; then
-            USER_SHELL="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7 || true)"
-        fi
-        if [ -z "$USER_SHELL" ]; then
-            USER_SHELL="$(readlink -f "/proc/$PPID/exe" 2>/dev/null || true)"
-        fi
-        case "$USER_SHELL" in
+        case "$SHELL" in
             */zsh)  RC_FILE="$HOME/.zshrc" ;;
             */bash) RC_FILE="$HOME/.bashrc" ;;
             *)      RC_FILE="" ;;
         esac
         if [ -z "$RC_FILE" ]; then
-            echo "  Couldn't detect your shell ($USER_SHELL) — skipping. (Bash and Zsh are supported.)"
+            echo "  Couldn't detect your shell from \$SHELL ($SHELL) — skipping. (Bash and Zsh are supported.)"
         else
             MARKER_START="# >>> mautrix-imessage shortcuts (managed) >>>"
             MARKER_END="# <<< mautrix-imessage shortcuts (managed) <<<"
@@ -1138,18 +1121,7 @@ EOF
     *)
         # User declined. If a previous run installed shortcuts, treat the
         # decline as "remove them" so the rc file matches the user's choice.
-        # $SHELL is set by the login process and is empty when a container is
-        # entered via `pct enter`/`lxc-attach`/`lxc exec` (no login ran). Fall
-        # back to the passwd database, then the parent process, so the shell is
-        # detected even in those LXC sessions.
-        USER_SHELL="${SHELL:-}"
-        if [ -z "$USER_SHELL" ]; then
-            USER_SHELL="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7 || true)"
-        fi
-        if [ -z "$USER_SHELL" ]; then
-            USER_SHELL="$(readlink -f "/proc/$PPID/exe" 2>/dev/null || true)"
-        fi
-        case "$USER_SHELL" in
+        case "$SHELL" in
             */zsh)  RC_FILE="$HOME/.zshrc" ;;
             */bash) RC_FILE="$HOME/.bashrc" ;;
             *)      RC_FILE="" ;;
