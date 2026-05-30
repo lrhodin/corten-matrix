@@ -82,55 +82,15 @@ COPY third_party/rustpush-upstream.sha ./third_party/rustpush-upstream.sha
 COPY rustpush/ ./rustpush/
 RUN make ensure-rustpush-source
 
-# ── Layer 2: the compile inputs (Go + Rust source) ──────────────────────────
-COPY go.mod go.sum Info.plist ./
-COPY nac-validation/ ./nac-validation/
-COPY pkg/            ./pkg/
-COPY cmd/            ./cmd/
-COPY imessage/       ./imessage/
-COPY ipc/            ./ipc/
-
-# Build with BuildKit cache mounts. CI exports these as part of
-# `cache-to: type=gha,mode=max` so subsequent runs reuse compiled
-# crates and Go modules instead of rebuilding rustpush from scratch
-# (~5 min saved per run once the cache is warm).
-#
-# Caches mounted:
-#   /root/.cargo/registry         - downloaded crate sources
-#   /root/.cargo/git              - git-backed crate sources
-#   /src/pkg/rustpushgo/target    - cargo build artifacts (the big one;
-#                                   rustpush builds here as a workspace
-#                                   dep, no separate cache needed)
-#   /root/go                      - GOPATH (Go module cache)
-#   /root/.cache/go-build         - Go build cache
-#
-# We can't cache /src/third_party/rustpush-upstream/ — BuildKit would
-# auto-create the parent on mount, and `ensure-rustpush-source` then
-# refuses to git clone into the non-empty dir. Cargo handles those
-# artifacts in pkg/rustpushgo/target anyway.
-#
-# cargo build + go build. ensure-rustpush-source already ran in Layer 1 (its
-# clone is present and the patches are idempotent), so it's a fast no-op here.
-# GIT_COMMIT only feeds the Go ldflags version stamp, so a new commit re-links
-# the Go binary in seconds instead of rebuilding rustpush — that's the whole
-# point of injecting it here rather than copying .git into an earlier layer.
-ARG GIT_COMMIT=unknown
-RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
-    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
-    --mount=type=cache,target=/src/pkg/rustpushgo/target,sharing=locked \
-    --mount=type=cache,target=/root/go,sharing=locked \
-    --mount=type=cache,target=/root/.cache/go-build,sharing=locked \
-    make build COMMIT=$GIT_COMMIT
-
-# Verify every rustpush patch landed in the cloned source tree. Mirrors
-# the `verify-rustpush-patches` job in .github/workflows/ci.yml exactly
-# so the Docker image can't ship a binary that's missing one of these
-# patches (which would happen silently if upstream reworded a guarded
-# line and the sed in ensure-rustpush-source quietly skipped it).
-#
-# Prints a one-line-per-patch status + a summary line at the end. Fails
-# the build if ANY patch marker is missing — the only safe failure mode
-# for a binary that depends on every one of these.
+# ── Verify every rustpush patch landed BEFORE compiling ─────────────────────
+# Runs immediately after the clone+patch and before any Rust/Go build, so a
+# missing patch fails the build fast (not after the expensive compile) and this
+# check caches in the clone tier instead of re-running on every Go edit. Mirrors
+# the `verify-rustpush-patches` job in .github/workflows/ci.yml so the image
+# can't ship a binary missing one of these patches — which would happen silently
+# if upstream reworded a guarded line and the sed in ensure-rustpush-source
+# skipped it. Fails the build if ANY marker is missing: the only safe failure
+# mode for a binary that depends on every one of these overlays.
 RUN set -e; \
     BASE=third_party/rustpush-upstream; \
     PASS=0; FAIL=0; TOTAL=0; \
@@ -147,7 +107,7 @@ RUN set -e; \
     }; \
     echo ""; \
     echo "═══════════════════════════════════════════════════════════"; \
-    echo "  Verifying rustpush patches are applied to built binary"; \
+    echo "  Verifying rustpush patches are applied to the cloned source"; \
     echo "═══════════════════════════════════════════════════════════"; \
     check "activation pub"                       "$BASE/src/lib.rs"                                   "pub mod activation;"; \
     check "ids pub"                              "$BASE/src/lib.rs"                                   "pub mod ids;"; \
@@ -165,9 +125,57 @@ RUN set -e; \
         echo "═══════════════════════════════════════════════════════════"; \
         exit 1; \
     fi; \
-    echo "  ✓ OK — all rustpush patches applied to the shipped binary."; \
+    echo "  ✓ OK — all rustpush patches applied."; \
     echo "═══════════════════════════════════════════════════════════"; \
     echo ""
+
+# ── Layer 2: compile the Rust static lib (librustpushgo.a) ──────────────────
+# Keyed ONLY on Rust inputs — the rustpushgo crate + nac-validation (rustpush
+# itself is already cloned + patched in Layer 1). A Go-source edit does NOT
+# touch these, so this layer — and the expensive cargo build — stays a gha
+# LAYER-cache hit across commits. That's the actual fix for the old "any commit
+# rebuilds rustpush" 8-minute builds: previously the cargo compile shared a RUN
+# with the Go build, so any pkg/ edit busted it, and it leaned on the cargo
+# `--mount=type=cache` to skip the rebuild — but BuildKit cache MOUNTS are
+# builder-local and are NOT exported by `cache-to: type=gha`, so on every fresh
+# CI runner that mount was cold and rustpush recompiled from scratch. The LAYER
+# cache, by contrast, IS exported by gha (mode=max) — so moving the compile into
+# its own Rust-input-keyed layer means a Go change reuses the cached lib.
+#
+# `make rust` cp's the archive to /src/librustpushgo.a — committed to THIS
+# layer's filesystem (NOT the cargo target cache mount) — so the Go layer below
+# links it via the cgo bindings' `-L${SRCDIR}/../../` (= /src) plus the
+# Makefile's `-L$(CURDIR)` (= /src). The cache mounts here only speed the
+# compile itself; the shipped artifact is the committed /src/librustpushgo.a.
+COPY pkg/rustpushgo/ ./pkg/rustpushgo/
+COPY nac-validation/ ./nac-validation/
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,target=/src/pkg/rustpushgo/target,sharing=locked \
+    make rust
+
+# ── Layer 3: compile the Go binary + bbctl, linking the prebuilt lib ─────────
+# Only Go inputs are copied here, so a Go-source edit invalidates ONLY this
+# cheap layer. RUST_LIB is already built and up-to-date: ensure-rustpush-source
+# is idempotent (every patch is grep-guarded, so a re-run bumps no source
+# mtimes) and nothing copied here touches the Rust sources, so `make build`
+# skips cargo entirely and just compiles + links Go in seconds. GIT_COMMIT feeds
+# only the Go version stamp — a new commit re-links Go, never rebuilds rustpush.
+# The cargo cache mounts stay mounted as a safety net: if make ever does judge
+# RUST_LIB stale, it's a fast incremental cargo pass, not a from-scratch rebuild
+# (and the registry mount is there rather than failing offline).
+COPY go.mod go.sum Info.plist ./
+COPY pkg/connector/  ./pkg/connector/
+COPY cmd/            ./cmd/
+COPY imessage/       ./imessage/
+COPY ipc/            ./ipc/
+ARG GIT_COMMIT=unknown
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,target=/src/pkg/rustpushgo/target,sharing=locked \
+    --mount=type=cache,target=/root/go,sharing=locked \
+    --mount=type=cache,target=/root/.cache/go-build,sharing=locked \
+    make build COMMIT=$GIT_COMMIT
 
 # ─── Stage 2: runtime ────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
