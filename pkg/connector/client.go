@@ -15,12 +15,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"image"
 	"image/jpeg"
 	"math"
 	"net/url"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
@@ -40,6 +42,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"go.mau.fi/util/ffmpeg"
 	"go.mau.fi/util/ptr"
+	"golang.org/x/sync/semaphore"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -7904,6 +7907,13 @@ func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMess
 			}()
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			// Bound resident attachment bytes against the shared process-wide
+			// budget (see preUploadCloudAttachments / attachmentByteSem).
+			weight := clampAttachmentWeight(att.FileSize)
+			if err := attachmentByteSem.Acquire(ctx, weight); err != nil {
+				return // ctx cancelled
+			}
+			defer attachmentByteSem.Release(weight)
 			msgs := c.downloadAndUploadAttachment(ctx, row, sender, ts, hasText, idx, att)
 			for _, m := range msgs {
 				results <- cloudAttachmentResult{Index: idx, Message: m}
@@ -8092,24 +8102,18 @@ func (c *IMClient) downloadAndUploadAttachment(
 	}
 
 	// Remux/transcode non-MP4 videos to MP4 for broad Matrix client compatibility.
+	// Goes through transcodeToMP4 so this CloudKit-backfill path shares the same
+	// process-wide serialization and retry as the live and chat.db paths — the
+	// pre-upload runs up to 32 of these goroutines at once, so without the
+	// shared semaphore a low-memory host could have 32 ffmpeg re-encodes
+	// running simultaneously and OOM.
 	if c.Main.Config.VideoTranscoding && ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
 		origMime := mimeType
 		origSize := len(data)
-		method := "remux"
-		converted, convertErr := ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
-			[]string{"-c", "copy", "-movflags", "+faststart"},
-			mimeType)
-		if convertErr != nil {
-			// Remux failed — try full re-encode
-			method = "re-encode"
-			converted, convertErr = ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
-				[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
-					"-c:a", "aac", "-movflags", "+faststart"},
-				mimeType)
-		}
+		converted, method, convertErr := transcodeToMP4(ctx, &log, data, mimeType)
 		if convertErr != nil {
 			log.Warn().Err(convertErr).Str("guid", row.GUID).Str("original_mime", origMime).
-				Msg("FFmpeg video conversion failed, uploading original")
+				Msg("FFmpeg video conversion failed after retries, uploading original")
 		} else {
 			log.Info().Str("guid", row.GUID).Str("original_mime", origMime).
 				Str("method", method).Int("original_bytes", origSize).Int("converted_bytes", len(converted)).
@@ -8271,23 +8275,14 @@ func (c *IMClient) downloadAndUploadAttachment(
 			}
 		}
 
-		// Remux/transcode the avid video if enabled.
+		// Remux/transcode the avid video if enabled. Shares transcodeToMP4's
+		// serialization + retry with the other paths (see the lqa branch above).
 		if c.Main.Config.VideoTranscoding && ffmpeg.Supported() {
 			origSize := len(avidData)
-			method := "remux"
-			converted, convertErr := ffmpeg.ConvertBytes(ctx, avidData, ".mp4", nil,
-				[]string{"-c", "copy", "-movflags", "+faststart"},
-				avidMime)
-			if convertErr != nil {
-				method = "re-encode"
-				converted, convertErr = ffmpeg.ConvertBytes(ctx, avidData, ".mp4", nil,
-					[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
-						"-c:a", "aac", "-movflags", "+faststart"},
-					avidMime)
-			}
+			converted, method, convertErr := transcodeToMP4(ctx, &log, avidData, avidMime)
 			if convertErr != nil {
 				log.Warn().Err(convertErr).Str("guid", row.GUID).
-					Msg("Live Photo avid ffmpeg conversion failed, uploading original")
+					Msg("Live Photo avid ffmpeg conversion failed after retries, uploading original")
 			} else {
 				log.Info().Str("guid", row.GUID).
 					Str("method", method).Int("original_bytes", origSize).Int("converted_bytes", len(converted)).
@@ -8337,6 +8332,52 @@ func (c *IMClient) downloadAndUploadAttachment(
 	}
 
 	return messages
+}
+
+const (
+	// attachmentMaxParallelDownloads caps the number of concurrent CloudKit
+	// downloads during pre-upload — bounds sockets/fds/goroutines.
+	attachmentMaxParallelDownloads = 32
+	// attachmentMaxInFlightBytes caps the total attachment payload resident in
+	// memory at once across the pre-upload fan-out. Each in-flight download
+	// holds its blob (and briefly its transcoded copy ≈ 2× this budget) in RAM,
+	// so on a small host (the 1GB Docker target) a burst of large videos at
+	// full count parallelism could blow the memory budget. Weighting each
+	// download by its FileSize against this budget keeps a pure-photo backfill
+	// fully parallel while throttling large-video bursts to whatever fits —
+	// bounding peak RAM without slowing the common case. The ffmpeg encode peak
+	// is bounded separately by transcodeSem (one re-encode at a time), which is
+	// the single largest consumer; this value leaves it headroom under 1GB.
+	// iMessage caps attachments at ~100 MB, so this sits just above the largest
+	// possible single item: one max-size video downloads near-alone (the right
+	// bound) while smaller attachments still pack in alongside it. Tune up if
+	// the host has more RAM (faster large-video backfill) or down if it's still
+	// tight.
+	attachmentMaxInFlightBytes int64 = 128 << 20 // 128 MiB
+)
+
+// attachmentByteSem bounds the total attachment payload resident in memory at
+// once across ALL CloudKit download fan-outs — the startup pre-upload, the
+// per-chunk forward backfill, and the per-message multi-attachment download. It
+// is process-wide (one shared budget) so overlapping phases can't each spend a
+// full budget and collectively blow past it. Acquired weighted by FileSize and
+// held for the lifetime of each download+transcode+upload.
+var attachmentByteSem = semaphore.NewWeighted(attachmentMaxInFlightBytes)
+
+// clampAttachmentWeight turns an attachment's reported FileSize into a valid
+// weight for the in-flight-bytes semaphore: at least 1 (FileSize may be 0 or
+// unknown) and at most the whole budget. iMessage caps attachments at ~100 MB
+// — below the budget — so the upper clamp is a defensive guard that shouldn't
+// fire in practice; it keeps an unexpectedly oversized item running alone
+// instead of deadlocking on budget it could never acquire.
+func clampAttachmentWeight(fileSize int64) int64 {
+	if fileSize < 1 {
+		return 1
+	}
+	if fileSize > attachmentMaxInFlightBytes {
+		return attachmentMaxInFlightBytes
+	}
+	return fileSize
 }
 
 // preUploadCloudAttachments downloads every CloudKit attachment recorded in the
@@ -8487,8 +8528,8 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 		Msg("Pre-upload: starting CloudKit→Matrix attachment pre-upload before portal creation")
 
 	start := time.Now()
-	const maxParallel = 32
-	sem := make(chan struct{}, maxParallel)
+	sem := make(chan struct{}, attachmentMaxParallelDownloads)
+	byteSem := attachmentByteSem
 	var wg sync.WaitGroup
 	var uploaded atomic.Int64
 
@@ -8497,13 +8538,20 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 		go func(p pendingUpload) {
 			defer wg.Done()
 			// Check context before acquiring semaphore so shutdown doesn't
-			// queue up behind 32 in-flight downloads (each up to 90s).
+			// queue up behind the in-flight downloads (each up to 90s).
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
 				return
 			}
 			defer func() { <-sem }()
+			// Bound resident attachment bytes: hold budget for this blob's
+			// size for the lifetime of the download+transcode+upload.
+			weight := clampAttachmentWeight(p.att.FileSize)
+			if err := byteSem.Acquire(ctx, weight); err != nil {
+				return // ctx cancelled
+			}
+			defer byteSem.Release(weight)
 			defer func() {
 				if r := recover(); r != nil {
 					log.Error().Any("panic", r).
@@ -8580,8 +8628,8 @@ func (c *IMClient) preUploadChunkAttachments(ctx context.Context, rows []cloudMe
 		return
 	}
 	log.Info().Int("uncached", len(pending)).Msg("Forward backfill: pre-uploading uncached attachments in parallel")
-	const maxParallel = 32
-	sem := make(chan struct{}, maxParallel)
+	sem := make(chan struct{}, attachmentMaxParallelDownloads)
+	byteSem := attachmentByteSem
 	var wg sync.WaitGroup
 	for _, p := range pending {
 		wg.Add(1)
@@ -8593,6 +8641,12 @@ func (c *IMClient) preUploadChunkAttachments(ctx context.Context, rows []cloudMe
 				return
 			}
 			defer func() { <-sem }()
+			// Bound resident attachment bytes (see preUploadCloudAttachments).
+			weight := clampAttachmentWeight(p.att.FileSize)
+			if err := byteSem.Acquire(ctx, weight); err != nil {
+				return // ctx cancelled
+			}
+			defer byteSem.Release(weight)
 			defer func() {
 				if r := recover(); r != nil {
 					log.Error().Any("panic", r).
@@ -10507,12 +10561,29 @@ const (
 	// transcodeBackoffInitial is the first wait between transcode retries; it
 	// doubles after each failure.
 	transcodeBackoffInitial = 3 * time.Second
-	// transcodeRetryCadence caps the INTERVAL between retries — not the number
-	// of retries. Transcoding never gives up (no man left behind), so the wait
-	// must settle at a steady cadence: an uncapped interval would double to
-	// hours/days and effectively stop retrying, which is the opposite of what
-	// we want. Retries continue at this cadence until the conversion succeeds.
+	// transcodeRetryCadence caps the INTERVAL between retries (not their
+	// count): an uncapped exponential interval would double to hours, so it
+	// settles at this steady cadence.
 	transcodeRetryCadence = 60 * time.Second
+	// transcodeMaxAttempts bounds the TOTAL transcode attempts before we give
+	// up and ship the original. Transient memory-pressure failures (the ffmpeg
+	// subprocess OOM-killed) are worth retrying — by the next attempt other
+	// work has often freed memory — but NOT forever. Transcodes are serialized,
+	// so a re-encode that is OOM-killed while running alone means this host
+	// simply can't fit this video's encode in memory and it will be killed on
+	// every attempt; retrying that forever would pin the attachment's blob and
+	// its backfill download slot and stall preUploadCloudAttachments' wg.Wait()
+	// indefinitely — backfill would never complete, which under Docker looks
+	// exactly like a memory leak. A generous cap rides out genuine transient
+	// spikes, then degrades gracefully to the original file (~9 min at the
+	// cadence above).
+	transcodeMaxAttempts = 12
+	// transcodeMaxDeterministicFailures gives up much sooner for a
+	// DETERMINISTIC failure — ffmpeg ran to completion and exited non-zero
+	// (unsupported codec, corrupt blob, or a build missing the libx264/aac
+	// encoder). Waiting for memory can't fix those. A small allowance absorbs
+	// the rare transient that surfaces as an exit code instead of a kill.
+	transcodeMaxDeterministicFailures = 3
 )
 
 // transcodeSem serializes ffmpeg conversions process-wide. The dominant cause
@@ -10523,43 +10594,98 @@ const (
 // never starves the others.
 var transcodeSem = make(chan struct{}, 1)
 
+// transcodeFailureIsDeterministic reports whether an ffmpeg failure will never
+// be fixed by retrying. ffmpeg.ConvertBytes shells out to a subprocess, so:
+//   - terminated by a signal (ExitCode() == -1, the OOM-killer's SIGKILL) →
+//     transient: the box was briefly out of memory, retry will likely succeed.
+//   - exited with a non-zero status (ExitCode() >= 0) → deterministic: ffmpeg
+//     ran to completion and rejected the input (bad codec, corrupt data, or a
+//     build missing the encoder). Retrying changes nothing.
+//
+// Anything that isn't an *exec.ExitError (e.g. fork/exec itself failed because
+// the host couldn't spawn the subprocess under memory pressure) is treated as
+// transient so we keep trying.
+func transcodeFailureIsDeterministic(err error) bool {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode() >= 0
+	}
+	return false
+}
+
 // transcodeToMP4 remuxes (cheap) or, failing that, re-encodes data to MP4. It
 // is serialized against other transcodes (one ffmpeg at a time → bounded peak
-// memory) and retries with exponential backoff that NEVER gives up: on a
-// low-memory host the conversion may be OOM-killed repeatedly, so we keep
-// retrying — backing off to a steady cadence — until it completes. No man left
-// behind. The ffmpeg run is detached from the parent context's deadline so a
-// short inbound deadline can't abort it mid-encode; the only way out without a
-// successful conversion is true bridge shutdown (ctx cancelled), in which case
-// the caller ships the original.
+// memory) and retries with exponential backoff, then degrades to shipping the
+// original. Failures fall in two buckets:
+//
+//   - Transient (the ffmpeg subprocess was OOM-killed by a signal): worth
+//     retrying, since other work may free memory before the next attempt — but
+//     only up to transcodeMaxAttempts. Because transcodes are serialized, an
+//     encode OOM-killed while running alone means the host can't fit it in
+//     memory and will kill it every time; retrying forever would pin the blob
+//     and its backfill download slot and stall the backfill's wg.Wait()
+//     indefinitely (indistinguishable from a memory leak under Docker).
+//   - Deterministic (ffmpeg ran and exited non-zero — unsupported codec,
+//     corrupt data, or a build missing the encoder): capped much sooner, since
+//     waiting for memory can't fix it.
+//
+// The ffmpeg run is detached from the parent context's deadline so a short
+// inbound deadline can't abort it mid-encode; bridge shutdown (ctx cancelled)
+// still exits promptly. On any give-up path the caller ships the original.
 func transcodeToMP4(ctx context.Context, log *zerolog.Logger, data []byte, mimeType string) (converted []byte, method string, err error) {
 	base := context.WithoutCancel(ctx)
-	backoff := transcodeBackoffInitial
-	for attempt := 1; ; attempt++ {
-		// One ffmpeg at a time across the whole process — bounds peak memory.
+	// runOnce acquires the process-wide slot, runs ffmpeg, and releases the slot
+	// even if ffmpeg panics — a bare release could leak the only slot and
+	// deadlock all transcoding process-wide.
+	runOnce := func() ([]byte, string, error) {
 		select {
 		case transcodeSem <- struct{}{}:
 		case <-ctx.Done():
 			return nil, "", ctx.Err()
 		}
-		method = "remux"
-		converted, err = ffmpeg.ConvertBytes(base, data, ".mp4", nil,
+		defer func() { <-transcodeSem }()
+		out, e := ffmpeg.ConvertBytes(base, data, ".mp4", nil,
 			[]string{"-c", "copy", "-movflags", "+faststart"},
 			mimeType)
-		if err != nil {
+		if e != nil {
 			// Remux failed (often an incompatible codec) — try a full re-encode.
-			method = "re-encode"
-			converted, err = ffmpeg.ConvertBytes(base, data, ".mp4", nil,
+			out, e = ffmpeg.ConvertBytes(base, data, ".mp4", nil,
 				[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
 					"-c:a", "aac", "-movflags", "+faststart"},
 				mimeType)
+			return out, "re-encode", e
 		}
-		<-transcodeSem // release before backing off so other transcodes can run
+		return out, "remux", e
+	}
+	backoff := transcodeBackoffInitial
+	deterministicFailures := 0
+	for attempt := 1; attempt <= transcodeMaxAttempts; attempt++ {
+		converted, method, err = runOnce()
 		if err == nil {
 			return converted, method, nil
 		}
-		log.Warn().Err(err).Int("attempt", attempt).Dur("backoff", backoff).Int("bytes", len(data)).
-			Msg("Video transcode failed (likely transient memory pressure); will keep retrying until it completes")
+		// Shutdown (or a cancelled acquire) — give up, caller ships original.
+		if ctx.Err() != nil {
+			return nil, method, ctx.Err()
+		}
+		if transcodeFailureIsDeterministic(err) {
+			deterministicFailures++
+			if deterministicFailures >= transcodeMaxDeterministicFailures {
+				log.Warn().Err(err).Int("attempt", attempt).Int("bytes", len(data)).
+					Msg("Video transcode failing deterministically (unsupported codec, corrupt input, or ffmpeg missing the encoder); giving up and shipping original")
+				return nil, method, err
+			}
+		} else {
+			// Transient (memory pressure) — reset the deterministic streak so a
+			// kill never counts toward the deterministic give-up.
+			deterministicFailures = 0
+		}
+		if attempt == transcodeMaxAttempts {
+			break // don't sleep after the final attempt
+		}
+		log.Warn().Err(err).Int("attempt", attempt).Int("max_attempts", transcodeMaxAttempts).
+			Dur("backoff", backoff).Int("bytes", len(data)).Bool("deterministic", deterministicFailures > 0).
+			Msg("Video transcode failed; backing off before retry")
 		select {
 		case <-ctx.Done():
 			return nil, method, ctx.Err()
@@ -10569,6 +10695,9 @@ func transcodeToMP4(ctx context.Context, log *zerolog.Logger, data []byte, mimeT
 			backoff = transcodeRetryCadence
 		}
 	}
+	log.Warn().Err(err).Int("attempts", transcodeMaxAttempts).Int("bytes", len(data)).
+		Msg("Video transcode still failing after max attempts (host likely can't fit this encode in memory); giving up and shipping original")
+	return nil, method, err
 }
 
 func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, attMsg *attachmentMessage, videoTranscoding, heicConversion bool, heicQuality int) (*bridgev2.ConvertedMessage, error) {

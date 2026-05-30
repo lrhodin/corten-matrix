@@ -692,20 +692,15 @@ func (c *IMClient) processSharedAlbumAsset(ctx context.Context, logger zerolog.L
 		data, mimeType, fileName, durationMs = convertAudioForMatrix(data, mimeType, fileName)
 	}
 
-	// Video transcoding: non-MP4 → MP4
+	// Video transcoding: non-MP4 → MP4. Routed through transcodeToMP4 so shared
+	// album transcodes share the process-wide one-at-a-time semaphore with the
+	// backfill and live paths — at most one ffmpeg runs anywhere, which bounds
+	// peak memory on low-memory hosts.
 	if c.Main.Config.VideoTranscoding && ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
 		origMime := mimeType
-		method := "remux"
-		converted, convertErr := ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
-			[]string{"-c", "copy", "-movflags", "+faststart"}, mimeType)
+		converted, method, convertErr := transcodeToMP4(ctx, &logger, data, mimeType)
 		if convertErr != nil {
-			method = "re-encode"
-			converted, convertErr = ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
-				[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
-					"-c:a", "aac", "-movflags", "+faststart"}, mimeType)
-		}
-		if convertErr != nil {
-			logger.Warn().Err(convertErr).Str("original_mime", origMime).Msg("FFmpeg video conversion failed, uploading original")
+			logger.Warn().Err(convertErr).Str("original_mime", origMime).Msg("FFmpeg video conversion failed after retries, uploading original")
 		} else {
 			logger.Info().Str("original_mime", origMime).Str("method", method).Msg("Video transcoded to MP4")
 			data = converted
