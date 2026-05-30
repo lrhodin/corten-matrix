@@ -229,8 +229,11 @@ RUN groupadd --system --gid 1000 bridge \
 # host-bashrc aliases) — that gating is set by the entrypoint before exec.
 COPY --from=builder /src/mautrix-imessage-v2 /usr/local/bin/mautrix-imessage-v2
 COPY --from=builder /src/bbctl              /usr/local/bin/bbctl
-COPY --from=builder /src/scripts/install-linux.sh        /opt/imessage/scripts/install-linux.sh
-COPY --from=builder /src/scripts/install-beeper-linux.sh /opt/imessage/scripts/install-beeper-linux.sh
+# Install scripts are source, not build artifacts — copy them straight from the
+# build context (the builder no longer carries scripts/, so they can't come
+# --from=builder). This is also what keeps script edits out of the build cache.
+COPY scripts/install-linux.sh        /opt/imessage/scripts/install-linux.sh
+COPY scripts/install-beeper-linux.sh /opt/imessage/scripts/install-beeper-linux.sh
 
 # Entrypoint + the imessage-setup convenience wrapper + as-bridge.
 #
