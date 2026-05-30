@@ -312,11 +312,34 @@ if [ -t 0 ]; then
             echo "✓ CloudKit backfill disabled — real-time messages only, no PIN needed"
         fi
     else
-        # Re-run: show current setting without prompting
+        # Re-run: let the user toggle the existing setting. Without this, a
+        # config stuck at cloudkit_backfill: false could never be flipped on
+        # interactively once a DB existed — and in Docker the PID-1 bridge
+        # creates the DB between setup runs, so re-runs always land here.
+        echo ""
+        echo "CloudKit Backfill:"
+        echo "  When enabled, the bridge will sync your iMessage history from iCloud."
+        echo "  This requires entering your device PIN during login to join the iCloud Keychain."
+        echo "  When disabled, only new real-time messages are bridged (no PIN needed)."
+        echo ""
         if [ "$CURRENT_BACKFILL" = "true" ]; then
-            echo "✓ Backfill source: CloudKit (iCloud sync)"
+            read -p "Enable CloudKit message history backfill? [Y/n]: " ENABLE_BACKFILL
+            case "$ENABLE_BACKFILL" in
+                [nN]*) ENABLE_BACKFILL=false ;;
+                *)     ENABLE_BACKFILL=true ;;
+            esac
         else
-            echo "✓ Backfill: disabled (real-time messages only)"
+            read -p "Enable CloudKit message history backfill? [y/N]: " ENABLE_BACKFILL
+            case "$ENABLE_BACKFILL" in
+                [yY]*) ENABLE_BACKFILL=true ;;
+                *)     ENABLE_BACKFILL=false ;;
+            esac
+        fi
+        sed -i "s/cloudkit_backfill: .*/cloudkit_backfill: $ENABLE_BACKFILL/" "$CONFIG"
+        if [ "$ENABLE_BACKFILL" = "true" ]; then
+            echo "✓ CloudKit backfill enabled — you'll be asked for your device PIN during login"
+        else
+            echo "✓ CloudKit backfill disabled — real-time messages only, no PIN needed"
         fi
     fi
 fi
