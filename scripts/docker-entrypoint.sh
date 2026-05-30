@@ -145,6 +145,9 @@ SETUP_LOCK="$DATA_DIR/.setup-in-progress"
 # login) marks that setup has actually completed a login. /home/bridge/.local/
 # share/mautrix-imessage is symlinked to /data, so the bridge writes it here.
 SESSION_FILE="$DATA_DIR/session.json"
+# A bridge that exits in under this many seconds is treated as a startup
+# failure (e.g. a rejected as_token) rather than a real run — see cmd_run.
+BRIDGE_MIN_UPTIME="${BRIDGE_MIN_UPTIME:-30}"
 
 # A setup lock is honored only while the setup process that created it is still
 # alive. cmd_setup records its PID in the lock; `imessage setup` runs as a
@@ -191,38 +194,76 @@ require_tty() {
 }
 
 cmd_run() {
-    # Wait for setup to FINISH before starting the bridge. Keeps PID 1 alive so
-    # `docker exec -it Rustpush-Matrix imessage-setup` works against a "running"
-    # container.
-    #
-    # Three gates, all required:
-    #   * config.yaml exists          — the bridge has something to run against.
-    #   * no .setup-in-progress lock   — an active setup run isn't mid-write
-    #                                    (install-beeper-linux.sh writes config
-    #                                    partway through, then does the login).
-    #   * session.json exists          — a login has actually completed.
-    #
-    # The session.json gate is load-bearing: /data persists across container
-    # rebuilds, so config.yaml is usually already present at boot. Without this
-    # gate, PID 1 would exec a login-less bridge the instant the container
-    # starts — before `imessage setup` runs — and that idle bridge never picks
-    # up the session.json that setup writes later, so the bridge "doesn't start"
-    # until a manual `docker restart`. Waiting for session.json means setup
-    # completes, drops the lock, writes the session, and cmd_run starts the
-    # bridge on its own.
-    local warned=0
-    while [ ! -f "$CONFIG" ] || setup_in_progress || [ ! -f "$SESSION_FILE" ]; do
-        if [ "$warned" -eq 0 ]; then
-            echo "waiting for setup — run 'imessage setup' from the host (no config.yaml or no completed iMessage login yet)."
-            warned=1
+    local warned start elapsed rc
+    while true; do
+        # Wait until setup has produced a runnable state. Three gates:
+        #   * config.yaml exists        — something to run against.
+        #   * no LIVE setup in progress  — install-*.sh writes config partway
+        #                                  through, then does the login; don't
+        #                                  race it (a stale lock is auto-cleared).
+        #   * session.json exists        — a login has actually completed.
+        # The session.json gate is load-bearing: /data persists across rebuilds,
+        # so config.yaml is usually present at boot; without it PID 1 would start
+        # a login-less bridge before `imessage setup` ever runs.
+        warned=0
+        while [ ! -f "$CONFIG" ] || setup_in_progress || [ ! -f "$SESSION_FILE" ]; do
+            if [ "$warned" -eq 0 ]; then
+                echo "waiting for setup — run 'imessage setup' from the host (no config.yaml or no completed iMessage login yet)."
+                warned=1
+            fi
+            sleep 30
+        done
+
+        # SUPERVISE the bridge as a child instead of exec-ing it as PID 1.
+        #
+        # A bridge that dies almost immediately is a startup failure — most
+        # commonly a rejected as_token after `bbctl delete` ("M_UNKNOWN_TOKEN",
+        # log.Fatal). If the bridge were PID 1, that fatal would exit the
+        # container, Docker's restart policy would relaunch it, and it would
+        # fatal again — parking the container in "restarting", which BLOCKS
+        # `docker exec`. But `docker exec` is exactly how `imessage setup`
+        # attaches to regenerate config.yaml — so a crash-looping container
+        # fights the only tool that can fix it. (On bare metal this never
+        # happens: setup stops the systemd unit first, so no bridge races it.)
+        #
+        # Supervising keeps PID 1 as this shell: the container is always
+        # "running" and exec-able. On a fast bridge exit we hold here, exec-able,
+        # for setup to fix config; once it rewrites config.yaml the next attempt
+        # succeeds on its own. cd into /data so anisette's relative
+        # state/anisette/ resolves the same as WORKDIR.
+        cd "$DATA_DIR"
+        echo "[entrypoint] starting bridge"
+        STOPPING=0
+        "$BIN" -c "$CONFIG" &
+        BRIDGE_CHILD=$!
+        # `docker stop` sends SIGTERM to PID 1 (this shell), not the child —
+        # forward it so the bridge shuts down cleanly. wait returns early when a
+        # trapped signal fires, so reap until the child is actually gone.
+        trap 'STOPPING=1; kill -TERM "$BRIDGE_CHILD" 2>/dev/null' TERM INT
+        start=$(date +%s)
+        rc=0
+        while kill -0 "$BRIDGE_CHILD" 2>/dev/null; do
+            if wait "$BRIDGE_CHILD"; then rc=0; else rc=$?; fi
+        done
+        trap - TERM INT
+        elapsed=$(( $(date +%s) - start ))
+
+        if [ "$STOPPING" = "1" ]; then
+            # Being stopped — propagate and let the container go down.
+            exit "$rc"
         fi
+        if [ "$elapsed" -ge "$BRIDGE_MIN_UPTIME" ]; then
+            # Ran long enough to be a real session (a healthy bridge only exits
+            # on crash or signal). Exit so Docker's restart policy restarts it.
+            echo "[entrypoint] bridge exited after ${elapsed}s (rc=$rc); container will restart."
+            exit "$rc"
+        fi
+        # Fast exit = startup failure. Do NOT crash-loop the container out of
+        # `docker exec` reach. Stay up and exec-able so `imessage setup` can fix
+        # config.yaml, then retry.
+        echo "[entrypoint] bridge exited after only ${elapsed}s (rc=$rc) — likely a bad/stale config (e.g. a rejected as_token after 'bbctl delete'). NOT crash-looping: the container stays up and exec-able so 'imessage setup' can regenerate config.yaml. Retrying in 30s."
         sleep 30
     done
-    # cd into /data so anisette's relative state/anisette/ lands on the
-    # volume. WORKDIR /data in the Dockerfile already does this; the
-    # cd is defensive.
-    cd "$DATA_DIR"
-    exec "$BIN" -c "$CONFIG"
 }
 
 cmd_setup() {

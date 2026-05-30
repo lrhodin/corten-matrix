@@ -34,10 +34,16 @@ LOG=/data/logs/bridge.log
 CONFIG=/data/config.yaml
 SETUP_LOCK=/data/.setup-in-progress
 
-# Healthy: the bridge binary is PID 1.
-if grep -qa mautrix-imessage-v2 /proc/1/cmdline 2>/dev/null; then
-    exit 0
-fi
+# Healthy: the bridge binary is running. cmd_run supervises it as a CHILD (so a
+# fast-failing bridge can't crash-loop the container out of `docker exec` reach),
+# so it is usually not PID 1 — match on the executable across all PIDs via
+# /proc/<pid>/exe. Using exe (not a cmdline grep) means we match the real binary
+# and never false-positive on a process that merely has the name as an argument.
+for d in /proc/[0-9]*; do
+    case "$(readlink "$d/exe" 2>/dev/null)" in
+        */mautrix-imessage-v2) exit 0 ;;
+    esac
+done
 
 # A genuine setup is running ONLY if the lock is held AND its owning process is
 # still alive (cmd_setup records its PID; setup runs as a `docker exec` child in
