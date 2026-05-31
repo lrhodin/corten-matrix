@@ -99,6 +99,20 @@ type IMConfig struct {
 	// other Apple devices for Focus visibility.
 	StatusKitNotifications bool `yaml:"statuskit_notifications"`
 
+	// ReadReceipts controls whether the bridge sends read receipts to iMessage
+	// contacts when you mark a message as read in Matrix. When false, iMessage
+	// contacts will not see the "Read" indicator for your messages. Incoming
+	// read receipts from iMessage contacts are always forwarded to Matrix.
+	// Default is true.
+	ReadReceipts bool `yaml:"read_receipts"`
+
+	// TypingNotifications controls whether the bridge sends typing indicators
+	// to iMessage contacts while you compose a reply in Matrix. When false,
+	// iMessage contacts will not see the typing bubble. Incoming typing
+	// indicators from iMessage contacts are always forwarded to Matrix.
+	// Default is true.
+	TypingNotifications bool `yaml:"typing_notifications"`
+
 	// CardDAV is an external CardDAV server for contact name resolution.
 	// When configured, this is used instead of iCloud CardDAV contacts.
 	CardDAV CardDAVConfig `yaml:"carddav"`
@@ -220,6 +234,8 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "disable_facetime")
 	helper.Copy(up.Bool, "statuskit_share_on_startup")
 	helper.Copy(up.Bool, "statuskit_notifications")
+	helper.Copy(up.Bool, "read_receipts")
+	helper.Copy(up.Bool, "typing_notifications")
 	helper.Copy(up.Str, "carddav", "email")
 	helper.Copy(up.Str, "carddav", "url")
 	helper.Copy(up.Str, "carddav", "username")

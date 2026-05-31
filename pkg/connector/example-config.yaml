@@ -84,6 +84,16 @@ statuskit_notifications: true
 # re-deliver anything to Matrix.
 debug_disable_privacy: false
 
+# Send read receipts to iMessage contacts when you read their messages in
+# Matrix. Set to false to stop iMessage contacts seeing when you have read
+# their messages. Incoming read receipts from iMessage contacts are unaffected.
+read_receipts: true
+
+# Send typing indicators to iMessage contacts while you compose a reply in
+# Matrix. Set to false to hide your typing from iMessage contacts. Incoming
+# typing indicators from iMessage contacts are unaffected.
+typing_notifications: true
+
 # External CardDAV server for contact name resolution.
 # Works with Google (app passwords), Nextcloud, Radicale, Fastmail, etc.
 # When configured, this is used instead of iCloud contacts.
