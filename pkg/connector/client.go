@@ -6530,6 +6530,24 @@ func (c *IMClient) powerLevelsForMemberSync(ctx context.Context, portal *bridgev
 	return c.hardenedPowerLevels(ctx, portal)
 }
 
+// excludeFromTimelineMemberExtra marks a membership state event as non-timeline.
+// Shared and treated read-only — bridgev2 clones it per event before mutating.
+var excludeFromTimelineMemberExtra = map[string]any{"com.beeper.exclude_from_timeline": true}
+
+// stampMembershipSilent flags every member in a resync/backfill member map so the
+// framework's syncParticipants emits its invite AND its auto-accept join with
+// com.beeper.exclude_from_timeline — keeping the create-time/backfill roster out
+// of the timeline. Paired with disabling AutoJoinInvites (see GetChatInfo), this
+// is what actually suppresses "<name> joined the chat" on a fresh-DB backfill.
+// Applied ONLY to GetChatInfo / chatDBInfoToBridgev2 member maps; NEVER to
+// handleParticipantChange, so a real add/remove still shows in the timeline.
+func stampMembershipSilent(members map[networkid.UserID]bridgev2.ChatMember) {
+	for id, m := range members {
+		m.MemberEventExtra = excludeFromTimelineMemberExtra
+		members[id] = m
+	}
+}
+
 // resetEscalatedUsers is the Custom power-level hook from hardenedPowerLevels.
 // It demotes any non-bot user whose level was raised above the room baseline
 // (users_default) back down to that baseline, and — when a room is known and the
@@ -6669,6 +6687,23 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 	// Groups use "gid:<UUID>" portal IDs, or legacy comma-separated participant IDs
 	isGroup := strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",")
 
+	// Force room membership through the framework's syncParticipants path instead
+	// of the Beeper "auto-join invites" genesis path. With auto_join_invites=true,
+	// initial members are added via the CreateRoom request (req.Invite /
+	// com.beeper.initial_members), which is a bare []user_id with no per-member
+	// content — so the connector cannot attach com.beeper.exclude_from_timeline,
+	// and on a fresh-DB backfill every member (your own double puppet + each ghost)
+	// surfaces as a visible "<name> joined the chat". Disabling the capability makes
+	// CreateMatrixRoom add members via syncParticipants after creation, which DOES
+	// honor ChatMemberList.ExcludeChangesFromTimeline and ChatMember.MemberEventExtra
+	// (set below), so the create-time roster is added silently. Real joins/leaves
+	// still come through handleParticipantChange, which intentionally does not set
+	// those flags and therefore stays visible. Set here (runs before
+	// CreateMatrixRoom reads the capability) and idempotent.
+	if caps := c.Main.Bridge.Matrix.GetCapabilities(); caps != nil {
+		caps.AutoJoinInvites = false
+	}
+
 	canBackfill := false
 	if c.Main.Config.UseChatDBBackfill() {
 		canBackfill = c.chatDB != nil
@@ -6736,12 +6771,16 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 				Membership: event.MembershipJoin,
 			}
 		}
+		// Suppress "<name> joined the chat" for the create-time/backfill roster.
+		// Real adds/removes still show via handleParticipantChange (not stamped).
+		stampMembershipSilent(memberMap)
 		chatInfo.Members = &bridgev2.ChatMemberList{
 			IsFull:      true,
 			MemberMap:   memberMap,
 			// Permissive at creation (silent initial-member add), full lockdown
 			// on resync. See powerLevelsForMemberSync.
-			PowerLevels: c.powerLevelsForMemberSync(ctx, portal, true),
+			PowerLevels:                c.powerLevelsForMemberSync(ctx, portal, true),
+			ExcludeChangesFromTimeline: true,
 		}
 
 		// Only set the group name for NEW portals (no Matrix room yet).
@@ -6852,13 +6891,15 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			}
 		}
 
+		stampMembershipSilent(memberMap)
 		members := &bridgev2.ChatMemberList{
 			IsFull:      true,
 			OtherUserID: otherUser,
 			MemberMap:   memberMap,
 			// Permissive at creation (silent initial-member add), full lockdown
 			// on resync. See powerLevelsForMemberSync.
-			PowerLevels: c.powerLevelsForMemberSync(ctx, portal, false),
+			PowerLevels:                c.powerLevelsForMemberSync(ctx, portal, false),
+			ExcludeChangesFromTimeline: true,
 		}
 
 		// For self-chats, set an explicit name and avatar from contacts since
@@ -11686,9 +11727,10 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 	if parsed.IsGroup {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDefault)
 		members := &bridgev2.ChatMemberList{
-			IsFull:      true,
-			MemberMap:   make(map[networkid.UserID]bridgev2.ChatMember),
-			PowerLevels: c.hardenedPowerLevels(context.Background(), nil),
+			IsFull:                     true,
+			MemberMap:                  make(map[networkid.UserID]bridgev2.ChatMember),
+			PowerLevels:                c.hardenedPowerLevels(context.Background(), nil),
+			ExcludeChangesFromTimeline: true,
 		}
 		members.MemberMap[makeUserID(c.handle)] = bridgev2.ChatMember{
 			EventSender: bridgev2.EventSender{
@@ -11705,6 +11747,7 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 				Membership:  event.MembershipJoin,
 			}
 		}
+		stampMembershipSilent(members.MemberMap)
 		chatInfo.Members = members
 	} else {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDM)
@@ -11731,11 +11774,13 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 			}
 		}
 
+		stampMembershipSilent(memberMap)
 		members := &bridgev2.ChatMemberList{
-			IsFull:      true,
-			OtherUserID: otherUser,
-			MemberMap:   memberMap,
-			PowerLevels: c.hardenedPowerLevels(context.Background(), nil),
+			IsFull:                     true,
+			OtherUserID:                otherUser,
+			MemberMap:                  memberMap,
+			PowerLevels:                c.hardenedPowerLevels(context.Background(), nil),
+			ExcludeChangesFromTimeline: true,
 		}
 
 		// For self-chats, set an explicit name and avatar from contacts since
