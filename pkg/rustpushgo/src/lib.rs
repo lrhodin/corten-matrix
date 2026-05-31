@@ -4080,6 +4080,22 @@ async fn ft_handle_with_join_recovery(
     Ok(emitted)
 }
 
+// Bridge user's FaceTime display name (resolved Go-side: facetime_display_name
+// config override → Apple SPD name → handle), set via set_self_display_name.
+// Stamped onto the bridge webview's LetMeIn nickname so the peer sees the
+// user's name instead of the raw temp:<uuid> pseud — the URL &n= pre-fill only
+// fills Apple's join-page name box client-side and never reaches the wire.
+static FACETIME_SELF_DISPLAY_NAME: std::sync::RwLock<Option<String>> =
+    std::sync::RwLock::new(None);
+
+fn facetime_self_display_name() -> Option<String> {
+    FACETIME_SELF_DISPLAY_NAME
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .filter(|s| !s.trim().is_empty())
+}
+
 async fn auto_approve_bridge_letmein(
     facetime: &rustpush::facetime::FTClient,
     request: &rustpush::facetime::LetMeInRequest,
@@ -4324,6 +4340,16 @@ async fn auto_approve_bridge_letmein(
         let mut retry_request = request.clone();
         if attempt > 0 {
             retry_request.delegation_uuid = None;
+        }
+        // Stamp the bridge user's display name onto the webview's nickname so
+        // the peer sees a name (FTMember.nickname → ConversationMember on the
+        // wire, facetime.rs:127-131) instead of the raw temp:<uuid> pseud. The
+        // webview's own LetMeIn carries no usable nickname (Apple's &n= join-
+        // page pre-fill stays client-side), so we set it bridge-side.
+        if retry_request.nickname.as_deref().unwrap_or("").trim().is_empty() {
+            if let Some(name) = facetime_self_display_name() {
+                retry_request.nickname = Some(name);
+            }
         }
         match facetime.respond_letmein(retry_request, Some(&approved_group)).await {
             Ok(()) => {
@@ -5987,6 +6013,16 @@ impl WrappedFaceTimeClient {
     pub async fn export_state_json(&self) -> Result<String, WrappedError> {
         let state = self.inner.state.read().await;
         serialize_state_json(&*state)
+    }
+
+    /// Set the bridge user's FaceTime display name (resolved Go-side:
+    /// facetime_display_name override → Apple SPD name → handle). Stamped onto
+    /// the bridge webview's LetMeIn nickname in auto_approve_bridge_letmein so
+    /// peers see the user's name instead of the raw temp:<uuid> pseud.
+    pub fn set_self_display_name(&self, name: String) {
+        if let Ok(mut g) = FACETIME_SELF_DISPLAY_NAME.write() {
+            *g = if name.trim().is_empty() { None } else { Some(name) };
+        }
     }
 
     pub async fn use_link_for(&self, old_usage: String, usage: String) -> Result<(), WrappedError> {

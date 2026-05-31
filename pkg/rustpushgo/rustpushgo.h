@@ -764,6 +764,12 @@ void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_ring(
 	RustCallStatus* out_status
 );
 
+void uniffi_rustpushgo_fn_method_wrappedfacetimeclient_set_self_display_name(
+	void* ptr,
+	RustBuffer name,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_use_link_for(
 	void* ptr,
 	RustBuffer old_usage,
@@ -1919,6 +1925,10 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_respond_delegat
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_ring(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_set_self_display_name(
 	RustCallStatus* out_status
 );
 

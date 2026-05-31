@@ -277,6 +277,12 @@ func armBridgeFaceTimeCall(
 	ringTTLSecs uint64,
 	displayName string,
 ) (webLink string, sessionID string, err error) {
+	// Make the bridge user's display name available to the rust webview-letmein
+	// path, which stamps it onto the participant nickname so the peer sees a
+	// name instead of the raw temp:<uuid> pseud. Persists across calls, so it
+	// also covers inbound answers after the first outbound call.
+	ft.SetSelfDisplayName(displayName)
+
 	sessionID, err = newFaceTimeSessionID()
 	if err != nil {
 		return "", "", fmt.Errorf("generate session ID: %w", err)
@@ -339,18 +345,15 @@ func armBridgeFaceTimeCall(
 
 // appendFaceTimeLinkName appends &n=<base64-name> to a FaceTime web join
 // link so Apple's join page pre-fills the display-name field, sparing the
-// user from typing their name before joining.
+// user from typing their name before joining. This is confirmed working —
+// the name renders in the join-page box. It does NOT, however, propagate to
+// the peer's view of the participant (that's stamped on the wire separately,
+// in auto_approve_bridge_letmein); this is purely the join-page convenience.
 //
 // Apple's web FT page base64-decodes the &n= value (matching the &k= and
-// &p= pattern — both are URL-safe base64 of binary data in
-// facetime.rs:102). Sending raw text caused the page to atob() it and
-// render gibberish (reverted in 8d9c8f2); base64-encoding here matches
+// &p= URL-safe-base64 pattern). Sending raw text caused the page to atob() it
+// and render gibberish (reverted in 8d9c8f2); base64-encoding here matches
 // what the page expects.
-//
-// This is the bridge's analogue of OpenBubbles' Android-native webview
-// name injection (rustpush_service.dart:3222 passes "name" separately
-// via MethodChannel). We can't inject JS into Apple's page from a
-// Matrix link, so we ride the URL-fragment path instead.
 func appendFaceTimeLinkName(link, name string) string {
 	if name == "" {
 		return link

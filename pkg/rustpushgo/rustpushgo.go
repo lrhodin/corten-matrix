@@ -1321,6 +1321,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_set_self_display_name(uniffiStatus)
+		})
+		if checksum != 6851 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_set_self_display_name: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_use_link_for(uniffiStatus)
 		})
 		if checksum != 19893 {
@@ -4672,6 +4681,16 @@ func (_self *WrappedFaceTimeClient) Ring(sessionId string, targets []string, let
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
 		})
+}
+
+func (_self *WrappedFaceTimeClient) SetSelfDisplayName(name string) {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedFaceTimeClient")
+	defer _self.ffiObject.decrementPointer()
+	rustCall(func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_rustpushgo_fn_method_wrappedfacetimeclient_set_self_display_name(
+			_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(name)), _uniffiStatus)
+		return false
+	})
 }
 
 func (_self *WrappedFaceTimeClient) UseLinkFor(oldUsage string, usage string) error {
