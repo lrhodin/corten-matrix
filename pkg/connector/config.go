@@ -9,16 +9,19 @@
 package connector
 
 import (
-	_ "embed"
 	"strings"
 	"text/template"
 
 	up "go.mau.fi/util/configupgrade"
 	"gopkg.in/yaml.v3"
+
+	"github.com/lrhodin/imessage/pkg/imconfig"
 )
 
-//go:embed example-config.yaml
-var ExampleConfig string
+// ExampleConfig is the embedded network config template. It lives in the
+// dependency-free pkg/imconfig package so cmd/bbctl can share the exact same
+// bytes without pulling in the Rust FFI; see that package for why.
+var ExampleConfig = imconfig.NetworkExampleConfig
 
 type IMConfig struct {
 	DisplaynameTemplate string `yaml:"displayname_template"`

@@ -13,18 +13,9 @@ import (
 	"github.com/beeper/bridge-manager/api/beeperapi"
 	"github.com/beeper/bridge-manager/api/hungryapi"
 	"github.com/beeper/bridge-manager/bridgeconfig"
-)
 
-// imessageNetworkConfig is prepended to the bridgev2 base config.
-// It sets iMessage-specific defaults without requiring a separate template file.
-const imessageNetworkConfig = `network:
-    displayname_template: '{{if .FirstName}}{{.FirstName}}{{if .LastName}} {{.LastName}}{{end}}{{else if .Nickname}}{{.Nickname}}{{else if .Phone}}{{.Phone}}{{else if .Email}}{{.Email}}{{else}}{{.ID}}{{end}}'
-    cloudkit_backfill: false
-    backfill_source: cloudkit
-    video_transcoding: false
-    heic_conversion: false
-    heic_jpeg_quality: 95
-`
+	"github.com/lrhodin/imessage/pkg/imconfig"
+)
 
 var configCommand = &cli.Command{
 	Name:      "config",
@@ -108,8 +99,12 @@ func cmdConfig(ctx *cli.Context) error {
 		return fmt.Errorf("failed to generate config: %w", err)
 	}
 
-	// Prepend iMessage-specific network block
-	output := imessageNetworkConfig + baseConfig
+	// Prepend the iMessage network block. This is the same embedded template
+	// the bridge itself uses (pkg/imconfig), so a Beeper-generated config
+	// carries the complete, current set of network keys — identical to a
+	// self-hosted config. Keeping every key present is what lets the install
+	// scripts skip their (fragile) key-insertion sed/python fallbacks.
+	output := imconfig.WrapNetwork() + baseConfig
 
 	// Notify Beeper that this bridge is registered and starting
 	err = beeperapi.PostBridgeState(baseDomain, envCfg.Username, bridge, reg.AppToken, beeperapi.ReqPostBridgeState{

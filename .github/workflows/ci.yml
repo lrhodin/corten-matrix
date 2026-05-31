@@ -50,7 +50,7 @@ jobs:
           check-latest: true
 
       - name: Run tests
-        run: go test -count=1 ./imessage/...
+        run: go test -count=1 ./imessage/... ./pkg/imconfig/...
 
   # NOTE: pkg/connector/ tests require the Rust static library (librustpushgo.a)
   # and are run as part of the build jobs below (after `make build`).
