@@ -3462,7 +3462,6 @@ async fn suppress_own_device_ring(ft: &rustpush::facetime::FTClient, guid: &str)
         // Only the bridge's own leg was registered — nothing to suppress.
         return;
     }
-    let target_count = targets.len();
 
     let ids_send = IDSSendMessage {
         sender: handle.clone(),
@@ -3477,15 +3476,11 @@ async fn suppress_own_device_ring(ft: &rustpush::facetime::FTClient, guid: &str)
         extras: Default::default(),
     };
 
-    match ft.identity.send_message(topic, ids_send, targets).await {
-        Ok(_) => info!(
-            "suppress_own_device_ring: sent RespondedElsewhere to own handle {} for session {} ({} sibling target(s), bridge's own leg excluded)",
-            handle, guid, target_count
-        ),
-        Err(e) => warn!(
+    if let Err(e) = ft.identity.send_message(topic, ids_send, targets).await {
+        warn!(
             "suppress_own_device_ring: send_message failed for session {}: {:?}",
             guid, e
-        ),
+        );
     }
 }
 
