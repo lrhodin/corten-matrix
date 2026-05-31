@@ -3337,17 +3337,52 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
                 },
             )
             .await;
-        let diag_targets = ft
+        // Also resolve the BRIDGE's OWN handle on facetime.multi — stale /
+        // accumulated FACETIME registrations smeared across the own handle are
+        // a prime suspect for callees silently dropping the Invitation (can't
+        // validate the sender identity). Dump per-endpoint push tokens for
+        // both callee and bridge so we can spot stale/duplicate endpoints.
+        let _ = ft
             .identity
-            .cache
-            .lock()
-            .await
-            .get_participants_targets(diag_topic, &diag_my_handle, &targets);
+            .cache_keys(
+                diag_topic,
+                std::slice::from_ref(&diag_my_handle),
+                &diag_my_handle,
+                true,
+                &rustpush::ids::user::QueryOptions {
+                    required_for_message: true,
+                    result_expected: true,
+                },
+            )
+            .await;
+        let (callee_tokens, bridge_tokens) = {
+            let cache = ft.identity.cache.lock().await;
+            let callee = cache.get_participants_targets(diag_topic, &diag_my_handle, &targets);
+            let bridge = cache.get_participants_targets(
+                diag_topic,
+                &diag_my_handle,
+                std::slice::from_ref(&diag_my_handle),
+            );
+            let tok = |ts: &[rustpush::ids::identity_manager::DeliveryHandle]| {
+                ts.iter()
+                    .map(|t| {
+                        let b = base64_encode(&t.delivery_data.push_token);
+                        format!("{}:{}", t.participant, &b[..b.len().min(10)])
+                    })
+                    .collect::<Vec<_>>()
+            };
+            (tok(&callee), tok(&bridge))
+        };
         info!(
-            "FACETIME_RING_DIAG: session={} callee_targets={:?} resolved_ft_endpoints={} cache_keys_ok={} cache_keys_err={:?}",
+            "FACETIME_RING_DIAG: session={} caller_my_handles={:?} session_link={:?} callee_targets={:?} callee_endpoints={} callee_tokens={:?} bridge_own_endpoints={} bridge_tokens={:?} cache_keys_ok={} cache_keys_err={:?}",
             guid,
+            session.my_handles,
+            session.link,
             targets,
-            diag_targets.len(),
+            callee_tokens.len(),
+            callee_tokens,
+            bridge_tokens.len(),
+            bridge_tokens,
             diag_ck.is_ok(),
             diag_ck.as_ref().err()
         );
@@ -6741,7 +6776,6 @@ pub async fn new_client(
         let status_cb_for_recv = status_callback_for_recv.clone();
         let ft_for_recv = prewarmed_facetime.inner.clone();
         let client_weak_for_loop = client_weak_for_loop.clone();
-        let identity_for_reregister = client.identity.clone();
         async move {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(rustpush::APSMessage, u64)>();
             let pending = Arc::new(AtomicU64::new(0));
@@ -6756,7 +6790,6 @@ pub async fn new_client(
             let drain_handle = tokio::spawn({
                 let conn = conn.clone();
                 let reconnected_at = reconnected_at.clone();
-                let identity_for_reregister = identity_for_reregister.clone();
                 async move {
                     let mut recv = conn.messages_cont.subscribe();
                     let mut state = conn.resource_state.subscribe();
@@ -6792,28 +6825,18 @@ pub async fn new_client(
                                     reconnected_at.store(now, Ordering::Relaxed);
                                     info!("APNs reconnecting (Generating), marking messages as stored for {}ms", RECONNECT_WINDOW_MS);
                                 }
-                                // APS courier reconnect: refresh IDS registration so the
-                                // madrid push-token binding tracks the (possibly rotated)
-                                // APS token. Upstream's do_connect adopts a new token
-                                // from Apple's ConnectResponse without notifying IDS,
-                                // leaving madrid silently routed to the old token even
-                                // though multiplex1 keeps working on the new connection.
-                                //
-                                // refresh_now() = ResourceManager::refresh — same call
-                                // OpenBubbles' "Reregister" button makes (api.rs
-                                // do_reregister). It has a 15s internal no-op gate so
-                                // network flaps don't spam IDS. Permanent failures
-                                // (6005 et al.) close the ResourceManager — same risk
-                                // as today's schedule_rereg loop, not new exposure.
-                                if matches!(current, ResourceState::Generated) {
-                                    let identity = identity_for_reregister.clone();
-                                    tokio::spawn(async move {
-                                        match identity.refresh_now().await {
-                                            Ok(()) => info!("Refreshed IDS registration after APS reconnect"),
-                                            Err(e) => warn!("IDS refresh_now after APS reconnect failed: {:?}", e),
-                                        }
-                                    });
-                                }
+                                // NOTE: previously re-registered the full IDS bundle
+                                // (refresh_now()) on every APS reconnect to rebind the
+                                // madrid push token. REMOVED — re-registering the whole
+                                // 4-service bundle (incl. FACETIME/VIDEO) on every network
+                                // flap accumulated dozens of stale FaceTime registrations
+                                // under the bridge's own handle (38 observed). Callees
+                                // could no longer resolve a single clean identity for the
+                                // bridge, so calls presented/answered as an unresolvable
+                                // UUID and failed in both directions (no ring outbound,
+                                // hangup inbound). It also never fixed the "bridge not
+                                // connecting" report it was added for — that was a flaky
+                                // network, not stale IDS routing.
                             }
                             // Message drain: forward APNs messages to process task
                             result = recv.recv() => {
