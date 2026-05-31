@@ -9973,6 +9973,44 @@ impl Client {
         Ok(registered_count)
     }
 
+    /// OpenBubbles' "clear identity cache" operation: drop the bridge's local
+    /// IDS key cache (id_cache.plist), then re-register the identity bundle so
+    /// the cache rebuilds against Apple's current state.
+    ///
+    /// Recovery path for a smeared/stale registration set (e.g. the dozens of
+    /// stale FaceTime registrations the reverted May-19 reconnect re-reg churn
+    /// left under the own handle, which break calls). invalidate_id_cache()
+    /// clears the cached lookups; the immediate re-register re-establishes the
+    /// identity so the bridge isn't left in a cache-wiped, unregistered state.
+    /// Returns the number of services in the rebuilt registration.
+    pub async fn clear_identity_cache(&self) -> Result<u32, WrappedError> {
+        // 1. Drop the local IDS key cache.
+        self.client.identity.invalidate_id_cache().await;
+
+        // 2. Re-register (update_users → refresh_now → register) so the
+        //    identity is re-established and the cache rebuilds.
+        let current_users: Vec<rustpush::IDSUser> = self
+            .client
+            .identity
+            .users
+            .read()
+            .await
+            .clone();
+        let registered_count = current_users
+            .first()
+            .map(|u| u.registration.len() as u32)
+            .unwrap_or(0);
+        self.client
+            .identity
+            .update_users(current_users)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("clear_identity_cache: re-register failed: {:?}", e),
+            })?;
+        info!("clear_identity_cache: invalidated IDS key cache and re-registered identity bundle ({} services)", registered_count);
+        Ok(registered_count)
+    }
+
     pub async fn send_sms_activation(
         &self,
         conversation: WrappedConversation,

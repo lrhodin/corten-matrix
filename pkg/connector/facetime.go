@@ -123,6 +123,21 @@ var cmdFaceTimeRotateIdentity = &commands.FullHandler{
 	RequiresLogin: true,
 }
 
+// cmdFaceTimeClearIdentityCache clears the bridge's local IDS key cache and
+// re-registers — OpenBubbles' "clear identity cache" operation. Recovers from
+// a smeared/stale registration set (e.g. dozens of stale FaceTime
+// registrations accumulated under the handle) that makes outbound calls ring a
+// UUID / not connect and inbound calls hang up.
+var cmdFaceTimeClearIdentityCache = &commands.FullHandler{
+	Name: "facetime-clear-identity-cache",
+	Func: fnFaceTimeClearIdentityCache,
+	Help: commands.HelpMeta{
+		Section:     HelpSectionFaceTime,
+		Description: "Clear the bridge's local IDS identity/key cache, then re-register. Use to recover from a stale/smeared registration set (calls ringing a UUID or not connecting).",
+	},
+	RequiresLogin: true,
+}
+
 var cmdFaceTimeState = &commands.FullHandler{
 	Name: "facetime-state",
 	Func: fnFaceTimeState,
@@ -890,6 +905,24 @@ func fnFaceTimeRotateIdentity(ce *commands.Event) {
 	}
 	ce.Reply(
 		"Re-registered bridge IDS identity (services in registration: %d). Peer iPhones should re-resolve **%s** on their next IDS query — try the call again.",
+		count, stripIdentifierPrefix(client.handle),
+	)
+}
+
+// fnFaceTimeClearIdentityCache drops the local IDS key cache and re-registers
+// (OpenBubbles' "clear identity cache"). Recovers a smeared registration set.
+func fnFaceTimeClearIdentityCache(ce *commands.Event) {
+	client, ok := faceTimeClientOnly(ce)
+	if !ok {
+		return
+	}
+	count, err := client.client.ClearIdentityCache()
+	if err != nil {
+		ce.Reply("Failed to clear identity cache: %v", err)
+		return
+	}
+	ce.Reply(
+		"Cleared the local IDS identity cache and re-registered (services in registration: %d). Give Apple a minute to settle, then try a call to **%s**.",
 		count, stripIdentifierPrefix(client.handle),
 	)
 }

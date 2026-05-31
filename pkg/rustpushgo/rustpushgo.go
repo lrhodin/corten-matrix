@@ -475,6 +475,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_clear_identity_cache(uniffiStatus)
+		})
+		if checksum != 21945 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_clear_identity_cache: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_cloud_diag_full_count(uniffiStatus)
 		})
 		if checksum != 27287 {
@@ -2187,6 +2196,31 @@ func (_self *Client) BatchResolveHandles(unknowns []string, knownHandles []strin
 		FfiConverterMapStringSequenceStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) ClearIdentityCache() (uint32, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_clear_identity_cache(
+				_pointer,
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_u32(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) C.uint32_t {
+			// completeFunc
+			return C.ffi_rustpushgo_rust_future_complete_u32(unsafe.Pointer(handle), status)
+		},
+		FfiConverterUint32INSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_u32(unsafe.Pointer(rustFuture), status)
 		})
 }
 

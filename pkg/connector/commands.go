@@ -82,6 +82,7 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 			cmdFaceTimeClear,
 			cmdFaceTimeInvalidatePeer,
 			cmdFaceTimeRotateIdentity,
+			cmdFaceTimeClearIdentityCache,
 			cmdFaceTimeState,
 			cmdFaceTimeSessionLink,
 			cmdFaceTimeUseLink,
