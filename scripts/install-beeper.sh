@@ -84,9 +84,12 @@ build_bbctl() {
             --branch "$BBCTL_BRANCH" "$BBCTL_REPO" "$BBCTL_DIR"
         cd "$BBCTL_DIR"
         git sparse-checkout init --cone
-        git sparse-checkout set cmd/bbctl
         git checkout --quiet "$BBCTL_BRANCH"
     fi
+    # bbctl imports pkg/imconfig, so the sparse checkout must include it too.
+    # Applied unconditionally (outside the clone branch) so existing checkouts
+    # pick it up when they update, not just fresh clones.
+    git sparse-checkout set cmd/bbctl pkg/imconfig
     go build -o bbctl ./cmd/bbctl/ 2>&1
     cd - >/dev/null
     echo "✓ Built bbctl"
@@ -1186,7 +1189,7 @@ if [ ! -d "$BBCTL_DIR/.git" ] && command -v go >/dev/null 2>&1; then
     git clone --filter=blob:none --no-checkout --quiet \
         --branch "$BBCTL_BRANCH" "$BBCTL_REPO" "$BBCTL_DIR"
     git -C "$BBCTL_DIR" sparse-checkout init --cone
-    git -C "$BBCTL_DIR" sparse-checkout set cmd/bbctl
+    git -C "$BBCTL_DIR" sparse-checkout set cmd/bbctl pkg/imconfig
     git -C "$BBCTL_DIR" checkout --quiet "$BBCTL_BRANCH"
     (cd "$BBCTL_DIR" && go build -o bbctl ./cmd/bbctl/ 2>&1) | sed 's/^/  /'
     [ -n "$EXISTING_BBCTL" ] && rm -f "$EXISTING_BBCTL"
@@ -1201,6 +1204,7 @@ if [ -d "$BBCTL_DIR/.git" ] && command -v go >/dev/null 2>&1; then
         step "Updating bbctl  $LOCAL → $REMOTE"
         T0=$(date +%s)
         git -C "$BBCTL_DIR" reset --hard "origin/$BBCTL_BRANCH" --quiet
+        git -C "$BBCTL_DIR" sparse-checkout set cmd/bbctl pkg/imconfig
         step "Building bbctl..."
         (cd "$BBCTL_DIR" && go build -o bbctl ./cmd/bbctl/ 2>&1) | sed 's/^/  /'
         T1=$(date +%s)

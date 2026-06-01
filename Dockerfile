@@ -165,6 +165,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
 # RUST_LIB stale, it's a fast incremental cargo pass, not a from-scratch rebuild
 # (and the registry mount is there rather than failing offline).
 COPY go.mod go.sum Info.plist ./
+COPY pkg/imconfig/   ./pkg/imconfig/
 COPY pkg/connector/  ./pkg/connector/
 COPY cmd/            ./cmd/
 COPY imessage/       ./imessage/
