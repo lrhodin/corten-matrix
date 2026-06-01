@@ -2,11 +2,11 @@
 # ============================================================================
 # healthcheck — Docker HEALTHCHECK probe for the mautrix-imessage-v2 bridge.
 #
-# cmd_run (docker-entrypoint.sh) ends with `exec "$BIN" …`, so when the bridge
-# is actually running it REPLACES PID 1. We probe PID 1's cmdline rather than a
-# listening port, because the Beeper path uses appservice-websocket (no inbound
-# port) while self-hosted listens on 29325 — the PID-1 check works for both and
-# needs no extra tooling.
+# cmd_run (docker-entrypoint.sh) supervises the bridge as a child, so it isn't
+# necessarily PID 1. We scan every PID for the bridge binary (via /proc exe and
+# comm — see the loop below) rather than probing a listening port, because the
+# Beeper path uses appservice-websocket (no inbound port) while self-hosted
+# listens on 29325 — the process check works for both and needs no extra tooling.
 #
 #   * PID 1 is the bridge binary            -> healthy (exit 0)
 #   * setup in progress (.setup-in-progress) -> healthy AND silent: `imessage
@@ -36,12 +36,27 @@ SETUP_LOCK=/data/.setup-in-progress
 
 # Healthy: the bridge binary is running. cmd_run supervises it as a CHILD (so a
 # fast-failing bridge can't crash-loop the container out of `docker exec` reach),
-# so it is usually not PID 1 — match on the executable across all PIDs via
-# /proc/<pid>/exe. Using exe (not a cmdline grep) means we match the real binary
-# and never false-positive on a process that merely has the name as an argument.
+# so it is usually not PID 1 — match the binary across all PIDs.
+#
+# Two probes, because each covers a gap the other leaves:
+#   * /proc/<pid>/exe is precise (full path, no truncation), BUT following that
+#     symlink for a process owned by another uid needs ptrace access. Docker
+#     drops CAP_SYS_PTRACE by default, and the entrypoint setpriv-drops the
+#     bridge to PUID (default 1000) while this healthcheck runs as root — so a
+#     root readlink() of the PUID bridge's exe returns EACCES and the match
+#     silently fails. That is the "bridge not running but it is" false negative
+#     seen after migrating from baremetal to Docker.
+#   * /proc/<pid>/comm is the process name read straight from the task struct;
+#     it is readable across uids WITHOUT ptrace, so it works for any PUID. The
+#     kernel truncates comm to 15 chars: mautrix-imessage-v2 -> mautrix-imessag.
+# comm can't false-positive on an argument either (it is the process name, not
+# the cmdline), so checking both is strictly safer than exe alone.
 for d in /proc/[0-9]*; do
     case "$(readlink "$d/exe" 2>/dev/null)" in
         */mautrix-imessage-v2) exit 0 ;;
+    esac
+    case "$(cat "$d/comm" 2>/dev/null || true)" in
+        mautrix-imessag*) exit 0 ;;
     esac
 done
 
