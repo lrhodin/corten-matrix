@@ -7004,7 +7004,34 @@ pub async fn new_client(
                     // even if the link stays down (repeating request_update is
                     // harmless — the ResourceManager is already retrying).
                     const APNS_STALL_TIMEOUT: Duration = Duration::from_secs(300);
+                    // SECOND failure mode (distinct from the dead socket above):
+                    // the transport stays fully alive — keepalive Pongs flow every
+                    // ~60s and the APS Acks for the user's OWN outgoing messages
+                    // come back fine — but Apple has silently stopped routing
+                    // com.apple.madrid push NOTIFICATIONS (incoming messages /
+                    // receipts) to this connection's token. Symptom: "I can send
+                    // but I stop receiving", restart fixes it (observed across
+                    // multiple users; one Raspberry-Pi bridge sent fine for ~19h
+                    // while receiving nothing). The half-open-socket watchdog above
+                    // CANNOT see this: last_inbound is reset by every messages_cont
+                    // frame, including the Pongs and send-Acks that keep arriving on
+                    // a live-but-deaf socket — so it never trips. We therefore track
+                    // notifications SEPARATELY (reset only on a real Notification
+                    // frame) and, when the transport is provably alive yet no
+                    // notification has arrived for a long window, force a
+                    // TRANSPORT-ONLY reconnect to re-assert the topic filter
+                    // (do_connect re-sends SetState + filter(current_topics); the
+                    // madrid interest is held for the connection's lifetime by
+                    // IMClient's _interest_token, so it survives the reconnect).
+                    // Same request_update() lever as above → no IDS re-registration.
+                    // We can't distinguish "deaf" from "genuinely quiet" without an
+                    // active probe, so the threshold is deliberately long (1h): a
+                    // deaf link self-heals within the hour instead of never, and a
+                    // truly idle link just sees one harmless reconnect per hour
+                    // (well within normal reconnect cadence — not Apple-visible spam).
+                    const APNS_RECEIVE_STALL_TIMEOUT: Duration = Duration::from_secs(3600);
                     let mut last_inbound = tokio::time::Instant::now();
+                    let mut last_notification = tokio::time::Instant::now();
                     let mut watchdog_tick = tokio::time::interval(Duration::from_secs(30));
                     watchdog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
@@ -7046,9 +7073,20 @@ pub async fn new_client(
                                 match result {
                                     Ok(msg) => {
                                         // Any inbound APS frame (real message OR a
-                                        // keepalive Pong) proves the receive path is
-                                        // alive — feed the liveness watchdog.
+                                        // keepalive Pong) proves the TRANSPORT is
+                                        // alive — feed the half-open-socket watchdog.
                                         last_inbound = tokio::time::Instant::now();
+                                        // A real IDS Notification (incoming message,
+                                        // receipt, typing on madrid) additionally
+                                        // proves Apple's push ROUTING to this token is
+                                        // live. Pongs and our own send-Acks do NOT —
+                                        // they are exactly what masks a live-but-deaf
+                                        // socket from the watchdog above. matches! does
+                                        // not move msg (no bindings), so it stays
+                                        // available to forward below.
+                                        if matches!(msg, rustpush::APSMessage::Notification { .. }) {
+                                            last_notification = tokio::time::Instant::now();
+                                        }
                                         drain_pending.fetch_add(1, Ordering::Relaxed);
                                         let drain_ts = std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
@@ -7060,9 +7098,13 @@ pub async fn new_client(
                                         }
                                     }
                                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                                        // Lagged means frames WERE arriving (we fell
-                                        // behind) — the link is alive.
+                                        // Lagged means frames WERE arriving fast enough
+                                        // that we fell behind — the link is alive and
+                                        // almost certainly carrying real notifications,
+                                        // so refresh both timers to avoid a spurious
+                                        // re-filter during a genuine burst.
                                         last_inbound = tokio::time::Instant::now();
+                                        last_notification = tokio::time::Instant::now();
                                         error!(
                                             "APS broadcast receiver lagged — {} messages were DROPPED by the \
                                              broadcast channel before we could read them. Real-time messages \
@@ -7092,8 +7134,35 @@ pub async fn new_client(
                                     conn.request_update().await;
                                     // Space forced reconnects >= APNS_STALL_TIMEOUT apart
                                     // and give regeneration time to deliver frames before
-                                    // we would consider firing again.
+                                    // we would consider firing again. Reset BOTH timers:
+                                    // the regenerated link starts clean, and we don't
+                                    // want the deaf-link branch below to fire on the
+                                    // pre-reconnect notification gap.
                                     last_inbound = tokio::time::Instant::now();
+                                    last_notification = tokio::time::Instant::now();
+                                } else if last_notification.elapsed() >= APNS_RECEIVE_STALL_TIMEOUT {
+                                    // Transport is alive (a frame arrived within
+                                    // APNS_STALL_TIMEOUT — the `if` above didn't trip)
+                                    // but no real IDS notification has come through for
+                                    // APNS_RECEIVE_STALL_TIMEOUT. Either Apple silently
+                                    // stopped routing madrid pushes to this token, or
+                                    // the link is genuinely idle — we can't tell, so we
+                                    // re-assert the topic filter the cheap way: a
+                                    // transport-only reconnect (re-runs do_connect →
+                                    // SetState + filter(current_topics)). Recovers a
+                                    // lapsed subscription; a no-op-cost reconnect if the
+                                    // link was merely quiet.
+                                    let deaf = last_notification.elapsed();
+                                    warn!(
+                                        "APNs receive-routing watchdog: transport alive (inbound frame within {}s) but ZERO IDS notifications for {}s — Apple's madrid push routing to this token may have silently lapsed (the 'I can send but stopped receiving' failure). Forcing TRANSPORT-ONLY APS reconnect via request_update to re-assert the topic filter (no IDS re-registration). Harmless if the link was simply idle.",
+                                        idle.as_secs(),
+                                        deaf.as_secs()
+                                    );
+                                    conn.request_update().await;
+                                    // Reset only the notification timer so re-filters are
+                                    // spaced >= APNS_RECEIVE_STALL_TIMEOUT apart; the
+                                    // reconnect refreshes last_inbound on its own.
+                                    last_notification = tokio::time::Instant::now();
                                 }
                             }
                         }
