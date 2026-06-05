@@ -1024,6 +1024,17 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 	c.inviteContactsToStatusSharingOpts(log, false, false)
 }
 
+// statusKitAutoInvite gates the legacy IDS bulk invite sweep. OFF: peers share
+// their StatusKit keys automatically (OB's passive model), those keys land in the
+// user's CloudKit, and the periodic CloudKit pull (syncCloudStatusKitPeers)
+// hydrates whatever we're missing — so the bridge never bulk-invites anyone. This
+// removes the sweep's IDS queries entirely AND unblocks the pull (the sweep used
+// to defer it via statusKitSweepRunning). Per-peer manual invites remain via the
+// !statuskit-invite-channel command (a separate, bounded path); the dangerous
+// bulk !statuskit-invite-all command was removed. Set true only to re-enable the
+// legacy auto bulk sweep.
+const statusKitAutoInvite = false
+
 // inviteContactsToStatusSharingOpts is the core invite sweep.
 //
 //   - respectSpacing (periodic tick path): skip handles invited within
@@ -1037,6 +1048,14 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respectSpacing bool, bypassLatch bool) {
 	if c.client == nil || c.handle == "" {
 		log.Warn().Bool("client_nil", c.client == nil).Str("handle", logSafeHandle(c.handle)).Msg("StatusKit invite: skipped (client or handle not ready)")
+		return
+	}
+	// Bulk auto-invite is disabled (statusKitAutoInvite): peer keys come from the
+	// periodic CloudKit pull. Return BEFORE setting statusKitSweepRunning so this
+	// can never block syncCloudStatusKitPeers. Per-peer invites use a separate
+	// path (!statuskit-invite-channel).
+	if !statusKitAutoInvite {
+		log.Debug().Msg("StatusKit bulk invite disabled — keys come from the CloudKit pull; skipping sweep")
 		return
 	}
 	// Mark the sweep as running so the new-portal hook
@@ -1335,6 +1354,12 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 			log.Warn().Interface("panic", r).Msg("inviteSingleHandleToStatusSharing panicked — skipped")
 		}
 	}()
+
+	// Bulk auto-invite is disabled — a new portal's peer key arrives via the
+	// periodic CloudKit pull, not an auto-invite (statusKitAutoInvite).
+	if !statusKitAutoInvite {
+		return
+	}
 
 	if c.client == nil || c.handle == "" || c.UserLogin == nil {
 		return
