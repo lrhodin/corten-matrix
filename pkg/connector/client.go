@@ -169,6 +169,16 @@ type IMClient struct {
 	// per unresolved handle per session. Values are networkid.PortalID.
 	statusKitPortalCache sync.Map // map[string]networkid.PortalID
 
+	// statusKitLastNotice tracks the event ID of the last presence notice the
+	// bridge sent, so the next change can redact it and leave exactly ONE
+	// status notice in the room instead of a growing wall. Keyed by
+	// "<peer portal ID>|<room MXID>" — the peer's canonical portal ID AND the
+	// target room, NOT the room alone: in a shared group two people
+	// each get their own tracked notice, so one toggling never redacts the
+	// other's line. Values are id.EventID. Mirrored to the KV store under the
+	// same key so the dedup survives a bridge restart.
+	statusKitLastNotice sync.Map // map[string]id.EventID
+
 	// statusKitIDSGate paces and adaptively backs off batch IDS lookups
 	// driven by StatusKit alias resolution. Per-handle 6h negative cache
 	// (statusKitIDSAttemptKeyPrefix) prevents re-querying the same handle;
@@ -1982,9 +1992,9 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			}
 		}
 
-		sendStatusNotice := func(targetPortal *bridgev2.Portal) error {
+		sendStatusNotice := func(targetPortal *bridgev2.Portal) (id.EventID, error) {
 			if targetPortal == nil || targetPortal.MXID == "" {
-				return fmt.Errorf("invalid target portal")
+				return "", fmt.Errorf("invalid target portal")
 			}
 
 			// Stamp each notice at exactly the previous message's timestamp
@@ -2035,11 +2045,17 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 				if dp := c.UserLogin.User.DoublePuppet(ctx); dp != nil {
 					batchReq.MarkReadBy = dp.GetMXID()
 				}
-				_, sendErr := c.Main.Bridge.Matrix.BatchSend(ctx, targetPortal.MXID, batchReq, nil)
-				return sendErr
+				resp, sendErr := c.Main.Bridge.Matrix.BatchSend(ctx, targetPortal.MXID, batchReq, nil)
+				if sendErr != nil {
+					return "", sendErr
+				}
+				if resp == nil || len(resp.EventIDs) == 0 {
+					return "", nil
+				}
+				return resp.EventIDs[0], nil
 			}
 
-			_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, targetPortal.MXID, event.EventMessage, &event.Content{
+			resp, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, targetPortal.MXID, event.EventMessage, &event.Content{
 				Parsed: &event.MessageEventContent{
 					MsgType:  event.MsgNotice,
 					Body:     notice,
@@ -2051,17 +2067,59 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 					},
 				},
 			}, &bridgev2.MatrixSendExtra{Timestamp: noticeTS})
-			return sendErr
+			if sendErr != nil {
+				return "", sendErr
+			}
+			if resp == nil {
+				return "", nil
+			}
+			return resp.EventID, nil
+		}
+
+		// Per-(peer, room) tracking so each new notice can redact the prior
+		// one, leaving exactly ONE status notice in the room. Keyed by the
+		// canonical peer portal ID + room MXID (see statusKitLastNotice doc)
+		// and mirrored to the KV store so it survives a bridge restart.
+		noticeKey := func(roomMXID id.RoomID) string {
+			return string(portal.ID) + "|" + string(roomMXID)
+		}
+		noticeKVKey := func(roomMXID id.RoomID) database.Key {
+			return database.Key("statuskit.lastnotice." + noticeKey(roomMXID))
+		}
+		redactPrevNotice := func(roomMXID id.RoomID) {
+			var prevID id.EventID
+			if v, ok := c.statusKitLastNotice.Load(noticeKey(roomMXID)); ok {
+				prevID = v.(id.EventID)
+			} else if s := c.Main.Bridge.DB.KV.Get(ctx, noticeKVKey(roomMXID)); s != "" {
+				prevID = id.EventID(s)
+			}
+			if prevID == "" {
+				return
+			}
+			if _, err := c.Main.Bridge.Bot.SendMessage(ctx, roomMXID, event.EventRedaction, &event.Content{
+				Parsed: &event.RedactionEventContent{Redacts: prevID},
+			}, nil); err != nil {
+				log.Warn().Err(err).Str("portal_mxid", string(roomMXID)).Str("redacts", string(prevID)).
+					Msg("StatusKit: failed to redact previous presence notice")
+			}
 		}
 
 		sent := 0
 		for _, targetPortal := range targetPortals {
-			if err := sendStatusNotice(targetPortal); err != nil {
+			newID, err := sendStatusNotice(targetPortal)
+			if err != nil {
 				log.Warn().Err(err).Str("portal_mxid", string(targetPortal.MXID)).Msg("StatusKit: failed to send presence notice")
 				continue
 			}
 			sent++
 			log.Info().Str("portal_mxid", string(targetPortal.MXID)).Msg("StatusKit: sent silent presence notice")
+
+			// Redact the prior notice for THIS (peer, room) — sent first so a
+			// failed redaction leaves the correct new line rather than a gap —
+			// then record the new one as the line to redact next time.
+			redactPrevNotice(targetPortal.MXID)
+			c.statusKitLastNotice.Store(noticeKey(targetPortal.MXID), newID)
+			c.Main.Bridge.DB.KV.Set(ctx, noticeKVKey(targetPortal.MXID), string(newID))
 		}
 		if sent == 0 {
 			log.Warn().Msg("StatusKit: failed to send presence notice to any conversation")
