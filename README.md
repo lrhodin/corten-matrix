@@ -54,21 +54,20 @@ Pick one extraction option:
 
 **Option A: GUI app (recommended, macOS 10.15+ Catalina)**
 
-Build the SwiftUI extraction app on any Mac (Intel or Apple Silicon), then run it on the Intel Mac:
+Download the pre-built `ExtractKey.app.zip` from the [1.0.0 release](https://github.com/lrhodin/imessage/releases/tag/1.0.0), or build it yourself on any Mac (Intel or Apple Silicon):
 
 ```bash
 git clone https://github.com/lrhodin/imessage.git
 cd imessage/tools/extract-key-app
 ./build.sh
-# Copy ExtractKey.app to the Intel Mac and double-click it.
 ```
 
-The app reads hardware identifiers, displays them, and lets you copy or save the base64 key. If the Mac is missing encrypted IOKit properties (`_enc` fields), the app offers an **Enrich Key** button to compute them on the spot — no extra steps needed.
+Either way, copy `ExtractKey.app` to the Intel Mac and double-click it. The app reads hardware identifiers, displays them, and lets you copy or save the base64 key. If the Mac is missing encrypted IOKit properties (`_enc` fields), the app offers an **Enrich Key** button to compute them on the spot — no extra steps needed.
 
-> **Gatekeeper**: Because the app is ad-hoc signed (not notarized by Apple), macOS will block it on first launch. To open it:
+> **Gatekeeper**: An app you **build yourself** opens with no prompt — locally-built apps aren't quarantined. A **downloaded** pre-built copy is, though: macOS flags anything downloaded and the app is ad-hoc signed (not notarized — just a fact of macOS), so it's blocked on first launch. To open the downloaded copy:
 >
-> - **macOS 13+ (Ventura)**: Double-click the app. When the warning appears, go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**.
-> - **macOS 10.15–12**: Right-click (or Control-click) the app and choose **Open** from the context menu. Click **Open** in the dialog that appears.
+> - **macOS 13+ (Ventura)**: Double-click it, then go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**.
+> - **macOS 10.15–12**: Right-click (or Control-click) the app and choose **Open** from the context menu, then **Open** in the dialog.
 > - **Terminal**: Run `xattr -cr ExtractKey.app` to strip the quarantine flag, then double-click normally.
 
 **Option B: CLI (macOS 13+ with Go)**
@@ -118,7 +117,7 @@ Run the NAC relay — a small HTTP server on the Mac that generates Apple valida
 
 **Option 1: GUI app (recommended)**
 
-Build and run the menubar app — it bundles the relay, key extraction, and status monitoring in one place:
+Download the pre-built `NACRelay.app.zip` from the [1.0.0 release](https://github.com/lrhodin/imessage/releases/tag/1.0.0), or build the menubar app yourself — it bundles the relay, key extraction, and status monitoring in one place:
 
 ```bash
 cd tools/nac-relay-app
@@ -127,6 +126,8 @@ open NACRelay.app
 ```
 
 The app appears as an antenna icon in the menubar (no dock icon). It auto-starts the relay on launch, shows the relay address and auth info, and lets you extract the hardware key with relay credentials embedded — all from the popover UI. Click **Extract Hardware Key**, then **Copy Key** to get the base64 key.
+
+> **Gatekeeper**: Same as the extractor app above — a copy you build yourself opens with no prompt, but the **downloaded** pre-built `NACRelay.app` is quarantined (ad-hoc signed, not notarized — a fact of macOS). Open it via **right-click → Open** (macOS 10.15–12), **System Settings → Privacy & Security → Open Anyway** (macOS 13+), or `xattr -cr NACRelay.app` in Terminal.
 
 **Option 2: CLI**
 
