@@ -39,3 +39,37 @@ dev\windows-dev-env.bat && dev\windows-bindings.bat
 
 The one-time winget installs needed for the dev-env script to work are
 documented at the top of `dev\windows-dev-env.bat`.
+
+## Config
+
+### Network config (the `network:` / iMessage settings)
+
+**Source of truth: `pkg/imconfig/example-config.yaml`** — the documented
+defaults and comments users see. It is embedded **verbatim** via `//go:embed`
+into `NetworkExampleConfig` (`pkg/imconfig/imconfig.go`); it is **not** generated
+from Go, and there is no separate template. Both `pkg/connector` and `cmd/bbctl`
+consume this one embedded copy, so **never re-add a hardcoded config string**
+elsewhere — the two generation paths drifted once, which is exactly why this was
+unified into `pkg/imconfig`.
+
+The matching Go struct is `IMConfig` in `pkg/connector/config.go`, with
+`upgradeConfig` handling migrations.
+
+To add or change a network option, edit all three in lockstep:
+1. `pkg/imconfig/example-config.yaml` — the YAML key, default value, and the
+   user-facing comment.
+2. `pkg/connector/config.go` — the `IMConfig` struct field (+ `yaml:` tag) and
+   its doc comment. Keep this comment's wording in sync with the YAML comment.
+3. `pkg/connector/config.go` `upgradeConfig` — add a `helper.Copy(...)` line so
+   the option survives a config upgrade.
+
+`pkg/imconfig/imconfig_test.go` guards that the embedded YAML stays valid YAML.
+
+### Bridge (base/appservice) config — the `bridge:` section
+
+This is the **bridgev2 framework's** config (`bridgeconfig.BridgeConfig`), not
+ours. To change a framework default, override it in `IMConnector.Start()`
+(config YAML is loaded by then) — see the existing overrides there for
+`phone_numbers_in_profile` (must be true or bridgev2 strips `tel:` from contact
+profiles → no call button), `unknown_error_auto_reconnect`, and
+`unknown_error_max_auto_reconnects`.
