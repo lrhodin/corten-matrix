@@ -775,7 +775,7 @@ if ! grep -q 'statuskit_notifications:' "$CONFIG" 2>/dev/null; then
     statuskit_notifications: true' "$CONFIG"
 fi
 
-# ── StatusKit notifications (iOS 18 Focus / DND inline notices) ───
+# ── StatusKit notifications (iOS 18 Focus / DND shown as 🌙 on the chat title) ───
 CURRENT_STATUSKIT_NOTIF=$(grep 'statuskit_notifications:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*statuskit_notifications: *//' || true)
 if [ -n "${STATUSKIT_NOTIFICATIONS:-}" ]; then
     case "$STATUSKIT_NOTIFICATIONS" in
@@ -791,15 +791,14 @@ if [ -n "${STATUSKIT_NOTIFICATIONS:-}" ]; then
 elif [ -t 0 ]; then
     echo ""
     echo "StatusKit notifications:"
-    echo "  When a contact enables iOS 18 Focus or Do Not Disturb on their"
-    echo "  iPhone, the bridge can post a silent notice in the DM portal"
-    echo "  (\"🔕 Name has notifications silenced (Do Not Disturb).\") and"
-    echo "  update Matrix ghost presence — the same affordance Apple's"
-    echo "  Messages app shows in-conversation. Disabling keeps the"
-    echo "  StatusKit registration intact but suppresses the notices."
+    echo "  When a contact turns on an iOS 18 Focus or Do Not Disturb, the"
+    echo "  bridge marks it in the chat title — appending a 🌙 to their name"
+    echo "  (e.g. \"Alice 🌙\") and removing it when they turn it off — the"
+    echo "  same at-a-glance cue Apple shows next to a name. Disabling keeps"
+    echo "  StatusKit registration intact but suppresses the indicator."
     echo ""
-    echo "  Note: when a notification is posted, the destination chat will"
-    echo "  be unarchived. This is a limitation external to the bridge."
+    echo "  The 🌙 updates the contact's name (a room-state change), not a"
+    echo "  posted message — so it never bumps or unarchives the chat."
     echo ""
     if [ "$CURRENT_STATUSKIT_NOTIF" = "false" ]; then
         read -p "Enable StatusKit notifications? [y/N]: " EN_SK

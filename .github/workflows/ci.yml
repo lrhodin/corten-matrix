@@ -205,6 +205,13 @@ jobs:
           key: cargo-linux-${{ hashFiles('**/Cargo.lock', 'third_party/rustpush-upstream.sha') }}
           restore-keys: cargo-linux-
 
+      - name: Cache uniffi-bindgen-go (FFI binding generator)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/uniffi-bindgen-go
+          # Keyed on the pinned tag (AGENTS.md) so bumping the version busts it.
+          key: uniffi-bindgen-go-v0.2.2+v0.25.0
+
       - name: Verify pinned rustpush SHA file
         run: |
           PIN_FILE=third_party/rustpush-upstream.sha
@@ -221,6 +228,23 @@ jobs:
 
       - name: Build
         run: make build
+
+      - name: Verify FFI bindings are in sync with the Rust FFI surface
+        run: |
+          # Guards against editing the Rust #[uniffi::export] surface without
+          # running `make bindings`: a stale committed rustpushgo.go can compile
+          # yet break at runtime (uniffi contract mismatch) and ship via Docker,
+          # which trusts the committed bindings. No Makefile changes — this just
+          # regenerates from the librustpushgo.a built above and diffs.
+          # Pinned to the version in AGENTS.md (the one the committed bindings
+          # were generated with) so the diff is stable across generator releases.
+          command -v uniffi-bindgen-go >/dev/null 2>&1 || \
+            cargo install uniffi-bindgen-go \
+              --git https://github.com/NordSecurity/uniffi-bindgen-go \
+              --tag v0.2.2+v0.25.0
+          make bindings
+          git diff --exit-code -- pkg/rustpushgo/rustpushgo.go pkg/rustpushgo/rustpushgo.h \
+            || { echo "::error::Committed FFI bindings are stale — run 'make bindings' and commit pkg/rustpushgo/rustpushgo.{go,h}"; exit 1; }
 
       - name: Test pkg/connector/
         run: go test -count=1 ./pkg/connector/...

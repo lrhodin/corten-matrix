@@ -1206,8 +1206,49 @@ func (c *IMClient) Connect(ctx context.Context) {
 					if err := c.safeRefreshPetTokenThrottled(); err != nil {
 						log.Debug().Err(err).Msg("StatusKit startup share: PET refresh skipped")
 					}
-					if err := sk.ShareStatus(true, nil); err != nil {
-						log.Warn().Err(err).Msg("StatusKit startup share_status failed")
+					shareErr := sk.ShareStatus(true, nil)
+					if shareErr != nil && strings.Contains(shareErr.Error(), "Auth Missing") &&
+						c.tokenProvider != nil && *c.tokenProvider != nil {
+						// Warm-restore (restore_token_provider) injects ONLY the PET;
+						// the full GSA token map — including com.apple.gs.sharedchannels.auth
+						// that share_status needs — is repopulated only by a full
+						// login_email_pass. The GSA-announce prime that used to do that
+						// is disabled, and upstream get_token won't lazily fetch an
+						// *absent* token (it only re-logs-in for an expired-but-present
+						// one), so the map can lack sharedchannels.auth → "Auth Missing".
+						// The proactive refresh above is throttle-skipped on a quick
+						// restart, so force a full refresh here to rebuild the map,
+						// then retry once. One prime fixes the whole process.
+						//
+						// This deliberately bypasses the proactive 5-minute throttle
+						// (the warm-restore map is genuinely incomplete EVERY restart,
+						// so the throttle would wrongly leave us silent). To still
+						// protect against a crash-restart loop hammering Apple's GSA
+						// login, honor a short floor: skip the prime if any token
+						// refresh ran in the last 60s. Matches the CloudKit recovery's
+						// 60s min-interval; a normal restart (minutes apart) clears it,
+						// a tight crash loop (seconds) is bounded to ~1 login/60s.
+						const statusKitPrimeFloor = 60 * time.Second
+						recentRefresh := false
+						if raw := c.Main.Bridge.DB.KV.Get(context.Background(), petRefreshKVKey); raw != "" {
+							if ts, perr := strconv.ParseInt(raw, 10, 64); perr == nil && time.Since(time.Unix(ts, 0)) < statusKitPrimeFloor {
+								recentRefresh = true
+							}
+						}
+						if recentRefresh {
+							log.Warn().Msg("StatusKit startup share hit Auth Missing, but a token refresh ran <60s ago — skipping prime to avoid hammering Apple GSA (crash-loop guard)")
+						} else {
+							log.Info().Msg("StatusKit startup share hit Auth Missing — priming GSA tokens (warm-restore map is PET-only) and retrying")
+							if rErr := safeRefreshPetToken(*c.tokenProvider); rErr != nil {
+								log.Warn().Err(rErr).Msg("StatusKit startup share: GSA token prime failed")
+							} else {
+								c.Main.Bridge.DB.KV.Set(context.Background(), petRefreshKVKey, strconv.FormatInt(time.Now().Unix(), 10))
+								shareErr = sk.ShareStatus(true, nil)
+							}
+						}
+					}
+					if shareErr != nil {
+						log.Warn().Err(shareErr).Msg("StatusKit startup share_status failed")
 						return
 					}
 					// Stamp the post-invite cooldown key so the sweep's
@@ -1594,27 +1635,6 @@ func (c *IMClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal)
 // Callbacks from rustpush
 // ============================================================================
 
-// statusKitModeLabel converts a Focus/DND mode identifier to a human-readable
-// label for use in bridge bot notices.
-func statusKitModeLabel(mode *string) string {
-	if mode == nil || *mode == "" {
-		return ""
-	}
-	switch *mode {
-	case "com.apple.donotdisturb.mode.default":
-		return "Do Not Disturb"
-	case "com.apple.donotdisturb.mode.sleep":
-		return "Sleep"
-	default:
-		// Focus modes use identifiers like "com.apple.focus.mode.personal"
-		// or user-defined UUIDs. Humanise what we can; fall back to a generic label.
-		if strings.Contains(*mode, "focus") {
-			return "Focus"
-		}
-		return "Do Not Disturb"
-	}
-}
-
 // OnStatusUpdate is called by StatusKit when a contact's presence changes.
 // Posts an m.notice in the contact DM and the last active shared group so the
 // user sees status inline where they're actively chatting, similar to Apple's
@@ -1932,141 +1952,138 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			}
 		}
 
-		log.Info().
-			Str("normalized_user", normalizedUser).
-			Str("portal_id", string(portal.ID)).
-			Str("ghost_handle", ghostHandle).
-			Msg("StatusKit: sending presence notice to active conversations")
-
-		name := ghost.Name
-		if name == "" {
-			name = ghostHandle
-		}
-		var notice string
-		if silenced {
-			label := statusKitModeLabel(modeCopy)
-			if label != "" {
-				notice = "🔕 " + name + " has notifications silenced (" + label + ")."
-			} else {
-				notice = "🔕 " + name + " has notifications silenced."
-			}
-		} else {
-			notice = name + " has notifications turned on."
-		}
-
-		targetPortals := map[networkid.PortalID]*bridgev2.Portal{
-			portal.ID: portal,
-		}
-		candidateHandles := map[string]bool{
-			normalizedUser: true,
-			ghostHandle:    true,
-		}
-		if contact := c.lookupContact(user); contact != nil {
-			for _, altID := range contactPortalIDs(contact) {
-				candidateHandles[altID] = true
-			}
-		}
-		for handleID := range candidateHandles {
-			if handleID == "" {
-				continue
-			}
-			c.lastGroupForMemberMu.RLock()
-			groupKey, ok := c.lastGroupForMember[handleID]
-			c.lastGroupForMemberMu.RUnlock()
-			if !ok || groupKey.ID == "" {
-				continue
-			}
-			groupPortal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, groupKey)
-			if err == nil && groupPortal != nil && groupPortal.MXID != "" {
-				targetPortals[groupPortal.ID] = groupPortal
-			}
-		}
-
-		sendStatusNotice := func(targetPortal *bridgev2.Portal) error {
-			if targetPortal == nil || targetPortal.MXID == "" {
-				return fmt.Errorf("invalid target portal")
-			}
-
-			// Stamp each notice at exactly the previous message's timestamp
-			// so room ordering doesn't change. The m.notice +
-			// com.beeper.action_message=presence_update extension already
-			// signals "do not reorder" at the client level; matching the
-			// last message's timestamp is the bridge-side belt that
-			// doesn't depend on every client honoring the extension.
-			//
-			// A portal without any prior message shouldn't exist in
-			// practice (no messages = nothing to backfill = no portal),
-			// so the fallback below is defensive — keep the original
-			// now-1ms shape for that path.
-			noticeTS := time.Now().Add(-1 * time.Millisecond)
-			if lastMsg, dbErr := c.Main.Bridge.DB.Message.GetLastNonFakePartAtOrBeforeTime(
-				ctx, targetPortal.PortalKey, time.Now(),
-			); dbErr != nil {
-				log.Warn().Err(dbErr).Str("portal_id", string(targetPortal.ID)).
-					Msg("StatusKit: failed to query last message timestamp, using now-1ms")
-			} else if lastMsg != nil && !lastMsg.Timestamp.IsZero() {
-				noticeTS = lastMsg.Timestamp
-			}
-
-			if c.Main.Bridge.Matrix.GetCapabilities().BatchSending {
-				batchEvt := &event.Event{
-					Type:      event.EventMessage,
-					Sender:    c.Main.Bridge.Bot.GetMXID(),
-					RoomID:    targetPortal.MXID,
-					Timestamp: noticeTS.UnixMilli(),
-					Content: event.Content{
-						Parsed: &event.MessageEventContent{
-							MsgType:  event.MsgNotice,
-							Body:     notice,
-							Mentions: &event.Mentions{},
-						},
-						Raw: map[string]any{
-							"com.beeper.action_message": map[string]any{
-								"type": "presence_update",
-							},
-						},
+		// Reflect the focus state in the DM TITLE (room name) instead of
+		// posting a timeline notice: the contact's name normally, the name
+		// plus a trailing 🌙 while their Focus/DND is on. The title is
+		// persistent in the header and the chat-list row, never buried, and is
+		// updated in place with ExcludeChangesFromTimeline — so no wall, no
+		// tombstones, no inbox churn. DMs only: a group has a single shared
+		// title, so per-member focus can't ride on it (groups no longer
+		// surface focus at all).
+		//
+		// Routed through computeDMTitle so this live path and the periodic
+		// refreshDMPortalNamesFromContacts loop ALWAYS agree — the refresh
+		// re-applies the identical title every contact-sync tick (covering
+		// restarts and any toggle missed while the bridge was down), and a
+		// live change updates it immediately. The portal-keyed presence state
+		// was stored just above, so computeDMTitle sees the new state.
+		//
+		// Logs carry only the opaque room MXID + a boolean — never the
+		// contact name or handle.
+		// Only touch the title when there's something to own: the peer is
+		// silenced (add 🌙), or we already own the name (NameIsCustom — to
+		// maintain it or clear the moon). A pristine, never-silenced DM is left
+		// on implicit naming so we never mass-seize NameIsCustom (which would
+		// also freeze ghost avatar updates) across DMs. portal.Name may be
+		// empty for implicitly-named DMs, so a title!=Name gate alone isn't safe.
+		if portal.RoomType == database.RoomTypeDM && (silenced || portal.NameIsCustom) {
+			nameField := c.dmFocusName(ctx, portal)
+			c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
+				EventMeta: simplevent.EventMeta{
+					Type: bridgev2.RemoteEventChatInfoChange,
+					PortalKey: networkid.PortalKey{
+						ID:       portal.ID,
+						Receiver: c.UserLogin.ID,
 					},
-				}
-				batchReq := &mautrix.ReqBeeperBatchSend{
-					Forward:          true,
-					SendNotification: false,
-					Events:           []*event.Event{batchEvt},
-				}
-				if dp := c.UserLogin.User.DoublePuppet(ctx); dp != nil {
-					batchReq.MarkReadBy = dp.GetMXID()
-				}
-				_, sendErr := c.Main.Bridge.Matrix.BatchSend(ctx, targetPortal.MXID, batchReq, nil)
-				return sendErr
-			}
-
-			_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, targetPortal.MXID, event.EventMessage, &event.Content{
-				Parsed: &event.MessageEventContent{
-					MsgType:  event.MsgNotice,
-					Body:     notice,
-					Mentions: &event.Mentions{},
-				},
-				Raw: map[string]any{
-					"com.beeper.action_message": map[string]any{
-						"type": "presence_update",
+					LogContext: func(lc zerolog.Context) zerolog.Context {
+						return lc.Str("portal_mxid", string(portal.MXID)).
+							Str("source", "focus_status").
+							Bool("silenced", silenced)
 					},
 				},
-			}, &bridgev2.MatrixSendExtra{Timestamp: noticeTS})
-			return sendErr
-		}
-
-		sent := 0
-		for _, targetPortal := range targetPortals {
-			if err := sendStatusNotice(targetPortal); err != nil {
-				log.Warn().Err(err).Str("portal_mxid", string(targetPortal.MXID)).Msg("StatusKit: failed to send presence notice")
-				continue
-			}
-			sent++
-			log.Info().Str("portal_mxid", string(targetPortal.MXID)).Msg("StatusKit: sent silent presence notice")
-		}
-		if sent == 0 {
-			log.Warn().Msg("StatusKit: failed to send presence notice to any conversation")
+				ChatInfoChange: &bridgev2.ChatInfoChange{
+					ChatInfo: &bridgev2.ChatInfo{
+						Name:                       nameField,
+						ExcludeChangesFromTimeline: true,
+					},
+				},
+			})
+			log.Info().Str("portal_mxid", string(portal.MXID)).Bool("silenced", silenced).
+				Msg("StatusKit: updated DM title for focus change")
 		}
 	}()
+}
+
+// isPortalSilenced reports whether the peer of the given DM portal currently
+// has iMessage Focus/DND on. Map-first (statusKitPresenceByPortal), KV-fallback:
+// the in-memory map is cold after a restart, but the per-portal presence state
+// is persisted, so the fallback lets the periodic title refresh PRESERVE the 🌙
+// across restarts instead of stripping it until the next live toggle. A stored
+// value of "available" (or absent) = not silenced; any focus mode = silenced.
+//
+// Note: depends on StatusKitNotifications being enabled — when it's off,
+// OnStatusUpdate early-returns before recording presence, so this is always
+// false and no moon appears (intended).
+func (c *IMClient) isPortalSilenced(ctx context.Context, portalID networkid.PortalID) bool {
+	if v, ok := c.statusKitPresenceByPortal.Load(portalID); ok {
+		s, _ := v.(string)
+		return s != "" && s != "available"
+	}
+	s := c.Main.Bridge.DB.KV.Get(ctx, database.Key("statuskit.presence.portal."+string(portalID)))
+	return s != "" && s != "available"
+}
+
+// dmBaseName returns the name a DM's title shows WITHOUT the moon, matching the
+// authority that NORMALLY names that chat — so adding/removing 🌙 only ever
+// toggles the suffix and never swaps the underlying name (which is what caused
+// the "David Brustein" ↔ "David" flip):
+//   - self-chat (Note to Self): resolveContactDisplayname — exactly what the
+//     connector itself sets for the self-chat (GetChatInfo). Using ghost.Name
+//     here would disagree with the connector and flip the title on every toggle.
+//   - regular DM: ghost.Name — what the framework derives (and what
+//     DefaultChatName restores), and it carries shared-profile names that
+//     resolveContactDisplayname would miss.
+func (c *IMClient) dmBaseName(ctx context.Context, portal *bridgev2.Portal) string {
+	if c.isMyHandle(string(portal.ID)) {
+		return c.resolveContactDisplayname(string(portal.ID))
+	}
+	for _, uid := range []networkid.UserID{portal.OtherUserID, networkid.UserID(portal.ID)} {
+		if uid == "" {
+			continue
+		}
+		if ghost, err := c.Main.Bridge.GetGhostByID(ctx, uid); err == nil && ghost != nil && ghost.Name != "" {
+			return ghost.Name
+		}
+	}
+	return c.resolveContactDisplayname(string(portal.ID))
+}
+
+// computeDMTitle returns a DM's room title: dmBaseName plus a trailing " 🌙"
+// while the peer's iMessage Focus/DND is on. SINGLE source of truth for the
+// title — both the live focus path (OnStatusUpdate) and the periodic refresh
+// (refreshDMPortalNamesFromContacts) call it, so they can never disagree.
+func (c *IMClient) computeDMTitle(ctx context.Context, portal *bridgev2.Portal) string {
+	base := c.dmBaseName(ctx, portal)
+	if base != "" && c.isPortalSilenced(ctx, portal.ID) {
+		base += " 🌙"
+	}
+	return base
+}
+
+// dmFocusName returns the ChatInfo.Name to set for a DM given the peer's focus
+// state:
+//   - silenced  → the moon title ("<name> 🌙"), which we own (NameIsCustom=true).
+//   - available, regular DM → bridgev2.DefaultChatName, which RELEASES ownership
+//     (NameIsCustom=false) so the framework restores the bare ghost name AND
+//     re-enables ghost name+avatar sync. (Re-stamping the bare name would keep
+//     NameIsCustom=true forever and freeze the ghost avatar.)
+//   - available, self-chat → the bare connector name. The connector permanently
+//     owns the self-chat name (NameIsCustom is always set by GetChatInfo), so
+//     releasing would just fight GetChatInfo and flip; restore the same bare
+//     name dmBaseName uses, keeping it stable.
+//
+// Returns the DefaultChatName package sentinel by identity (the framework
+// matches it by pointer at portal.go:4983) — never a copy of "".
+func (c *IMClient) dmFocusName(ctx context.Context, portal *bridgev2.Portal) *string {
+	if c.isPortalSilenced(ctx, portal.ID) {
+		title := c.computeDMTitle(ctx, portal)
+		return &title
+	}
+	if c.isMyHandle(string(portal.ID)) {
+		base := c.dmBaseName(ctx, portal)
+		return &base
+	}
+	return bridgev2.DefaultChatName
 }
 
 // ensureBotPushRuleSilenced installs push rules via the double puppet so

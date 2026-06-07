@@ -85,6 +85,21 @@ func (c *IMConnector) Start(ctx context.Context) error {
 		c.Bridge.Config.UnknownErrorMaxAutoReconnects = 100
 	}
 
+	// iMessage's primary identifier IS the phone number, and the Matrix client
+	// (Beeper) gates the call button — and treats a contact as callable/phone —
+	// on a tel: identifier in the ghost's profile. bridgev2 STRIPS every tel:
+	// from profiles unless this is set (ghost.go prepareContactInfo deletes
+	// tel: when !PhoneNumbersInProfile). With the default (false), phone-only
+	// contacts ended up email-only in their profile ("defaulting to email", no
+	// call button) even though GetUserInfo includes the phone. Force it on:
+	// exposing the phone is the whole point of an iMessage contact, and it's
+	// what makes the call button work. Set in Start() (config YAML is loaded by
+	// now); existing ghosts repopulate the tel: on their next contact refresh.
+	if !c.Bridge.Config.PhoneNumbersInProfile {
+		c.Bridge.Config.PhoneNumbersInProfile = true
+		c.Bridge.Log.Info().Msg("Forcing phone_numbers_in_profile=true so contact phone numbers stay in Matrix profiles (call button + contact resolution)")
+	}
+
 	// Override backfill defaults for iMessage CloudKit sync.
 	// Applied in Start() because Init() runs before config YAML is loaded.
 	// Only apply when CloudKit backfill is enabled — otherwise leave the

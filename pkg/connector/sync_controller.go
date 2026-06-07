@@ -771,8 +771,18 @@ func (c *IMClient) setContactsReady(log zerolog.Logger) {
 	} else {
 		log.Info().Msg("Re-syncing contact names for ghosts and group portals")
 	}
-	go c.refreshGhostNamesFromContacts(log)
 	go c.refreshGroupPortalNamesFromContacts(log)
+	// Ghost names first, THEN DM titles — in one sequence so they go hand in
+	// hand: refreshGhostNamesFromContacts updates ghost.Name synchronously, then
+	// refreshDMPortalNamesFromContacts recomputes each DM title from the FRESH
+	// name plus the current focus state (contact name + 🌙, or DefaultChatName to
+	// release when available). This keeps the moon preserved across restarts and
+	// ensures a contact-name change and the status indicator update together,
+	// never in two racing loops.
+	go func() {
+		c.refreshGhostNamesFromContacts(log)
+		c.refreshDMPortalNamesFromContacts(log)
+	}()
 	// Presence subscription only needs to run on first-ready and whenever new
 	// StatusKit keys arrive (via OnKeysReceived). The ghost set doesn't change
 	// per periodic contact-sync tick; re-subscribing every 15 minutes just
@@ -1621,6 +1631,80 @@ func (c *IMClient) refreshGroupPortalNamesFromContacts(log zerolog.Logger) {
 		updated++
 	}
 	log.Info().Int("updated", updated).Int("total_groups", total).Msg("Refreshed group portal names from contacts")
+}
+
+// refreshDMPortalNamesFromContacts re-applies each DM's title on every contact
+// sync so the iMessage Focus/DND moon (see computeDMTitle) can never be dropped.
+// The title is recomputed from the SAME helper the live focus path uses, so the
+// periodic refresh PRESERVES the 🌙 (and a focus toggle missed while the bridge
+// was down — or one short-circuited by the restart-warm dedup in OnStatusUpdate
+// — is corrected on the next tick). Mirrors refreshGroupPortalNamesFromContacts
+// but for DMs, gated on the composed TITLE (not the bare name) so the moon bit
+// flipping is not skipped. Groups are left to refreshGroupPortalNamesFromContacts;
+// the moon is never written to a ghost's global displayname, so it never fans
+// "changed their name" member events into shared rooms.
+func (c *IMClient) refreshDMPortalNamesFromContacts(log zerolog.Logger) {
+	ctx := context.Background()
+
+	portals, err := c.Main.Bridge.GetAllPortalsWithMXID(ctx)
+	if err != nil {
+		log.Err(err).Msg("Failed to load portals for DM title refresh")
+		return
+	}
+
+	updated := 0
+	total := 0
+	for _, portal := range portals {
+		if portal.Receiver != c.UserLogin.ID || portal.MXID == "" {
+			continue
+		}
+		// DMs only — groups have one shared title (handled elsewhere). Self-chat
+		// is included: it's a DM and gets the moon like any other.
+		if portal.RoomType != database.RoomTypeDM {
+			continue
+		}
+		total++
+
+		// Only touch DMs we should: silenced (apply 🌙) or already owned
+		// (NameIsCustom — maintain it or clear the moon). Leave pristine,
+		// never-silenced DMs on implicit naming — portal.Name may be empty for
+		// them, so stamping would mass-seize NameIsCustom (and freeze ghost
+		// avatars) across every DM on the first tick.
+		if !c.isPortalSilenced(ctx, portal.ID) && !portal.NameIsCustom {
+			continue
+		}
+		// Recompute the title (contact name + 🌙 when silenced) or, when
+		// available-but-still-owned, DefaultChatName to release the title back
+		// to the framework. Because this runs right after the ghost-name pass
+		// (see dispatch), the contact name is fresh — name change and status
+		// check go hand in hand. Skip no-op moon-title rewrites; DefaultChatName
+		// must proceed so it releases ownership and restores name + avatar.
+		nameField := c.dmFocusName(ctx, portal)
+		if nameField != bridgev2.DefaultChatName && (*nameField == "" || *nameField == portal.Name) {
+			continue
+		}
+
+		c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
+			EventMeta: simplevent.EventMeta{
+				Type: bridgev2.RemoteEventChatInfoChange,
+				PortalKey: networkid.PortalKey{
+					ID:       portal.ID,
+					Receiver: c.UserLogin.ID,
+				},
+				LogContext: func(lc zerolog.Context) zerolog.Context {
+					return lc.Str("portal_mxid", string(portal.MXID)).Str("source", "dm_title_refresh")
+				},
+			},
+			ChatInfoChange: &bridgev2.ChatInfoChange{
+				ChatInfo: &bridgev2.ChatInfo{
+					Name:                       nameField,
+					ExcludeChangesFromTimeline: true,
+				},
+			},
+		})
+		updated++
+	}
+	log.Info().Int("updated", updated).Int("total_dms", total).Msg("Refreshed DM titles (focus moon) from contacts")
 }
 
 // contactsWaitTimeout is how long CloudKit sync waits for the contacts
