@@ -8127,8 +8127,8 @@ func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMess
 // 90-second timeout. When Rust stalls on a network hang or an unrecognised
 // attachment format the goroutine would otherwise block forever; the timeout
 // frees the semaphore slot so other downloads can proceed. The inner goroutine
-// is leaked until Rust eventually unblocks, but that is bounded to at most 32
-// goroutines and is temporary.
+// is leaked until Rust eventually unblocks, but that is bounded by
+// attachmentMaxParallelDownloads and is temporary.
 func safeCloudDownloadAttachment(client *rustpushgo.Client, recordName string) ([]byte, error) {
 	type dlResult struct {
 		data []byte
@@ -8285,9 +8285,9 @@ func (c *IMClient) downloadAndUploadAttachment(
 	// Remux/transcode non-MP4 videos to MP4 for broad Matrix client compatibility.
 	// Goes through transcodeToMP4 so this CloudKit-backfill path shares the same
 	// process-wide serialization and retry as the live and chat.db paths — the
-	// pre-upload runs up to 32 of these goroutines at once, so without the
-	// shared semaphore a low-memory host could have 32 ffmpeg re-encodes
-	// running simultaneously and OOM.
+	// pre-upload runs up to attachmentMaxParallelDownloads of these goroutines at
+	// once, so without the shared semaphore a low-memory host could have several
+	// ffmpeg re-encodes running simultaneously and OOM.
 	if c.Main.Config.VideoTranscoding && ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
 		origMime := mimeType
 		origSize := len(data)
@@ -8516,9 +8516,14 @@ func (c *IMClient) downloadAndUploadAttachment(
 }
 
 const (
-	// attachmentMaxParallelDownloads caps the number of concurrent CloudKit
-	// downloads during pre-upload — bounds sockets/fds/goroutines.
-	attachmentMaxParallelDownloads = 32
+	// attachmentMaxParallelDownloads caps the number of concurrent attachment
+	// pipelines during pre-upload — each goroutine runs a full CloudKit
+	// download → transcode → Matrix upload, so this bounds the upload fan-out
+	// against the homeserver as well as sockets/fds/goroutines. Kept modest
+	// (well below the old value of 32) so a backfill doesn't hammer the Matrix
+	// media repo with dozens of simultaneous uploads. The per-item memory cost
+	// is bounded separately by attachmentByteSem.
+	attachmentMaxParallelDownloads = 8
 	// attachmentMaxInFlightBytes caps the total attachment payload resident in
 	// memory at once across the pre-upload fan-out. Each in-flight download
 	// holds its blob (and briefly its transcoded copy ≈ 2× this budget) in RAM,
@@ -8554,7 +8559,7 @@ var attachmentByteSem = semaphore.NewWeighted(attachmentMaxInFlightBytes)
 // -1,676,737,818, i.e. a ~2.6 GB blob wrapped past int32) must be treated as
 // WORST CASE, not as free. The old code returned weight 1 for fileSize < 1,
 // which defeated the budget entirely: a multi-GB download with a bogus size
-// cost one byte of budget, so 32 of them ran concurrently and OOM-killed the
+// cost one byte of budget, so a full fan-out of them ran concurrently and OOM-killed the
 // host (resident set blew past 5 GB before the kernel reaped the process).
 // Charging the full budget makes an unknown-size blob acquire the whole
 // semaphore and run ALONE, bounding peak resident bytes to a single download
@@ -8773,7 +8778,7 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 }
 
 // preUploadChunkAttachments downloads and uploads any uncached attachments in
-// the given rows in parallel (up to 32 concurrent). Called inline during
+// the given rows in parallel (up to attachmentMaxParallelDownloads concurrent). Called inline during
 // forward backfill before the sequential conversion loop, so that
 // downloadAndUploadAttachment gets instant cache hits instead of doing
 // sequential 90s CloudKit downloads that hang the portal event loop.
