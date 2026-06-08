@@ -3709,9 +3709,27 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	// when CanBackfill=true). Creating tasks before rooms exist causes a race:
 	// the backfill queue picks up the task, finds portal.MXID=="", and
 	// permanently deletes it via deleteBackfillQueueTaskIfRoomDoesNotExist.
+	// Don't reset portals that are already fully backfilled with nothing new
+	// since — resetting them re-runs the whole backward backfill on every
+	// startup (a ~30-minute boot on a 1,480-chat account that just re-confirms
+	// "no messages to backfill"). Portals with new/newly-decrypted content
+	// (fresh row writes since completed_at) are NOT in this set, so they still
+	// reset and re-backfill. bridgev2 won't re-enqueue the skipped ones either:
+	// their rooms already exist and ChatResync only triggers catchup when
+	// LatestMessageTS advances.
+	skipReset, err := c.cloudStore.portalsFullyBackfilledNoNewContent(ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to compute already-backfilled portals; resetting all (slower startup)")
+		skipReset = nil
+	}
 	resetCount := 0
 	skippedNoRoom := 0
+	skippedAlreadyDone := 0
 	for _, portalID := range ordered {
+		if skipReset[portalID] {
+			skippedAlreadyDone++
+			continue
+		}
 		portalKey := networkid.PortalKey{
 			ID:       networkid.PortalID(portalID),
 			Receiver: c.UserLogin.ID,
@@ -3739,11 +3757,12 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			resetCount++
 		}
 	}
-	if resetCount > 0 || skippedNoRoom > 0 {
+	if resetCount > 0 || skippedNoRoom > 0 || skippedAlreadyDone > 0 {
 		log.Info().
 			Int("reset_count", resetCount).
 			Int("skipped_no_room", skippedNoRoom).
-			Msg("Backward backfill task setup (rooms without tasks reset, new portals deferred to ChatResync)")
+			Int("skipped_already_done", skippedAlreadyDone).
+			Msg("Backward backfill task setup (rooms without tasks reset, already-complete portals left done, new portals deferred to ChatResync)")
 		if resetCount > 0 {
 			c.Main.Bridge.WakeupBackfillQueue()
 		}

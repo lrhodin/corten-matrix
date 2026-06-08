@@ -3167,6 +3167,44 @@ func (s *cloudBackfillStore) loadAttachmentCacheJSON(ctx context.Context) (map[s
 	return cache, rows.Err()
 }
 
+// portalsFullyBackfilledNoNewContent returns the set of portal_ids whose
+// backfill task is already done AND have no cloud_message rows written since
+// that backfill completed. On restart these are skipped instead of being reset
+// to is_done=false and re-backfilled — which on a large account (James: 1,480
+// chats) is a ~30-minute startup that re-confirms "no messages to backfill"
+// for nearly every portal.
+//
+// The freshness test keys on created_ts/updated_ts (when the ROW was written,
+// ms) versus completed_at (ns), NOT the message timestamp. That way it still
+// re-backfills a portal when a previously-undecryptable record becomes
+// readable on a version-upgrade re-sync — those land as freshly-written rows
+// with old message times, so message-time alone would wrongly skip them.
+func (s *cloudBackfillStore) portalsFullyBackfilledNoNewContent(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT bt.portal_id
+		FROM backfill_task bt
+		WHERE bt.user_login_id=$1 AND bt.is_done=1 AND bt.completed_at > 0
+		  AND NOT EXISTS (
+		    SELECT 1 FROM cloud_message cm
+		    WHERE cm.login_id=$1 AND cm.portal_id=bt.portal_id AND cm.deleted=FALSE
+		      AND MAX(cm.created_ts, cm.updated_ts) > bt.completed_at/1000000
+		  )
+	`, s.loginID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	skip := make(map[string]bool)
+	for rows.Next() {
+		var portalID string
+		if err := rows.Scan(&portalID); err != nil {
+			return nil, err
+		}
+		skip[portalID] = true
+	}
+	return skip, rows.Err()
+}
+
 // loadDeadAttachments returns every record_name tombstoned as permanently
 // un-downloadable for this login. The caller seeds an in-memory set so
 // pre-upload and the portal loop skip these without touching CloudKit.
