@@ -20,8 +20,10 @@ import (
 	"html"
 	"image"
 	"image/jpeg"
+	"io"
 	"math"
 	"net/url"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -8197,6 +8199,173 @@ func safeCloudDownloadAttachmentAvid(client *rustpushgo.Client, recordName strin
 	}
 }
 
+// maxFFIReturnableBytes is the largest attachment we can return as bytes over
+// the uniffi FFI. uniffi packs a returned Vec<u8> into a RustBuffer whose
+// length and capacity are i32, so a blob ≥ i32::MAX (~2.15 GB) panics on the
+// way out ("buffer capacity cannot fit into a i32."). Gate a touch under the
+// hard limit to leave headroom for Vec capacity overshoot.
+const maxFFIReturnableBytes = 2_000_000_000 // ~1.86 GiB, < i32::MAX
+
+// oversizedDownloadTimeout bounds the to-file download of a multi-GB blob.
+// These legitimately take minutes over CloudKit, so it's far longer than the
+// in-memory path's 90s.
+const oversizedDownloadTimeout = 10 * time.Minute
+
+// attachmentExceedsFFILimit reports whether an attachment's reported size means
+// its bytes can't be returned over the FFI and must be streamed via a temp file
+// instead. CloudKit reports a blob ≥ 2 GiB with a NEGATIVE (i32-wrapped)
+// file_size (e.g. -1,676,737,818 ≈ a 2.6 GB file), so a negative value is the
+// tell; a value above the gate (if stored un-wrapped) counts too. A file_size
+// of 0 (unknown) is NOT treated as oversized — most such attachments are small,
+// and the in-memory path's panic-recovery still catches a surprise.
+func attachmentExceedsFFILimit(fileSize int64) bool {
+	return fileSize < 0 || fileSize > maxFFIReturnableBytes
+}
+
+// safeCloudDownloadAttachmentToFile wraps the to-file FFI download with the same
+// panic recovery as safeCloudDownloadAttachment and a generous timeout. rustpush
+// writes the blob to destPath (never returning it over the i32-limited FFI) and
+// returns the byte count.
+func safeCloudDownloadAttachmentToFile(client *rustpushgo.Client, recordName, destPath string) (uint64, error) {
+	type dlResult struct {
+		n   uint64
+		err error
+	}
+	ch := make(chan dlResult, 1)
+	go func() {
+		var res dlResult
+		defer func() {
+			if r := recover(); r != nil {
+				stack := string(debug.Stack())
+				log.Error().Str("ffi_method", "CloudDownloadAttachmentToFile").
+					Str("record_name", recordName).
+					Str("stack", stack).
+					Msgf("FFI panic recovered: %v", r)
+				res = dlResult{err: fmt.Errorf("FFI panic in CloudDownloadAttachmentToFile: %v", r)}
+			}
+			ch <- res
+		}()
+		n, e := client.CloudDownloadAttachmentToFile(recordName, destPath)
+		res = dlResult{n: n, err: e}
+	}()
+	select {
+	case res := <-ch:
+		return res.n, res.err
+	case <-time.After(oversizedDownloadTimeout):
+		log.Error().Str("ffi_method", "CloudDownloadAttachmentToFile").
+			Str("record_name", recordName).
+			Msg("CloudDownloadAttachmentToFile timed out")
+		return 0, fmt.Errorf("CloudDownloadAttachmentToFile timed out after %s", oversizedDownloadTimeout)
+	}
+}
+
+// streamOversizedAttachment handles an attachment too large to return over the
+// FFI. rustpush writes it to a temp file, then UploadMediaStream streams it from
+// disk straight to Matrix (via its ReplacementFile path) — so neither Go nor the
+// homeserver upload ever holds the multi-GB blob in memory. Transcode/HEIC/
+// thumbnail are skipped: they all need the bytes resident and make no sense for
+// a multi-GB video. The homeserver's own media size limit then applies inside
+// UploadMediaStream (so a blob bigger than the server allows fails cleanly, not
+// as a lazy skip). Returns nil on any failure so the caller drops the item.
+func (c *IMClient) streamOversizedAttachment(
+	ctx context.Context,
+	row cloudMessageRow,
+	sender bridgev2.EventSender,
+	ts time.Time,
+	i int,
+	att cloudAttachmentRow,
+	attID string,
+) []*bridgev2.BackfillMessage {
+	log := c.Main.Bridge.Log.With().Str("component", "cloud_backfill").Logger()
+	intent := c.Main.Bridge.Bot
+
+	mimeType := att.MimeType
+	fileName := att.Filename
+	if mimeType == "" {
+		mimeType = utiToMIME(att.UTIType)
+	}
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	if fileName == "" {
+		fileName = "attachment"
+	}
+
+	tmp, err := os.CreateTemp("", "mautrix-cloud-oversized-*")
+	if err != nil {
+		log.Warn().Err(err).Str("record_name", att.RecordName).
+			Msg("Oversized attachment: failed to create temp file, skipping")
+		return nil
+	}
+	tmpPath := tmp.Name()
+	_ = tmp.Close()
+	// Remove the temp file on every exit path. UploadMediaStream also removes
+	// the ReplacementFile once it takes ownership; a double remove is harmless.
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	n, err := safeCloudDownloadAttachmentToFile(c.client, att.RecordName, tmpPath)
+	if err != nil {
+		fe := c.recordAttachmentFailure(att.RecordName, err.Error())
+		log.Warn().Err(err).Str("guid", row.GUID).Str("record_name", att.RecordName).
+			Int("attempt", fe.retries).
+			Msg("Failed to download oversized CloudKit attachment, skipping")
+		return nil
+	}
+	if n == 0 {
+		c.recordAttachmentFailure(att.RecordName, "empty data")
+		log.Debug().Str("guid", row.GUID).Str("record_name", att.RecordName).
+			Msg("Oversized CloudKit attachment returned empty data")
+		return nil
+	}
+
+	url, encFile, err := intent.UploadMediaStream(ctx, "", int64(n), true,
+		func(_ io.Writer) (*bridgev2.FileStreamResult, error) {
+			return &bridgev2.FileStreamResult{
+				FileName:        fileName,
+				MimeType:        mimeType,
+				ReplacementFile: tmpPath,
+			}, nil
+		})
+	if err != nil {
+		fe := c.recordAttachmentFailure(att.RecordName, err.Error())
+		log.Warn().Err(err).Str("guid", row.GUID).Str("record_name", att.RecordName).
+			Int64("size", int64(n)).Int("attempt", fe.retries).
+			Msg("Failed to stream oversized attachment to Matrix, skipping")
+		return nil
+	}
+
+	content := &event.MessageEventContent{
+		MsgType: mimeToMsgType(mimeType),
+		Body:    fileName,
+		Info: &event.FileInfo{
+			MimeType: mimeType,
+			Size:     int(n),
+		},
+	}
+	if encFile != nil {
+		content.File = encFile
+	} else {
+		content.URL = url
+	}
+	c.failedAttachments.Delete(att.RecordName)
+	// Intentionally NOT cached in attachmentContentCache: the temp file is gone
+	// after upload, and these are rare — a cache miss just re-streams on retry.
+	log.Info().Str("guid", row.GUID).Str("record_name", att.RecordName).
+		Int64("bytes", int64(n)).Str("mime", mimeType).Int("att_index", i).
+		Msg("Streamed oversized attachment to Matrix from disk (no in-memory buffer)")
+	return []*bridgev2.BackfillMessage{{
+		Sender:    sender,
+		ID:        makeMessageID(attID),
+		Timestamp: ts,
+		ConvertedMessage: &bridgev2.ConvertedMessage{
+			Parts: []*bridgev2.ConvertedMessagePart{{
+				Type:    event.EventMessage,
+				Content: content,
+			}},
+		},
+	}}
+}
+
 // downloadAndUploadAttachment handles a single attachment: download from CloudKit,
 // upload to Matrix, return as a backfill message.
 func (c *IMClient) downloadAndUploadAttachment(
@@ -8242,6 +8411,17 @@ func (c *IMClient) downloadAndUploadAttachment(
 				},
 			}}
 		}
+	}
+
+	// Oversized attachments can't be returned as bytes over the FFI: uniffi
+	// lowers a returned Vec<u8> into an i32-capped RustBuffer, so a blob ≥ 2 GiB
+	// panics on the way out ("buffer capacity cannot fit into a i32.") even
+	// though the download itself succeeds. Stream those straight from disk to
+	// Matrix instead of buffering them in memory to hand across the boundary.
+	// Live Photos (HasAvid) use a separate avid path below — leave them to it;
+	// they're never multi-GB.
+	if attachmentExceedsFFILimit(att.FileSize) && !att.HasAvid {
+		return c.streamOversizedAttachment(ctx, row, sender, ts, i, att, attID)
 	}
 
 	// Download the lqa (still image) — this is always the baseline.

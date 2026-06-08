@@ -12135,6 +12135,35 @@ impl Client {
         .await
     }
 
+    /// Download an attachment to a file on disk instead of returning the bytes
+    /// over the FFI.
+    ///
+    /// uniffi lowers a returned `Vec<u8>` into a `RustBuffer` whose length and
+    /// capacity are `i32`, so any blob ≥ 2 GiB panics on the way out of
+    /// `cloud_download_attachment` ("buffer capacity cannot fit into a i32.")
+    /// even though the download itself succeeded — CloudKit reports such sizes
+    /// as a NEGATIVE (i32-wrapped) file_size, e.g. -1,676,737,818 for a ~2.6 GB
+    /// blob. The Go side routes those oversized attachments here: we run the
+    /// normal download path by calling `cloud_download_attachment` in-process
+    /// (a plain Rust call — no uniffi lowering, so no i32 panic), stream the
+    /// bytes to `dest_path`, and return only the length. Nothing large crosses
+    /// the FFI boundary. The caller reads the file back and removes it.
+    pub async fn cloud_download_attachment_to_file(
+        &self,
+        record_name: String,
+        dest_path: String,
+    ) -> Result<u64, WrappedError> {
+        let bytes = self.cloud_download_attachment(record_name.clone()).await?;
+        let len = bytes.len() as u64;
+        std::fs::write(&dest_path, &bytes).map_err(|e| WrappedError::GenericError {
+            msg: format!(
+                "cloud_download_attachment_to_file {}: write {}: {e}",
+                record_name, dest_path
+            ),
+        })?;
+        Ok(len)
+    }
+
     // Ford recovery helper lives in a separate non-uniffi impl block below
     // (`impl WrappedClient { ford_recovery_download ... }`) — it takes
     // non-FFI reference types and uniffi can't codegen wrappers for it.

@@ -511,6 +511,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_cloud_download_attachment_to_file(uniffiStatus)
+		})
+		if checksum != 3625 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_cloud_download_attachment_to_file: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_cloud_download_group_photo(uniffiStatus)
 		})
 		if checksum != 31376 {
@@ -2323,6 +2332,31 @@ func (_self *Client) CloudDownloadAttachmentAvid(recordName string) ([]byte, err
 		FfiConverterBytesINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) CloudDownloadAttachmentToFile(recordName string, destPath string) (uint64, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_cloud_download_attachment_to_file(
+				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(recordName)), rustBufferToC(FfiConverterStringINSTANCE.Lower(destPath)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_u64(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) C.uint64_t {
+			// completeFunc
+			return C.ffi_rustpushgo_rust_future_complete_u64(unsafe.Pointer(handle), status)
+		},
+		FfiConverterUint64INSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_u64(unsafe.Pointer(rustFuture), status)
 		})
 }
 

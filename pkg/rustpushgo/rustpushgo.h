@@ -102,6 +102,13 @@ void* uniffi_rustpushgo_fn_method_client_cloud_download_attachment_avid(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_cloud_download_attachment_to_file(
+	void* ptr,
+	RustBuffer record_name,
+	RustBuffer dest_path,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_cloud_download_group_photo(
 	void* ptr,
 	RustBuffer record_name,
@@ -1575,6 +1582,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_cloud_download_attachment(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_cloud_download_attachment_avid(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_cloud_download_attachment_to_file(
 	RustCallStatus* out_status
 );
 
