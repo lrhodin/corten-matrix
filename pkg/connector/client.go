@@ -20,7 +20,6 @@ import (
 	"html"
 	"image"
 	"image/jpeg"
-	"io"
 	"math"
 	"net/url"
 	"os"
@@ -8199,19 +8198,17 @@ func safeCloudDownloadAttachmentAvid(client *rustpushgo.Client, recordName strin
 	}
 }
 
-// maxInMemoryAttachmentBytes is the cutoff above which an attachment is
-// transcoded and uploaded straight from disk instead of being read back into a
-// Go []byte for the in-memory pipeline. The download already lands on disk; the
-// in-memory path then reads the WHOLE file into RAM and transcodes it via
-// ConvertBytes (input AND output buffers resident at once), so a single ~1.6 GB
-// video spikes ~3–5 GB of RAM. Above this cutoff we use streamAttachmentFromFile,
-// which transcodes file→file on disk (tiny working set) and streams the upload
-// from disk — peak RAM stays flat regardless of file size. Sized at the typical
-// homeserver upload limit: a file bigger than that gets rejected on upload
-// anyway, so there's no reason to spend RAM processing it. (The i32 RustBuffer
-// panic is already prevented upstream by always downloading via the to-file FFI;
-// this threshold is purely about not pulling large blobs into memory.)
-const maxInMemoryAttachmentBytes = 100 * 1024 * 1024 // 100 MiB
+// maxBridgeableAttachmentBytes is the hard ceiling for bridging an attachment.
+// Anything larger is skipped outright — never downloaded, transcoded, or
+// uploaded. iMessage caps inline attachments at ~100 MB (larger files are sent
+// via Mail Drop as links, not inline assets), and Matrix homeservers (Beeper:
+// 100 MiB) reject larger uploads — so a multi-GB CloudKit blob can't render in
+// any client anyway. Attempting one just burns a multi-GB download buffer (in
+// Rust, outside the Go heap), a doomed transcode, and disk for a guaranteed
+// rejection — and a 3 GB video can wedge a small host outright. CloudKit
+// reports the size as a wrapped i32, so a blob in [2 GiB, 4 GiB) surfaces as a
+// NEGATIVE file_size; treat negative (or over the cap) as over-limit.
+const maxBridgeableAttachmentBytes = 100 * 1024 * 1024 // 100 MiB
 
 // oversizedDownloadTimeout bounds the to-file download of a multi-GB blob.
 // These legitimately take minutes over CloudKit, so it's far longer than the
@@ -8263,43 +8260,6 @@ func safeCloudDownloadAttachmentToFile(client *rustpushgo.Client, recordName, de
 	}
 }
 
-// transcodeFileToMP4 remuxes (cheap) or, failing that, re-encodes a video FILE
-// to an MP4 FILE on disk. Unlike transcodeToMP4's ConvertBytes — which loads the
-// whole input and output into memory — this streams input→output through ffmpeg
-// on disk, so it's safe for the multi-GB attachments handled by
-// streamAttachmentFromFile. Serialized against all other transcodes via
-// transcodeSem (one ffmpeg at a time → bounded CPU/memory on small or
-// single-core hosts). The remux pass is near-free when the source is already
-// H.264/HEVC in a non-MP4 container — the common case — sparing a slow re-encode
-// (which on a single core can take hours for a large video). Returns the output
-// path (caller removes it) or an error (caller ships the original).
-func transcodeFileToMP4(ctx context.Context, log *zerolog.Logger, inputPath string) (string, error) {
-	outPath := inputPath + ".mp4"
-	// Detach from a short inbound deadline so it can't abort the encode mid-run,
-	// matching transcodeToMP4. A large encode on a single core is genuinely long.
-	base := context.WithoutCancel(ctx)
-	transcodeSem <- struct{}{}
-	defer func() { <-transcodeSem }()
-	// Attempt 1: stream-copy remux — rewrap the container, no re-encode.
-	err := ffmpeg.ConvertPathWithDestination(base, inputPath, outPath, nil,
-		[]string{"-c", "copy", "-movflags", "+faststart"}, false)
-	if err == nil {
-		return outPath, nil
-	}
-	log.Debug().Err(err).Str("input", inputPath).
-		Msg("Oversized video remux failed, falling back to full re-encode")
-	_ = os.Remove(outPath)
-	// Attempt 2: full re-encode (codec incompatible with a plain remux).
-	err = ffmpeg.ConvertPathWithDestination(base, inputPath, outPath, nil,
-		[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
-			"-c:a", "aac", "-movflags", "+faststart"}, false)
-	if err != nil {
-		_ = os.Remove(outPath)
-		return "", err
-	}
-	return outPath, nil
-}
-
 // downloadAttachmentToTempFile downloads an attachment to a fresh temp file via
 // the to-file FFI. This is the single, uniform download path: it never lowers a
 // Vec over uniffi's i32-capped RustBuffer (so no "buffer too large" panic), it
@@ -8328,120 +8288,6 @@ func (c *IMClient) downloadAttachmentToTempFile(recordName string) (string, int6
 	return tmpPath, int64(n), nil
 }
 
-// streamAttachmentFromFile uploads an already-downloaded attachment from disk
-// straight to Matrix (via UploadMediaStream's ReplacementFile) — so neither Go
-// nor the homeserver upload holds the blob in memory. When video transcoding is
-// enabled the file is transcoded disk→disk first (remux when possible, else
-// re-encode). HEIC/thumbnail are skipped (those need the bytes resident and are
-// meaningless for a multi-GB video). The homeserver's own media size limit then
-// applies inside UploadMediaStream (so a blob bigger than the server allows
-// fails cleanly, not as a lazy skip). The caller owns tmpPath; this never
-// deletes it (though UploadMediaStream may consume it as the ReplacementFile
-// when no transcode happens). Returns nil on any failure so the caller drops
-// the item.
-func (c *IMClient) streamAttachmentFromFile(
-	ctx context.Context,
-	row cloudMessageRow,
-	sender bridgev2.EventSender,
-	ts time.Time,
-	i int,
-	att cloudAttachmentRow,
-	attID string,
-	tmpPath string,
-	n int64,
-) []*bridgev2.BackfillMessage {
-	log := c.Main.Bridge.Log.With().Str("component", "cloud_backfill").Logger()
-	intent := c.Main.Bridge.Bot
-
-	mimeType := att.MimeType
-	fileName := att.Filename
-	if mimeType == "" {
-		mimeType = utiToMIME(att.UTIType)
-	}
-	if mimeType == "" {
-		mimeType = "application/octet-stream"
-	}
-	if fileName == "" {
-		fileName = "attachment"
-	}
-
-	// What we'll stream up: the downloaded file as-is, unless we transcode.
-	uploadPath := tmpPath
-	uploadMime := mimeType
-	uploadName := fileName
-
-	// Power through a transcode even for these multi-GB videos when enabled —
-	// but disk→disk (see transcodeFileToMP4), never ConvertBytes, so ffmpeg
-	// streams through its own small working set instead of us loading the whole
-	// blob into RAM. On failure we ship the original rather than drop it.
-	if c.Main.Config.VideoTranscoding && ffmpeg.Supported() &&
-		strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
-		if outPath, convErr := transcodeFileToMP4(ctx, &log, tmpPath); convErr != nil {
-			log.Warn().Err(convErr).Str("guid", row.GUID).Str("record_name", att.RecordName).
-				Msg("Oversized video transcode failed after fallback, streaming original")
-		} else {
-			defer func() { _ = os.Remove(outPath) }()
-			uploadPath = outPath
-			uploadMime = "video/mp4"
-			uploadName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".mp4"
-			log.Info().Str("guid", row.GUID).Str("record_name", att.RecordName).
-				Msg("Transcoded oversized video to MP4 on disk")
-		}
-	}
-
-	uploadSize := int64(n)
-	if fi, statErr := os.Stat(uploadPath); statErr == nil {
-		uploadSize = fi.Size()
-	}
-
-	url, encFile, err := intent.UploadMediaStream(ctx, "", uploadSize, true,
-		func(_ io.Writer) (*bridgev2.FileStreamResult, error) {
-			return &bridgev2.FileStreamResult{
-				FileName:        uploadName,
-				MimeType:        uploadMime,
-				ReplacementFile: uploadPath,
-			}, nil
-		})
-	if err != nil {
-		fe := c.recordAttachmentFailure(att.RecordName, err.Error())
-		log.Warn().Err(err).Str("guid", row.GUID).Str("record_name", att.RecordName).
-			Int64("size", uploadSize).Int("attempt", fe.retries).
-			Msg("Failed to stream oversized attachment to Matrix, skipping")
-		return nil
-	}
-
-	content := &event.MessageEventContent{
-		MsgType: mimeToMsgType(uploadMime),
-		Body:    uploadName,
-		Info: &event.FileInfo{
-			MimeType: uploadMime,
-			Size:     int(uploadSize),
-		},
-	}
-	if encFile != nil {
-		content.File = encFile
-	} else {
-		content.URL = url
-	}
-	c.failedAttachments.Delete(att.RecordName)
-	// Intentionally NOT cached in attachmentContentCache: the temp file is gone
-	// after upload, and these are rare — a cache miss just re-streams on retry.
-	log.Info().Str("guid", row.GUID).Str("record_name", att.RecordName).
-		Int64("bytes", uploadSize).Str("mime", uploadMime).Int("att_index", i).
-		Msg("Streamed oversized attachment to Matrix from disk (no in-memory buffer)")
-	return []*bridgev2.BackfillMessage{{
-		Sender:    sender,
-		ID:        makeMessageID(attID),
-		Timestamp: ts,
-		ConvertedMessage: &bridgev2.ConvertedMessage{
-			Parts: []*bridgev2.ConvertedMessagePart{{
-				Type:    event.EventMessage,
-				Content: content,
-			}},
-		},
-	}}
-}
-
 // downloadAndUploadAttachment handles a single attachment: download from CloudKit,
 // upload to Matrix, return as a backfill message.
 func (c *IMClient) downloadAndUploadAttachment(
@@ -8459,6 +8305,22 @@ func (c *IMClient) downloadAndUploadAttachment(
 	attID := row.GUID
 	if i > 0 || hasText {
 		attID = fmt.Sprintf("%s_att%d", row.GUID, i)
+	}
+
+	// Skip over-limit attachments before doing ANY work. A blob bigger than the
+	// bridgeable ceiling can't be uploaded (homeserver rejects it) and can't
+	// render in any client, so downloading + transcoding it is pure waste — and
+	// a multi-GB download wedges small hosts. file_size is a wrapped i32, so
+	// blobs ≥ 2 GiB surface as negative; treat negative or over-cap as too big.
+	// Not recorded as a retriable failure — it's permanently too large.
+	if att.FileSize < 0 || att.FileSize > maxBridgeableAttachmentBytes {
+		log.Info().
+			Str("guid", row.GUID).
+			Str("att_guid", att.GUID).
+			Str("record_name", att.RecordName).
+			Int64("file_size", att.FileSize).
+			Msg("Skipping over-limit attachment — too large to bridge (not downloaded)")
+		return nil
 	}
 
 	// Cache hit: preUploadCloudAttachments already downloaded and uploaded this
@@ -8513,12 +8375,19 @@ func (c *IMClient) downloadAndUploadAttachment(
 		return nil
 	}
 
-	// Too big to safely pull into a Go []byte for the in-memory pipeline
-	// (HEIC/thumbnail/transcode) — reading + transcoding a large file in memory
-	// spikes several GB per attachment. Stream it from disk straight to Matrix,
-	// transcoding video disk→disk. Live Photos keep their separate avid path.
-	if n > maxInMemoryAttachmentBytes && !att.HasAvid {
-		return c.streamAttachmentFromFile(ctx, row, sender, ts, i, att, attID, tmpPath, n)
+	// Backstop the size gate: file_size is a wrapped i32, so a blob in the
+	// [4 GiB, ~4.4 GiB) window wraps to a small POSITIVE value that slips the
+	// pre-download check. Now that we know the real size, drop anything over the
+	// bridgeable ceiling before reading it into memory or transcoding it — it
+	// can't be uploaded and would just spike RAM for a guaranteed rejection.
+	if n > maxBridgeableAttachmentBytes {
+		log.Info().
+			Str("guid", row.GUID).
+			Str("att_guid", att.GUID).
+			Str("record_name", att.RecordName).
+			Int64("bytes", n).
+			Msg("Skipping over-limit attachment — too large to bridge (downloaded size)")
+		return nil
 	}
 
 	// Small enough: read it back for the normal in-memory pipeline.
