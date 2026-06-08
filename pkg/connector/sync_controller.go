@@ -3619,6 +3619,26 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		Int("to_process", len(ordered)).
 		Msg("Creating portals from cloud sync")
 
+	// Portals that are already fully backfilled AND have nothing new written
+	// since (created_ts/updated_ts > completed_at) don't need re-processing on
+	// startup — re-queuing a ChatResync + forward backfill for every one of
+	// them is the bulk of the post-restart churn (and on a large account holds
+	// the APNs buffer while it grinds through chats that find no new messages).
+	//
+	// MESSAGE-SAFE: the cloud sync runs BEFORE this and stamps created_ts AND
+	// updated_ts = now on every message it imports or updates (insert and
+	// ON CONFLICT both bind nowMS). So anything that arrived while the bridge
+	// was down lands with a fresh write-time > completed_at, which keeps its
+	// portal OUT of this skip set — it still gets a ChatResync and catches up.
+	// Only provably-unchanged portals are skipped. Best-effort: on query error
+	// we process everything (slower, never less correct).
+	skipUnchanged, err := c.cloudStore.portalsFullyBackfilledNoNewContent(ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to compute already-backfilled portals; processing all (noisier startup)")
+		skipUnchanged = nil
+	}
+	skippedChatResync := 0
+
 	// Set pendingInitialBackfills BEFORE queuing any portals.
 	// bridgev2 processes ChatResync events concurrently (QueueRemoteEvent is
 	// async), so FetchMessages(Forward=true) calls — and their
@@ -3643,6 +3663,14 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 
 	created := 0
 	for i, portalID := range ordered {
+		// Skip re-queuing portals that are already backfilled with nothing new
+		// (see skipUnchanged above). Their rooms exist (is_done implies a room)
+		// and offline messages would have excluded them from the set, so there's
+		// nothing to catch up. New/changed portals fall through and re-queue.
+		if skipUnchanged[portalID] {
+			skippedChatResync++
+			continue
+		}
 		portalKey := networkid.PortalKey{
 			ID:       networkid.PortalID(portalID),
 			Receiver: c.UserLogin.ID,
@@ -3691,6 +3719,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 
 	log.Info().
 		Int("queued", created).
+		Int("skipped_unchanged", skippedChatResync).
 		Int("total", len(ordered)).
 		Dur("elapsed", time.Since(portalStart)).
 		Msg("Finished queuing portals from cloud sync")
@@ -3712,21 +3741,17 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	// Don't reset portals that are already fully backfilled with nothing new
 	// since — resetting them re-runs the whole backward backfill on every
 	// startup (a ~30-minute boot on a 1,480-chat account that just re-confirms
-	// "no messages to backfill"). Portals with new/newly-decrypted content
-	// (fresh row writes since completed_at) are NOT in this set, so they still
-	// reset and re-backfill. bridgev2 won't re-enqueue the skipped ones either:
-	// their rooms already exist and ChatResync only triggers catchup when
+	// "no messages to backfill"). Same skipUnchanged set as the ChatResync
+	// queue above (message-safe — see the comment there). Portals with
+	// new/newly-decrypted content are NOT in the set, so they still reset and
+	// re-backfill. bridgev2 won't re-enqueue the skipped ones either: their
+	// rooms already exist and ChatResync only triggers catchup when
 	// LatestMessageTS advances.
-	skipReset, err := c.cloudStore.portalsFullyBackfilledNoNewContent(ctx)
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to compute already-backfilled portals; resetting all (slower startup)")
-		skipReset = nil
-	}
 	resetCount := 0
 	skippedNoRoom := 0
 	skippedAlreadyDone := 0
 	for _, portalID := range ordered {
-		if skipReset[portalID] {
+		if skipUnchanged[portalID] {
 			skippedAlreadyDone++
 			continue
 		}
