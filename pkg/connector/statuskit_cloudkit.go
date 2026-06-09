@@ -473,11 +473,21 @@ func (c *IMClient) syncCloudStatusKitPeers(ctx context.Context, log zerolog.Logg
 	// flips true and this guard never fires again; if it finds none, the latch
 	// stops further forced walks and a future invitation arrives via the
 	// incremental token as a normal change.
+	//
+	// DrainComplete is part of the trigger so we only ever recover from a walk
+	// that FINISHED (token exhausted) and still produced zero keys — the real
+	// stuck state. A drain that's merely in progress (a large account still
+	// walking, or a bounded-ctx pass cancelled mid-walk before reaching an
+	// invitation page) has DrainComplete=false; it must NOT be disrupted —
+	// dropping its mid-walk token would throw away progress and restart from
+	// scratch. The normal resume floor finishes those instead. A pre-existing
+	// row that predates DrainComplete parses false, so it just takes one extra
+	// (cheap, fetched=0) pass to set DrainComplete before recovery fires.
 	forcedRecoveryRepull := false
-	if sinceToken != nil && !meta.Established && !meta.RecoveryRepullDone {
+	if sinceToken != nil && !meta.Established && meta.DrainComplete && !meta.RecoveryRepullDone {
 		log.Info().
 			Time("parked_token_last_attempt", meta.LastAttempt).
-			Msg("StatusKit-CloudKit pass: cached token but no peer keys ever pulled — forcing a one-shot full re-walk to recover stranded keys")
+			Msg("StatusKit-CloudKit pass: completed walk left a cached token but no peer keys ever pulled — forcing a one-shot full re-walk to recover stranded keys")
 		sinceToken = nil
 		if clrErr := c.cloudStore.clearZoneToken(ctx, statusKitCloudTokenRow); clrErr != nil {
 			log.Info().Err(clrErr).Msg("StatusKit-CloudKit pass: failed to clear token row for recovery re-walk (continuing — FFI still gets a nil token)")
