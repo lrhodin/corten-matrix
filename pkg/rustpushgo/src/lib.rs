@@ -8687,61 +8687,96 @@ impl Client {
             msg: "StatusKit not initialized".into(),
         })?;
 
-        // Contacts may key back under a different handle form than their ghost
-        // ID (e.g. mailto: vs tel:). Augment the ghost list with every "from"
-        // handle persisted in statuskit-state.plist so request_handles matches
-        // all available channels regardless of handle form.
         let ghost_count = handles.len();
-        let mut augmented = handles;
+
+        // Count StatusKit channels per "from" handle from statuskit-state.plist.
+        // request_handles subscribes ALL channels for the handles we pass, and
+        // Apple bounces a single SubscribeToChannels that carries too many channels
+        // ("Subscribe confirmed failed!" from rustpush::aps), which silently kills
+        // ALL inbound presence for a heavily-keyed ("popular") account with
+        // hundreds of Focus-sharing peers. So we bin-pack handles into
+        // channel-budgeted chunks and subscribe each separately. The StatusKit
+        // channel-task accumulates per-channel interest (refcounts), so the union
+        // ends up subscribed; a short pause between chunks lets it drain and emit
+        // each batch as its own small SubscribeToChannels under Apple's ceiling.
+        let mut from_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         {
-            let mut extra: Vec<String> = Vec::new();
             let state_path = subsystem_state_path("statuskit-state.plist");
             if let Ok(data) = std::fs::read(&state_path) {
                 if let Ok(value) = plist::from_bytes::<plist::Value>(&data) {
-                    if let Some(dict) = value.as_dictionary() {
-                        if let Some(keys_dict) = dict.get("keys").and_then(|v| v.as_dictionary()) {
-                            let handle_set: std::collections::HashSet<&str> =
-                                augmented.iter().map(|s| s.as_str()).collect();
-                            for (_channel_id, entry) in keys_dict {
-                                if let Some(from_str) = entry.as_dictionary()
-                                    .and_then(|d| d.get("from"))
-                                    .and_then(|v| v.as_string())
-                                {
-                                    if !handle_set.contains(from_str) {
-                                        extra.push(from_str.to_string());
-                                    }
-                                }
+                    if let Some(keys_dict) = value
+                        .as_dictionary()
+                        .and_then(|d| d.get("keys"))
+                        .and_then(|v| v.as_dictionary())
+                    {
+                        for (_channel_id, entry) in keys_dict {
+                            if let Some(from_str) = entry
+                                .as_dictionary()
+                                .and_then(|d| d.get("from"))
+                                .and_then(|v| v.as_string())
+                            {
+                                *from_counts.entry(from_str.to_string()).or_insert(0) += 1;
                             }
                         }
                     }
                 }
             }
-            augmented.extend(extra);
         }
+        // Make sure every requested ghost handle is represented even if it has no
+        // key yet (so a future reshare for it still lands); it contributes 0
+        // channels and is therefore "free" in the budget.
+        for h in &handles {
+            from_counts.entry(h.clone()).or_insert(0);
+        }
+        let distinct_from = from_counts.len();
 
-        let token = sk.request_handles(&augmented).await;
-        // Replace (not accumulate) interest tokens. subscribe_to_status
-        // may be called multiple times (post-init + post-backfill + future
-        // re-subscribe paths); without clearing, each call leaks the
-        // previous token, pinning stale per-handle subscriptions on
-        // StatusKitClient's internal channel-interest map. Callers treat
-        // this function as "set the current subscription set", matching
-        // OB-Android's `requestHandles(to: [participant])` semantics —
-        // one authoritative interest list per chat activation.
-        {
+        // Greedily bin-pack handles into chunks of <= CHANNEL_BUDGET channels. A
+        // single handle whose channel count exceeds the budget unavoidably forms
+        // its own (over-budget) chunk — request_handles cannot split one handle's
+        // channels — but that is rare and isolates the risk to that one peer.
+        const CHANNEL_BUDGET: usize = 30;
+        let mut chunks: Vec<Vec<String>> = Vec::new();
+        let mut cur: Vec<String> = Vec::new();
+        let mut cur_count = 0usize;
+        for (handle, count) in from_counts {
+            if cur_count + count > CHANNEL_BUDGET && !cur.is_empty() {
+                chunks.push(std::mem::take(&mut cur));
+                cur_count = 0;
+            }
+            cur.push(handle);
+            cur_count += count;
+        }
+        if !cur.is_empty() {
+            chunks.push(cur);
+        }
+        let total_chunks = chunks.len();
+
+        // Subscribe the new chunks, THEN drop the old interest tokens. Holding the
+        // old tokens alive until the new ones are in place keeps shared channels at
+        // refcount >= 1, so we never trigger a bulk unsubscribe (which would itself
+        // overflow Apple's per-subscribe ceiling); only genuinely-removed channels
+        // (a small delta) get torn down when the old tokens finally drop.
+        let old_tokens = {
             let mut tokens = self.statuskit_interest_tokens.lock().await;
-            let prev = tokens.len();
-            tokens.clear();
-            tokens.push(token);
-            if prev > 0 {
-                info!("Dropped {} previous interest token(s) before re-subscribing", prev);
+            std::mem::take(&mut *tokens)
+        };
+        let mut new_tokens = Vec::with_capacity(total_chunks);
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            new_tokens.push(sk.request_handles(&chunk).await);
+            if i + 1 < total_chunks {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         }
+        {
+            let mut tokens = self.statuskit_interest_tokens.lock().await;
+            *tokens = new_tokens;
+        }
+        drop(old_tokens);
+
         info!(
-            "Requested presence subscription for {} handle(s) ({} ghost + {} from keys)",
-            augmented.len(),
-            ghost_count,
-            augmented.len() - ghost_count,
+            "Requested presence subscription in {} channel-budgeted chunk(s) ({} ghost handles, {} distinct from-handles)",
+            total_chunks, ghost_count, distinct_from,
         );
         Ok(())
     }
