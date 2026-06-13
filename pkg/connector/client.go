@@ -321,6 +321,17 @@ type IMClient struct {
 	lastPresenceSubscribe     time.Time
 	lastPresenceSubscribeLock sync.Mutex
 
+	// Trailing-edge coalescing for OnKeysReceived. A key-sharing burst (a
+	// heavily-keyed account at startup fires OnKeysReceived dozens of times in
+	// seconds) would otherwise trigger a full chunked SubscribeToStatus per
+	// event — a storm against Apple that gets worse the more keys a user has.
+	// schedulePresenceSubscribe collapses a burst into ONE re-subscribe that
+	// runs after the burst settles. See schedulePresenceSubscribe.
+	presenceSubscribeLock    sync.Mutex
+	presenceSubscribeGen     uint64
+	presenceSubscribePending bool
+	presenceSubscribeFirstAt time.Time
+
 	// statusKitInviteMu / statusKitNextInviteAt enforce a GLOBAL minimum
 	// interval between StatusKit invite dispatches, shared across every caller:
 	// the periodic sweep, the new-portal hook, and concurrent reconnect-
@@ -2390,8 +2401,8 @@ func (c *IMClient) OnKeysReceived() {
 	log := c.UserLogin.Log.With().
 		Str("component", "statuskit").
 		Logger()
-	log.Info().Msg("StatusKit: key-sharing message received — re-subscribing to presence")
-	go c.subscribeToContactPresence(log)
+	log.Info().Msg("StatusKit: key-sharing message received — scheduling presence re-subscribe")
+	c.schedulePresenceSubscribe(log)
 }
 
 // OnReshareSender is called once per reshare with the peer handle that sent

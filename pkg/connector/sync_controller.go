@@ -793,6 +793,63 @@ func (c *IMClient) setContactsReady(log zerolog.Logger) {
 	}
 }
 
+const (
+	// presenceSubscribeDebounce is the quiet window after the LAST key-sharing
+	// message in a burst before a coalesced re-subscribe fires. Trailing-edge:
+	// the subscribe reads the fully-settled state.keys snapshot, so it never
+	// misses a channel (a prior LEADING-edge debounce swallowed the follow-up
+	// that carried the new channel — see subscribeToContactPresence).
+	presenceSubscribeDebounce = 3 * time.Second
+	// presenceSubscribeMaxWait caps the total delay from the FIRST key in a
+	// burst, so a continuous key stream (a heavily-keyed account whose reshares
+	// trickle in without a 3s gap) can't starve presence indefinitely.
+	presenceSubscribeMaxWait = 30 * time.Second
+)
+
+// schedulePresenceSubscribe coalesces a burst of OnKeysReceived events into a
+// single subscribeToContactPresence call. Each key-sharing message re-arms a
+// trailing-edge timer; the subscribe runs once, presenceSubscribeDebounce after
+// the last key (or presenceSubscribeMaxWait after the first, whichever comes
+// first). This is the pounding fix for heavily-keyed accounts: instead of one
+// full chunked SubscribeToStatus per key (dozens, back-to-back, each larger the
+// more keys the user has), the whole startup burst becomes ONE re-subscribe.
+//
+// A monotonically-increasing generation stamps each arm; only the timer whose
+// generation is still current fires the subscribe, so re-arming is race-free
+// without holding a timer handle. Keys that arrive DURING a running subscribe
+// re-arm a fresh generation, so the tail is always picked up by a follow-up
+// (subscribeToContactPresence serializes via lastPresenceSubscribeLock).
+func (c *IMClient) schedulePresenceSubscribe(log zerolog.Logger) {
+	c.presenceSubscribeLock.Lock()
+	now := time.Now()
+	if !c.presenceSubscribePending {
+		c.presenceSubscribePending = true
+		c.presenceSubscribeFirstAt = now
+	}
+	c.presenceSubscribeGen++
+	gen := c.presenceSubscribeGen
+	delay := presenceSubscribeDebounce
+	if remaining := presenceSubscribeMaxWait - now.Sub(c.presenceSubscribeFirstAt); remaining < delay {
+		if remaining < 0 {
+			remaining = 0
+		}
+		delay = remaining
+	}
+	c.presenceSubscribeLock.Unlock()
+
+	time.AfterFunc(delay, func() {
+		c.presenceSubscribeLock.Lock()
+		if c.presenceSubscribeGen != gen {
+			// A newer key re-armed the timer; this generation is stale.
+			c.presenceSubscribeLock.Unlock()
+			return
+		}
+		c.presenceSubscribePending = false
+		c.presenceSubscribeLock.Unlock()
+		c.subscribeToContactPresence(log)
+	})
+}
+
 // subscribeToContactPresence subscribes to iMessage presence updates for all
 // known ghosts via StatusKit. Presence changes are delivered via
 // OnStatusUpdate and mapped to Matrix ghost presence.
