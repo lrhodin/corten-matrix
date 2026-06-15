@@ -1675,7 +1675,7 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	}
 	rows.Close()
 
-	updated := 0
+	reconciled := 0
 	for _, g := range ghosts {
 		// Skip ghosts with no matching contact (efficiency: avoids loading
 		// the full ghost object for participants who aren't in the address book).
@@ -1687,34 +1687,34 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		if contact == nil || !contact.HasName() {
 			continue
 		}
-		// Diff-gate: compute the expected displayname and skip if it matches
-		// the stored name. This prevents unnecessary Matrix profile update API
-		// calls on every contact refresh cycle (AggressiveUpdateInfo=true means
-		// UpdateInfo always makes an API call; diffing here is our only guard).
-		expectedName := c.Main.Config.FormatDisplayname(DisplaynameParams{
-			FirstName: contact.FirstName,
-			LastName:  contact.LastName,
-			Nickname:  contact.Nickname,
-			ID:        localID,
-		})
-		if g.name == expectedName {
-			continue
-		}
+		// Reconcile the FULL profile (name + avatar + identifiers) every cycle —
+		// NOT just when the name changed. UpdateInfo self-gates: prepareName /
+		// prepareAvatar / prepareContactInfo each compare against the stored
+		// value (prepareName at ghost.go:152 returns false when equal+NameSet),
+		// and pushProfileChanges early-returns when nothing differs. So an
+		// unchanged ghost costs a cached lookup and ZERO Matrix API calls — the
+		// old "AggressiveUpdateInfo always makes an API call" rationale for the
+		// name diff-gate was stale.
+		//
+		// Gating on name alone left identifier/avatar drift unhealed forever for
+		// already-named contacts: a malformed "tel:(845) 536-4690" baked in by an
+		// earlier bug, or a photo that finished downloading on a later sync, would
+		// only recover on the contact's next inbound message (UpdateInfoIfNecessary)
+		// or a full client re-login. Reconciling unconditionally makes both
+		// self-heal on the next contact tick, with no manual logout required.
 		ghost, err := c.Main.Bridge.GetGhostByID(ctx, g.id)
 		if err != nil || ghost == nil {
-			log.Warn().Err(err).Str("ghost_id", string(g.id)).Msg("Failed to load ghost for name refresh")
+			log.Warn().Err(err).Str("ghost_id", string(g.id)).Msg("Failed to load ghost for profile reconcile")
 			continue
 		}
-		// Use the full GetUserInfo → UpdateInfo cycle (same as refreshAllGhosts)
-		// to ensure name, avatar, and identifiers are all propagated to Matrix.
 		info, err := c.GetUserInfo(ctx, ghost)
 		if err != nil || info == nil {
 			continue
 		}
 		ghost.UpdateInfo(ctx, info)
-		updated++
+		reconciled++
 	}
-	log.Info().Int("updated", updated).Int("total", len(ghosts)).Msg("Refreshed ghost names from contacts")
+	log.Info().Int("reconciled", reconciled).Int("total", len(ghosts)).Msg("Reconciled ghost profiles from contacts")
 }
 
 // refreshGroupPortalNamesFromContacts re-resolves group portal names using

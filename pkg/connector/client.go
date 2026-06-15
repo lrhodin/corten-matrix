@@ -7378,11 +7378,20 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 			name := c.Main.Config.FormatDisplayname(identifierToDisplaynameParams(identifier))
 			ui.Name = &name
 		}
-		for _, phone := range contact.Phones {
-			ui.Identifiers = append(ui.Identifiers, "tel:"+phone)
-		}
-		for _, email := range contact.Emails {
-			ui.Identifiers = append(ui.Identifiers, "mailto:"+email)
+		// Emit normalized, deduped identifiers. The raw vCard phone strings
+		// carry display formatting straight from the address book (e.g.
+		// "(845) 536-4690"); concatenating "tel:"+phone ships a malformed
+		// "tel:(845) 536-4690" URI (spaces + parens) that the client can't
+		// parse as a phone number, so the contact renders with no number.
+		// contactPortalIDs() already produces clean E.164 tel: / lowercased
+		// mailto: IDs and dedupes them — reuse it instead of re-deriving here.
+		seen := map[string]bool{identifier: true}
+		for _, id := range contactPortalIDs(contact) {
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			ui.Identifiers = append(ui.Identifiers, id)
 		}
 		if len(contact.Avatar) > 0 {
 			avatarHash := sha256.Sum256(contact.Avatar)

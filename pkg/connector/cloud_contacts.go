@@ -857,7 +857,15 @@ func downloadContactPhotos(contacts []*imessage.Contact, log zerolog.Logger, aut
 			}
 			if len(data) > 0 {
 				c.Avatar = data
-				c.AvatarURL = ""
+				// Keep AvatarURL populated. carryOverAvatars reuses a cached
+				// photo only when old.AvatarURL == fresh.AvatarURL; clearing it
+				// here made that match fail on every subsequent sync, so every
+				// photo re-downloaded each cycle (defeating the carry-over and,
+				// for large address books, hammering iCloud into a 403 so photos
+				// never stuck). The needsDownload filter already excludes
+				// contacts with Avatar != nil, so retaining the URL never causes
+				// a re-fetch; a genuinely changed photo still re-downloads
+				// because the vCard supplies a new URL that won't match the old.
 			}
 		}(contact)
 	}
