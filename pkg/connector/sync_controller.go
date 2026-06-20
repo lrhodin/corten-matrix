@@ -1838,7 +1838,20 @@ func (c *IMClient) refreshDMPortalNamesFromContacts(log zerolog.Logger) {
 			// Contact name not resolved yet — leave it for a later tick.
 			continue
 		}
-		if nameField != bridgev2.DefaultChatName && (*nameField == "" || *nameField == portal.Name) {
+		// Resolve the contact photo once: needed both to stamp alongside the
+		// title and to decide whether a previously-mooned DM needs healing.
+		avatar := c.dmFocusContactAvatar(ctx, portal)
+		// Skip only when there's genuinely nothing to do. A no-op title alone is
+		// not enough: NameIsCustom=true (set by the moon) freezes the ghost->room
+		// avatar sync, so a DM the moon previously owned can sit with an empty or
+		// stale room photo even though its title is already correct. Re-push
+		// whenever the contact photo isn't reflected on the portal yet (empty
+		// AvatarMXC or a stale AvatarID) — this self-heals already-broken portals
+		// on the next tick. The framework no-ops the avatar once it matches and
+		// AvatarMXC is set, so it settles after one heal and never churns.
+		nameNoop := nameField != bridgev2.DefaultChatName && (*nameField == "" || *nameField == portal.Name)
+		avatarStale := avatar != nil && (portal.AvatarMXC == "" || portal.AvatarID != avatar.ID)
+		if nameNoop && !avatarStale {
 			continue
 		}
 
@@ -1851,7 +1864,7 @@ func (c *IMClient) refreshDMPortalNamesFromContacts(log zerolog.Logger) {
 		// carry the contact photo or the room loses it. The release path
 		// (DefaultChatName) hands naming back to the framework — leave it nil.
 		if nameField != bridgev2.DefaultChatName {
-			chatInfo.Avatar = c.dmFocusContactAvatar(ctx, portal)
+			chatInfo.Avatar = avatar
 		}
 		c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
 			EventMeta: simplevent.EventMeta{
