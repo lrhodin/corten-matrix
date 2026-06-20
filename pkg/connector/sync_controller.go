@@ -1842,6 +1842,17 @@ func (c *IMClient) refreshDMPortalNamesFromContacts(log zerolog.Logger) {
 			continue
 		}
 
+		chatInfo := &bridgev2.ChatInfo{
+			Name:                       nameField,
+			ExcludeChangesFromTimeline: true,
+		}
+		// Re-supply the room avatar alongside the moon title: NameIsCustom=true
+		// freezes the ghost avatar out of the DM, so an explicit-title stamp must
+		// carry the contact photo or the room loses it. The release path
+		// (DefaultChatName) hands naming back to the framework — leave it nil.
+		if nameField != bridgev2.DefaultChatName {
+			chatInfo.Avatar = c.dmFocusContactAvatar(ctx, portal)
+		}
 		c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
 			EventMeta: simplevent.EventMeta{
 				Type: bridgev2.RemoteEventChatInfoChange,
@@ -1854,10 +1865,7 @@ func (c *IMClient) refreshDMPortalNamesFromContacts(log zerolog.Logger) {
 				},
 			},
 			ChatInfoChange: &bridgev2.ChatInfoChange{
-				ChatInfo: &bridgev2.ChatInfo{
-					Name:                       nameField,
-					ExcludeChangesFromTimeline: true,
-				},
+				ChatInfo: chatInfo,
 			},
 		})
 		updated++
