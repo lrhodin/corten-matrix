@@ -119,6 +119,17 @@ func main() {
 			m.Init()
 			fmt.Fprintln(os.Stderr, "Database initialized successfully")
 			os.Exit(0)
+		default:
+			// A first argument that is neither a known subcommand nor a flag is
+			// a typo/unknown command. Without this, it silently fell through to
+			// normal bridge startup and surfaced as a confusing
+			// "failed to read config" error. Flags (-c config.yaml, etc.) start
+			// with "-" and must still pass through to the bridge's flag parser.
+			if !strings.HasPrefix(os.Args[1], "-") {
+				fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", os.Args[1])
+				cli.PrintHelp()
+				os.Exit(2)
+			}
 		}
 	}
 
