@@ -9645,13 +9645,69 @@ impl Client {
             n.scheduled = schedule;
             n
         };
+        // SMS sent-message threading on the user's other Apple devices (Macs).
+        // A bridge-sent SMS normally broadcasts a single transmit-request
+        // (is_phone=false, ic=0) to ALL the user's devices: the iPhone relays it
+        // over cellular, but the Macs store it as an unbound "relay request" that
+        // never threads ("Couldn't find chat"). A genuine iPhone send instead
+        // reflects a single display copy (is_phone=true, ic=1, fR=true) to its
+        // companions, which they thread.
+        //
+        // If we know the SMS-relay device (iPhone) token, replicate that: target
+        // the transmit-request at the SIM device ONLY, then separately emit the
+        // display reflection to all our own devices. The Macs then receive only
+        // the reflection (and thread it); the iPhone dedups it against the
+        // message it just transmitted. If we don't know the relay token yet,
+        // fall back to the original broadcast — the recipient still gets the SMS;
+        // companions just won't thread it (prior behavior).
+        let sms_relay_token: Option<Vec<u8>> = if conversation.is_sms {
+            self.client.sms_relay_token.read().unwrap().clone()
+        } else {
+            None
+        };
+        let reflect_normal = if sms_relay_token.is_some() {
+            let mut r = normal.clone();
+            r.service = MessageType::SMS {
+                is_phone: true,
+                using_number: handle.clone(),
+                from_handle: None,
+            };
+            Some(r)
+        } else {
+            None
+        };
+
         let mut msg = MessageInst::new(
             conv.clone(),
             &handle,
             Message::Message(normal),
         );
+        if let Some(token) = &sms_relay_token {
+            info!(
+                "SMS split-targeting active: transmit-request → relay device only, reflection → companions ({}-byte relay token)",
+                token.len()
+            );
+            msg.target = Some(vec![
+                rustpush::ids::identity_manager::MessageTarget::Token(token.clone()),
+            ]);
+        }
         match self.send_with_flap_retry(&mut msg).await {
-            Ok(_) => Ok(msg.id.clone()),
+            Ok(_) => {
+                if let Some(reflect_normal) = reflect_normal {
+                    let mut reflect = MessageInst::new(
+                        conv.clone(),
+                        &handle,
+                        Message::Message(reflect_normal),
+                    );
+                    // Same guid as the transmitted message so the iPhone dedups
+                    // it; target = None → all our own devices, so the Macs get it.
+                    reflect.id = msg.id.clone();
+                    if let Err(e) = self.send_with_flap_retry(&mut reflect).await {
+                        warn!("sent-SMS display reflection failed (cosmetic; recipient still received it): {}", e);
+                    }
+                }
+                Ok(msg.id.clone())
+            }
             Err(rustpush::PushError::NoValidTargets) if !conversation.is_sms => {
                 // iMessage failed — no IDS targets. Retry as SMS (without rich link).
                 info!("No IDS targets, falling back to SMS for {:?}", conv.participants);
