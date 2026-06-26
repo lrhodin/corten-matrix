@@ -1084,25 +1084,31 @@ GUI_DOMAIN="gui/$(id -u)"
 DOMAIN=$(grep '^\s*domain:' "$CONFIG" | head -1 | awk '{print $2}' || true)
 DOMAIN="${DOMAIN:-beeper.local}"
 
-# ── Install the LaunchAgent (optional; default Yes) ───────────
-# Setup needs the bridge running to finish login and to trigger the macOS
-# Contacts + Full Disk Access permission prompts, so this defaults to Yes.
-# Decline only if you'll start it yourself; the block below is otherwise the
-# same unconditional bridge-start as before.
+# Clear any previous instance before (re)starting.
+launchctl bootout "$GUI_DOMAIN/$BUNDLE_ID" 2>/dev/null || true
+launchctl unload "$PLIST" 2>/dev/null || true
+
+# The bridge ALWAYS starts in the background here — login and the macOS Contacts /
+# Full Disk Access permission prompts need it running. Installing the LaunchAgent
+# so it ALSO auto-starts at login is the only optional part (prompt, default Yes).
 if [ -t 0 ]; then
-    printf "\nInstall and start the background service now? [Y/n]: "
+    printf "\nAlso start automatically at login (install background service)? [Y/n]: "
     read INSTALL_SVC
 else
     INSTALL_SVC=""
 fi
 case "${INSTALL_SVC}" in
 [nN]*)
-    echo "Skipped — start it any time with: corten-matrix install-service"
+    # This session only — run it now, write no LaunchAgent.
+    rm -f "$PLIST" 2>/dev/null || true
+    XDG_DATA_HOME="$ACCOUNT_XDG" \
+    PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/go/bin:$HOME/go/bin" \
+        nohup /bin/bash "$DATA_ABS/start.sh" >>"$LOG_OUT" 2>>"$LOG_ERR" &
+    disown 2>/dev/null || true
+    echo "✓ Bridge started (this session only — run 'corten-matrix install-service' to start it at login)"
     ;;
 *)
 mkdir -p "$(dirname "$PLIST")"
-launchctl bootout "$GUI_DOMAIN/$BUNDLE_ID" 2>/dev/null || true
-launchctl unload "$PLIST" 2>/dev/null || true
 
 cat > "$PLIST" << PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -1161,40 +1167,34 @@ if ! launchctl bootstrap "$GUI_DOMAIN" "$PLIST" 2>/dev/null; then
         echo "   $BINARY -c $CONFIG_ABS"
         echo ""
         echo "   This is a known issue on macOS 13 (Ventura). Try:"
-        echo "   1. Remove and re-add the .app in Full Disk Access"
+        echo "   1. Remove and re-add corten-matrix in Full Disk Access"
         echo "   2. Re-run: corten-matrix setup-beeper"
         echo ""
     fi
 fi
-echo "✓ Bridge started (LaunchAgent installed)"
+echo "✓ Bridge started (installed as a login service)"
+    ;;
+esac
 echo ""
 
-# ── Wait for bridge to connect ────────────────────────────────
+# ── Wait for the bridge to come up (either path) ──────────────
 echo "Waiting for bridge to start..."
 for i in $(seq 1 15); do
     if grep -q "Bridge started\|UNCONFIGURED\|Backfill queue starting" "$LOG_OUT" 2>/dev/null; then
         echo "✓ Bridge is running"
-        echo ""
-        echo "═══════════════════════════════════════════════"
-        echo "  Setup Complete"
-        echo "═══════════════════════════════════════════════"
-        echo ""
-        echo "  Logs:    tail -f $LOG_OUT"
-        echo "  Stop:    launchctl bootout $GUI_DOMAIN/$BUNDLE_ID"
-        echo "  Start:   launchctl bootstrap $GUI_DOMAIN $PLIST"
-        echo "  Restart: launchctl kickstart -k $GUI_DOMAIN/$BUNDLE_ID"
-        exit 0
+        break
     fi
     sleep 1
 done
-    ;;
-esac
 
 echo ""
-echo "Bridge is starting up (check logs for status):"
-echo "  tail -f $LOG_OUT"
+echo "═══════════════════════════════════════════════"
+echo "  Setup Complete"
+echo "═══════════════════════════════════════════════"
 echo ""
-echo "Once running, DM @${BRIDGE_NAME}bot:$DOMAIN and send: login"
+echo "  Logs:    tail -f $LOG_OUT"
+echo "  Stop:    launchctl bootout $GUI_DOMAIN/$BUNDLE_ID"
+echo "  Restart: launchctl kickstart -k $GUI_DOMAIN/$BUNDLE_ID"
 
 # ── Add to PATH (optional; symlink only, no shell-rc edits) ────
 if [ -t 0 ] && ! command -v corten-matrix >/dev/null 2>&1; then

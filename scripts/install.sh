@@ -854,23 +854,30 @@ DATA_ABS="$(cd "$DATA_DIR" && pwd)"
 LOG_OUT="$DATA_ABS/bridge.stdout.log"
 LOG_ERR="$DATA_ABS/bridge.stderr.log"
 
-# ── Install the LaunchAgent (optional; default Yes) ───────────
-# Setup needs the bridge running to finish login and to trigger the macOS
-# Contacts + Full Disk Access permission prompts, so this defaults to Yes.
-# Decline only if you'll start it yourself.
+# Clear any previous instance before (re)starting.
+launchctl bootout "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || true
+launchctl unload "$PLIST" 2>/dev/null || true
+
+# The bridge ALWAYS starts in the background here — login and the macOS Contacts /
+# Full Disk Access permission prompts need it running. Installing the LaunchAgent
+# so it ALSO auto-starts at login is the only optional part (prompt, default Yes).
 if [ -t 0 ]; then
-    printf "\nInstall and start the background service now? [Y/n]: "
+    printf "\nAlso start automatically at login (install background service)? [Y/n]: "
     read INSTALL_SVC
 else
     INSTALL_SVC=""
 fi
 case "${INSTALL_SVC}" in
 [nN]*)
-    echo "Skipped — start it any time with: corten-matrix install-service"
+    # This session only — run it now, write no LaunchAgent.
+    rm -f "$PLIST" 2>/dev/null || true
+    XDG_DATA_HOME="$ACCOUNT_XDG" \
+        nohup "$BINARY" -c "$CONFIG_ABS" >>"$LOG_OUT" 2>>"$LOG_ERR" &
+    disown 2>/dev/null || true
+    echo "✓ Bridge started (this session only — run 'corten-matrix install-service' to start it at login)"
     ;;
 *)
 mkdir -p "$(dirname "$PLIST")"
-launchctl unload "$PLIST" 2>/dev/null || true
 
 cat > "$PLIST" << PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -915,10 +922,12 @@ cat > "$PLIST" << PLIST_EOF
 PLIST_EOF
 
 launchctl load "$PLIST"
-echo "✓ Bridge started (LaunchAgent installed)"
+echo "✓ Bridge started (installed as a login service)"
+    ;;
+esac
 echo ""
 
-# ── Wait for bridge to connect ────────────────────────────────
+# ── Wait for the bridge to come up (either path) ──────────────
 echo "Waiting for bridge to start..."
 for i in $(seq 1 15); do
     if grep -q "Bridge started" "$LOG_OUT" 2>/dev/null; then
@@ -927,8 +936,6 @@ for i in $(seq 1 15); do
     fi
     sleep 1
 done
-    ;;
-esac
 
 echo ""
 echo "═══════════════════════════════════════════════"
