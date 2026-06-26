@@ -1084,31 +1084,12 @@ GUI_DOMAIN="gui/$(id -u)"
 DOMAIN=$(grep '^\s*domain:' "$CONFIG" | head -1 | awk '{print $2}' || true)
 DOMAIN="${DOMAIN:-beeper.local}"
 
-# Clear any previous instance before (re)starting.
+# Always install the plist — the start/stop/restart subcommands act on it by path
+# (launchctl load/unload "$PLIST"), so it's a hard dependency even if we don't
+# load it now. Clear any previous instance first.
+mkdir -p "$(dirname "$PLIST")"
 launchctl bootout "$GUI_DOMAIN/$BUNDLE_ID" 2>/dev/null || true
 launchctl unload "$PLIST" 2>/dev/null || true
-
-# The bridge ALWAYS starts in the background here — login and the macOS Contacts /
-# Full Disk Access permission prompts need it running. Installing the LaunchAgent
-# so it ALSO auto-starts at login is the only optional part (prompt, default Yes).
-if [ -t 0 ]; then
-    printf "\nAlso start automatically at login (install background service)? [Y/n]: "
-    read INSTALL_SVC
-else
-    INSTALL_SVC=""
-fi
-case "${INSTALL_SVC}" in
-[nN]*)
-    # This session only — run it now, write no LaunchAgent.
-    rm -f "$PLIST" 2>/dev/null || true
-    XDG_DATA_HOME="$ACCOUNT_XDG" \
-    PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/go/bin:$HOME/go/bin" \
-        nohup /bin/bash "$DATA_ABS/start.sh" >>"$LOG_OUT" 2>>"$LOG_ERR" &
-    disown 2>/dev/null || true
-    echo "✓ Bridge started (this session only — run 'corten-matrix install-service' to start it at login)"
-    ;;
-*)
-mkdir -p "$(dirname "$PLIST")"
 
 cat > "$PLIST" << PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -1160,32 +1141,43 @@ cat > "$PLIST" << PLIST_EOF
 </plist>
 PLIST_EOF
 
-if ! launchctl bootstrap "$GUI_DOMAIN" "$PLIST" 2>/dev/null; then
-    if ! launchctl load "$PLIST" 2>/dev/null; then
+# The plist is installed; the prompt only decides whether to LOAD (start) it now.
+# Either way 'corten-matrix start/stop/restart' work later, since they act on it.
+if [ -t 0 ]; then
+    printf "\nStart the bridge now (and automatically at login)? [Y/n]: "
+    read START_NOW
+else
+    START_NOW=""
+fi
+case "${START_NOW}" in
+[nN]*)
+    echo "✓ Service installed (not started). Start it any time with: corten-matrix start"
+    ;;
+*)
+    # Load it, then force-start — RunAtLoad starts it on a clean load and
+    # kickstart -k guarantees it even if a stale registration no-ops bootstrap.
+    if launchctl bootstrap "$GUI_DOMAIN" "$PLIST" 2>/dev/null \
+        || launchctl load -w "$PLIST" 2>/dev/null; then
+        launchctl kickstart -k "$GUI_DOMAIN/$BUNDLE_ID" 2>/dev/null || true
+        echo "✓ Bridge started"
+    else
         echo ""
-        echo "⚠  LaunchAgent failed to load. You can run the bridge manually:"
-        echo "   $BINARY -c $CONFIG_ABS"
-        echo ""
-        echo "   This is a known issue on macOS 13 (Ventura). Try:"
-        echo "   1. Remove and re-add corten-matrix in Full Disk Access"
-        echo "   2. Re-run: corten-matrix setup-beeper"
+        echo "⚠  Could not load the service. Run the bridge manually:"
+        echo "   $BINARY -n -c $CONFIG_ABS"
         echo ""
     fi
-fi
-echo "✓ Bridge started (installed as a login service)"
+
+    echo ""
+    echo "Waiting for bridge to start..."
+    for i in $(seq 1 15); do
+        if grep -q "Bridge started\|UNCONFIGURED\|Backfill queue starting" "$LOG_OUT" 2>/dev/null; then
+            echo "✓ Bridge is running"
+            break
+        fi
+        sleep 1
+    done
     ;;
 esac
-echo ""
-
-# ── Wait for the bridge to come up (either path) ──────────────
-echo "Waiting for bridge to start..."
-for i in $(seq 1 15); do
-    if grep -q "Bridge started\|UNCONFIGURED\|Backfill queue starting" "$LOG_OUT" 2>/dev/null; then
-        echo "✓ Bridge is running"
-        break
-    fi
-    sleep 1
-done
 
 echo ""
 echo "═══════════════════════════════════════════════"

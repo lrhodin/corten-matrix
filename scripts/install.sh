@@ -854,30 +854,12 @@ DATA_ABS="$(cd "$DATA_DIR" && pwd)"
 LOG_OUT="$DATA_ABS/bridge.stdout.log"
 LOG_ERR="$DATA_ABS/bridge.stderr.log"
 
-# Clear any previous instance before (re)starting.
+# Always install the plist — the start/stop/restart subcommands act on it by path
+# (launchctl load/unload "$PLIST"), so it's a hard dependency even if we don't
+# load it now. Clear any previous instance first.
+mkdir -p "$(dirname "$PLIST")"
 launchctl bootout "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || true
 launchctl unload "$PLIST" 2>/dev/null || true
-
-# The bridge ALWAYS starts in the background here — login and the macOS Contacts /
-# Full Disk Access permission prompts need it running. Installing the LaunchAgent
-# so it ALSO auto-starts at login is the only optional part (prompt, default Yes).
-if [ -t 0 ]; then
-    printf "\nAlso start automatically at login (install background service)? [Y/n]: "
-    read INSTALL_SVC
-else
-    INSTALL_SVC=""
-fi
-case "${INSTALL_SVC}" in
-[nN]*)
-    # This session only — run it now, write no LaunchAgent.
-    rm -f "$PLIST" 2>/dev/null || true
-    XDG_DATA_HOME="$ACCOUNT_XDG" \
-        nohup "$BINARY" -c "$CONFIG_ABS" >>"$LOG_OUT" 2>>"$LOG_ERR" &
-    disown 2>/dev/null || true
-    echo "✓ Bridge started (this session only — run 'corten-matrix install-service' to start it at login)"
-    ;;
-*)
-mkdir -p "$(dirname "$PLIST")"
 
 cat > "$PLIST" << PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -921,21 +903,41 @@ cat > "$PLIST" << PLIST_EOF
 </plist>
 PLIST_EOF
 
-launchctl load "$PLIST"
-echo "✓ Bridge started (installed as a login service)"
+# The plist is installed; the prompt only decides whether to LOAD (start) it now.
+# Either way 'corten-matrix start/stop/restart' work later, since they act on it.
+if [ -t 0 ]; then
+    printf "\nStart the bridge now (and automatically at login)? [Y/n]: "
+    read START_NOW
+else
+    START_NOW=""
+fi
+case "${START_NOW}" in
+[nN]*)
+    echo "✓ Service installed (not started). Start it any time with: corten-matrix start"
+    ;;
+*)
+    if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
+        || launchctl load -w "$PLIST" 2>/dev/null; then
+        launchctl kickstart -k "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || true
+        echo "✓ Bridge started"
+    else
+        echo ""
+        echo "⚠  Could not load the service. Run the bridge manually:"
+        echo "   $BINARY -c $CONFIG_ABS"
+        echo ""
+    fi
+
+    echo ""
+    echo "Waiting for bridge to start..."
+    for i in $(seq 1 15); do
+        if grep -q "Bridge started" "$LOG_OUT" 2>/dev/null; then
+            echo "✓ Bridge is running"
+            break
+        fi
+        sleep 1
+    done
     ;;
 esac
-echo ""
-
-# ── Wait for the bridge to come up (either path) ──────────────
-echo "Waiting for bridge to start..."
-for i in $(seq 1 15); do
-    if grep -q "Bridge started" "$LOG_OUT" 2>/dev/null; then
-        echo "✓ Bridge is running"
-        break
-    fi
-    sleep 1
-done
 
 echo ""
 echo "═══════════════════════════════════════════════"
