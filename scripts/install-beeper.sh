@@ -288,10 +288,16 @@ if [ "$CURRENT_SOURCE" = "chatdb" ] && [ "$(uname -s)" = "Darwin" ]; then
         if ! "$BINARY" fda-check >/dev/null 2>&1; then
             echo ""
             echo "⚠ Full Disk Access is required for chat.db backfill."
-            echo "  Opening System Settings → Privacy & Security → Full Disk Access..."
-            echo "  Grant access to the bridge binary, then press Enter to continue."
+            echo ""
+            echo "  Opening System Settings → Privacy & Security → Full Disk Access."
+            echo "  macOS does NOT list the bridge automatically — add it by hand:"
+            echo "    1. Click the + button (click the padlock to unlock first if needed)."
+            echo "    2. Press Cmd+Shift+G, paste this path, then press Return:"
+            echo "         $BINARY"
+            echo "    3. Select 'corten-matrix', click Open, then turn its toggle ON."
+            echo ""
             open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null
-            read -p "Press Enter when Full Disk Access has been granted..."
+            read -p "Press Enter once you've added and enabled corten-matrix..."
             if "$BINARY" fda-check >/dev/null 2>&1; then
                 echo "✓ Full Disk Access confirmed"
             else

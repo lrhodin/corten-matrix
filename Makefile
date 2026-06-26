@@ -52,9 +52,7 @@ endif
 
 # Plain binary (no .app bundle; host ops live in the corten-matrix subcommands).
 export PATH := /opt/homebrew/bin:/opt/homebrew/sbin:$(PATH)
-APP_BUNDLE  := $(APP_NAME).app
-BINARY      := $(APP_BUNDLE)/Contents/MacOS/$(APP_NAME)
-INFO_PLIST  := $(APP_BUNDLE)/Contents/Info.plist
+BINARY      := $(APP_NAME)
 CGO_CFLAGS  := -I/opt/homebrew/include
 CGO_LDFLAGS := -L/opt/homebrew/lib -L$(CURDIR)
 CARGO_ENV   := MACOSX_DEPLOYMENT_TARGET=13.0
@@ -230,25 +228,16 @@ bindings: $(RUST_LIB)
 # Build
 # ===========================================================================
 
-# Builds a corten-matrix.app bundle. The host-side ops (setup/start/stop/…) are
-# the binary's own subcommands (see pkg/cli). Shipping a codesigned .app — rather
-# than a bare binary — is what lets macOS auto-list it under Full Disk Access for
-# chat.db backfill (a plain binary has to be added by hand). setup symlinks the
-# inner binary onto your PATH as `corten-matrix`.
+# A single self-contained `corten-matrix` binary; host ops are its own
+# subcommands (see pkg/cli) — run `./corten-matrix help`.
 build: check-deps $(RUST_LIB) $(BINARY)
-	@# Convenience launcher so `./corten-matrix <cmd>` works without typing the
-	@# in-bundle path; selfPath() resolves the symlink back into the .app.
-	@ln -sf $(BINARY) $(APP_NAME)
-	@echo "Built $(APP_BUNDLE) ($(VERSION)-$(COMMIT)) — run './$(APP_NAME) help' for setup/ops"
+	@echo "Built $(BINARY) ($(VERSION)-$(COMMIT)) — run './$(BINARY) help' for setup/ops"
 
-$(BINARY): $(GO_SRC) Info.plist $(shell find . -name '*.m' -o -name '*.h' 2>/dev/null | grep -v target) go.mod go.sum $(RUST_LIB) $(COMMIT_FILE)
-	@mkdir -p $(APP_BUNDLE)/Contents/MacOS
-	cp Info.plist $(INFO_PLIST)
+$(BINARY): $(GO_SRC) $(shell find . -name '*.m' -o -name '*.h' 2>/dev/null | grep -v target) go.mod go.sum $(RUST_LIB) $(COMMIT_FILE)
 	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 		go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/$(CMD_PKG)/
-	codesign --force --deep --sign - $(APP_BUNDLE)
+	codesign --force --sign - --identifier com.lrhodin.corten-matrix $(BINARY)
 
 clean:
-	rm -rf $(APP_BUNDLE)
 	rm -f $(APP_NAME) $(RUST_LIB)
 	cd pkg/rustpushgo && cargo clean 2>/dev/null || true

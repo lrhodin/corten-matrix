@@ -126,26 +126,14 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Database initialized successfully")
 			os.Exit(0)
 		case "fda-check":
-			// Probe chat.db as our OWN TCC "responsible" process (disclaiming the
-			// parent Terminal) so macOS attributes the access to THIS binary and
-			// lists it under Full Disk Access during setup — not Terminal, and not
-			// only once the bridge later runs under launchd. Exits 0 if chat.db is
-			// readable, 1 otherwise. See scripts/install.sh + fda_darwin.go.
-			os.Exit(fdaCheck())
-		case "fda-probe":
-			// Internal: spawned under launchd by fda-check. Attempting chat.db as
-			// our own responsible process is what registers the binary with TCC /
-			// Full Disk Access. Writes "0" (readable) / "1" (denied) to argv[2].
-			res := []byte("1")
+			// Probe the local Messages chat.db — exit 0 if readable, 1 if not. The
+			// install scripts use this to tell whether Full Disk Access is granted.
 			home, _ := os.UserHomeDir()
 			if f, err := os.Open(filepath.Join(home, "Library", "Messages", "chat.db")); err == nil {
 				_ = f.Close()
-				res = []byte("0")
+				os.Exit(0)
 			}
-			if len(os.Args) > 2 {
-				_ = os.WriteFile(os.Args[2], res, 0o644)
-			}
-			os.Exit(0)
+			os.Exit(1)
 		default:
 			// A first argument that is neither a known subcommand nor a flag is
 			// a typo/unknown command. Without this, it silently fell through to
