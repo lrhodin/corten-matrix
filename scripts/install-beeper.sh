@@ -6,6 +6,10 @@ DATA_DIR="$2"
 BUNDLE_ID="$3"
 
 BRIDGE_NAME="${BRIDGE_NAME:-sh-imessage}"
+# Session/login dir root for this account. The bridge reads session.json from
+# $XDG_DATA_HOME/corten-matrix, so a second account points this at its own dir
+# (and the launchd service below sets it so the running bridge agrees).
+ACCOUNT_XDG="${XDG_DATA_HOME:-$HOME/.local/share}"
 
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
@@ -1124,6 +1128,8 @@ cat > "$PLIST" << PLIST_EOF
         <string>-I/opt/homebrew/include</string>
         <key>CGO_LDFLAGS</key>
         <string>-L/opt/homebrew/lib</string>
+        <key>XDG_DATA_HOME</key>
+        <string>$ACCOUNT_XDG</string>
     </dict>
 </dict>
 </plist>

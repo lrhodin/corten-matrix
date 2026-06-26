@@ -5,6 +5,13 @@ BINARY="$1"
 DATA_DIR="$2"
 
 BRIDGE_NAME="${BRIDGE_NAME:-sh-imessage}"
+# Per-account systemd unit name. The first account uses the bare name; a second
+# account passes a suffixed value so the two services never collide.
+SERVICE_NAME="${SERVICE_NAME:-corten-matrix}"
+# Session/login dir root for this account. The bridge reads session.json from
+# $XDG_DATA_HOME/corten-matrix, so a second account points this at its own dir
+# and gets a fully separate login (no shared state with the first account).
+ACCOUNT_XDG="${XDG_DATA_HOME:-$HOME/.local/share}"
 
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
@@ -21,11 +28,11 @@ echo ""
 # systemctl stop prevents Restart=always from kicking in (systemd only
 # auto-restarts after process exits, not after admin stop). No need to
 # mask — masking fails when the unit file already exists on disk.
-if systemctl --user is-active corten-matrix >/dev/null 2>&1; then
-    systemctl --user stop corten-matrix
+if systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+    systemctl --user stop "$SERVICE_NAME"
     echo "✓ Stopped running bridge"
-elif systemctl is-active corten-matrix >/dev/null 2>&1; then
-    sudo systemctl stop corten-matrix
+elif systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+    sudo systemctl stop "$SERVICE_NAME"
     echo "✓ Stopped running bridge"
 fi
 
@@ -599,10 +606,10 @@ fi
 # bbctl config posts StateStarting which makes Beeper show "Running".
 # Stopping the systemd service disconnects the websocket, which makes
 # Beeper detect it as unreachable and overrides the stale state.
-if systemctl --user is-active corten-matrix >/dev/null 2>&1; then
-    systemctl --user stop corten-matrix
-elif systemctl is-active corten-matrix >/dev/null 2>&1; then
-    sudo systemctl stop corten-matrix
+if systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+    systemctl --user stop "$SERVICE_NAME"
+elif systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+    sudo systemctl stop "$SERVICE_NAME"
 fi
 
 # ── Check for existing login / prompt if needed ──────────────
@@ -1015,10 +1022,10 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     echo "└─────────────────────────────────────────────────┘"
     echo ""
     # Stop the bridge if running (otherwise it holds the DB lock)
-    if systemctl --user is-active corten-matrix >/dev/null 2>&1; then
-        systemctl --user stop corten-matrix
-    elif systemctl is-active corten-matrix >/dev/null 2>&1; then
-        sudo systemctl stop corten-matrix
+    if systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+        systemctl --user stop "$SERVICE_NAME"
+    elif systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+        sudo systemctl stop "$SERVICE_NAME"
     fi
 
     if [ "${FORCE_CLEAR_STATE:-false}" = "true" ]; then
@@ -1044,10 +1051,10 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
 fi
 
 # ── Stop bridge before applying config changes ────────────────
-if systemctl --user is-active corten-matrix >/dev/null 2>&1; then
-    systemctl --user stop corten-matrix
-elif systemctl is-active corten-matrix >/dev/null 2>&1; then
-    sudo systemctl stop corten-matrix
+if systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+    systemctl --user stop "$SERVICE_NAME"
+elif systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+    sudo systemctl stop "$SERVICE_NAME"
 fi
 
 if [ -z "${IN_DOCKER:-}" ]; then
@@ -1058,10 +1065,10 @@ if [ -z "${IN_DOCKER:-}" ]; then
 # default to --user (the common path for non-root installs).
 _SHORTCUT_SYSCTL=""
 _SHORTCUT_JCTL=""
-if systemctl --user list-unit-files corten-matrix.service 2>/dev/null | grep -q corten-matrix; then
+if systemctl --user list-unit-files "$SERVICE_NAME.service" 2>/dev/null | grep -q "$SERVICE_NAME"; then
     _SHORTCUT_SYSCTL="systemctl --user"
     _SHORTCUT_JCTL="journalctl --user"
-elif systemctl list-unit-files corten-matrix.service 2>/dev/null | grep -q corten-matrix; then
+elif systemctl list-unit-files "$SERVICE_NAME.service" 2>/dev/null | grep -q "$SERVICE_NAME"; then
     _SHORTCUT_SYSCTL="sudo systemctl"
     _SHORTCUT_JCTL="sudo journalctl"
 else
@@ -1158,8 +1165,8 @@ if [ -z "${IN_DOCKER:-}" ]; then
 # Detect whether systemd user sessions work. In containers (LXC) or when
 # running as root, the user instance is often unavailable — fall back to a
 # system-level service in that case.
-USER_SERVICE_FILE="$HOME/.config/systemd/user/corten-matrix.service"
-SYSTEM_SERVICE_FILE="/etc/systemd/system/corten-matrix.service"
+USER_SERVICE_FILE="$HOME/.config/systemd/user/$SERVICE_NAME.service"
+SYSTEM_SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
 
 if command -v systemctl >/dev/null 2>&1; then
     if systemctl --user status >/dev/null 2>&1; then
@@ -1188,6 +1195,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$DATA_DIR
+Environment=XDG_DATA_HOME=$ACCOUNT_XDG
 ExecStart=/bin/bash $DATA_DIR/start.sh
 Restart=always
 RestartSec=5
@@ -1199,7 +1207,7 @@ LimitNOFILE=65536
 WantedBy=default.target
 EOF
     systemctl --user daemon-reload
-    systemctl --user enable corten-matrix
+    systemctl --user enable "$SERVICE_NAME"
 }
 
 install_systemd_system() {
@@ -1212,6 +1220,7 @@ After=network.target
 Type=simple
 User=$USER
 WorkingDirectory=$DATA_DIR
+Environment=XDG_DATA_HOME=$ACCOUNT_XDG
 ExecStart=/bin/bash $DATA_DIR/start.sh
 Restart=always
 RestartSec=5
@@ -1223,13 +1232,13 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable corten-matrix
+    systemctl enable "$SERVICE_NAME"
 }
 
 if [ "$SYSTEMD_MODE" = "user" ]; then
     if [ -f "$USER_SERVICE_FILE" ]; then
         install_systemd_user
-        systemctl --user restart corten-matrix
+        systemctl --user restart "$SERVICE_NAME"
         echo "✓ Bridge restarted"
     else
         echo ""
@@ -1237,14 +1246,14 @@ if [ "$SYSTEMD_MODE" = "user" ]; then
         case "$answer" in
             [nN]*) ;;
             *)     install_systemd_user
-                   systemctl --user start corten-matrix
+                   systemctl --user start "$SERVICE_NAME"
                    echo "✓ Bridge started (systemd user service installed)" ;;
         esac
     fi
 elif [ "$SYSTEMD_MODE" = "system" ]; then
     if [ -f "$SYSTEM_SERVICE_FILE" ]; then
         install_systemd_system
-        systemctl restart corten-matrix
+        systemctl restart "$SERVICE_NAME"
         echo "✓ Bridge restarted"
     else
         echo ""
@@ -1253,7 +1262,7 @@ elif [ "$SYSTEMD_MODE" = "system" ]; then
         case "$answer" in
             [nN]*) ;;
             *)     install_systemd_system
-                   systemctl start corten-matrix
+                   systemctl start "$SERVICE_NAME"
                    echo "✓ Bridge started (system service installed)" ;;
         esac
     fi
@@ -1270,15 +1279,15 @@ echo "  Binary: $BINARY"
 echo "  Config: $CONFIG"
 echo ""
 if [ "${SYSTEMD_MODE:-none}" = "user" ] && [ -f "${USER_SERVICE_FILE:-}" ]; then
-    echo "  Status:  systemctl --user status corten-matrix"
-    echo "  Logs:    journalctl --user -u corten-matrix -f"
-    echo "  Stop:    systemctl --user stop corten-matrix"
-    echo "  Restart: systemctl --user restart corten-matrix"
+    echo "  Status:  systemctl --user status $SERVICE_NAME"
+    echo "  Logs:    journalctl --user -u $SERVICE_NAME -f"
+    echo "  Stop:    systemctl --user stop $SERVICE_NAME"
+    echo "  Restart: systemctl --user restart $SERVICE_NAME"
 elif [ "${SYSTEMD_MODE:-none}" = "system" ] && [ -f "${SYSTEM_SERVICE_FILE:-}" ]; then
-    echo "  Status:  systemctl status corten-matrix"
-    echo "  Logs:    journalctl -u corten-matrix -f"
-    echo "  Stop:    systemctl stop corten-matrix"
-    echo "  Restart: systemctl restart corten-matrix"
+    echo "  Status:  systemctl status $SERVICE_NAME"
+    echo "  Logs:    journalctl -u $SERVICE_NAME -f"
+    echo "  Stop:    systemctl stop $SERVICE_NAME"
+    echo "  Restart: systemctl restart $SERVICE_NAME"
 else
     echo "  Run manually:"
     echo "    cd $(dirname "$CONFIG") && $BINARY -c $CONFIG"

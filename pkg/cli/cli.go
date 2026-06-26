@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 
 	"github.com/lrhodin/corten-matrix/pkg/bbctl"
 	"github.com/lrhodin/corten-matrix/scripts"
@@ -44,6 +45,34 @@ func cortenDataDir() string {
 // $XDG_DATA_HOME/corten-matrix) where config.yaml lives. Exported so the login
 // subcommand resolves the same path as the rest of the CLI.
 func DataDir() string { return cortenDataDir() }
+
+// secondDataDir is the data dir of the optional second account — a sibling of
+// the first account's dir (…/corten-matrix-1). Setup creates it only if the
+// user opts into a second account.
+func secondDataDir() string {
+	return filepath.Join(filepath.Dir(cortenDataDir()), "corten-matrix-1")
+}
+
+// hasSecondAccount reports whether a second account has been set up.
+func hasSecondAccount() bool {
+	fi, err := os.Stat(secondDataDir())
+	return err == nil && fi.IsDir()
+}
+
+// serviceLabel returns the launchd label (macOS) / systemd unit base name
+// (Linux) for account idx (0 = primary, 1 = second). These mirror the names the
+// install scripts use (BUNDLE_ID / SERVICE_NAME).
+func serviceLabel(idx int) string {
+	base := cortenBundleID // com.lrhodin.corten-matrix
+	if runtime.GOOS != "darwin" {
+		base = "corten-matrix"
+	}
+	if idx == 0 {
+		return base
+	}
+	return base + "-1"
+}
+
 
 // selfPath returns the absolute path of this binary (resolving symlinks).
 func selfPath() string {
@@ -98,34 +127,182 @@ func runEmbeddedScript(name string, args ...string) {
 	exitWith("/bin/bash", append([]string{tmp.Name()}, args...)...)
 }
 
-// serviceCtl controls the installed bridge service.
+// serviceCtl runs a lifecycle action on EVERY configured account's service:
+// start/stop/restart/status act on both accounts in one shot. (Only `logs` is
+// per-account — see tailLogs.) Exits non-zero if any account's action failed.
 func serviceCtl(action string) {
+	labels := []string{serviceLabel(0)}
+	if hasSecondAccount() {
+		labels = append(labels, serviceLabel(1))
+	}
+	failed := false
+	for _, label := range labels {
+		if err := serviceCtlOne(action, label); err != nil {
+			failed = true
+		}
+	}
+	if failed {
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+// serviceCtlOne runs one action against a single account's service label
+// (launchd label on macOS, systemd --user unit base name on Linux).
+func serviceCtlOne(action, label string) error {
 	if runtime.GOOS == "darwin" {
-		plist := filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents", cortenBundleID+".plist")
+		plist := filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents", label+".plist")
 		switch action {
 		case "start":
-			exitWith("launchctl", "load", "-w", plist)
+			return streamRun("launchctl", "load", "-w", plist)
 		case "stop":
-			exitWith("launchctl", "unload", "-w", plist)
+			return streamRun("launchctl", "unload", "-w", plist)
 		case "restart":
-			exitWith("launchctl", "kickstart", "-k", "gui/"+strconv.Itoa(os.Getuid())+"/"+cortenBundleID)
+			return streamRun("launchctl", "kickstart", "-k", "gui/"+strconv.Itoa(os.Getuid())+"/"+label)
 		case "status":
-			exitWith("launchctl", "list", cortenBundleID)
+			return streamRun("launchctl", "list", label)
 		}
-		return
+		return nil
 	}
-	// Linux: systemd --user unit installed by install-linux.sh.
-	const unit = "corten-matrix.service"
+	// Linux: systemd --user unit installed by the install scripts.
+	unit := label + ".service"
 	switch action {
 	case "start":
-		exitWith("systemctl", "--user", "start", unit)
+		return streamRun("systemctl", "--user", "start", unit)
 	case "stop":
-		exitWith("systemctl", "--user", "stop", unit)
+		return streamRun("systemctl", "--user", "stop", unit)
 	case "restart":
-		exitWith("systemctl", "--user", "restart", unit)
+		return streamRun("systemctl", "--user", "restart", unit)
 	case "status":
-		exitWith("systemctl", "--user", "status", unit)
+		return streamRun("systemctl", "--user", "status", unit)
 	}
+	return nil
+}
+
+// ── Setup orchestration: account 1, then an optional second account ──────────
+// Max two accounts. A second account is a different Apple ID on the same
+// machine, run as its own bridge (own appservice name, data dir, login, and
+// service) so the two never share login state. The lifecycle commands act on
+// both; only logs are per-account.
+
+// isInteractive reports whether stdin is a terminal (so we can prompt).
+func isInteractive() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
+}
+
+// configBackfillSource returns an account's `backfill_source:` value
+// ("cloudkit" / "chatdb"), or "" if unset/unreadable.
+func configBackfillSource(dataDir string) string {
+	data, err := os.ReadFile(filepath.Join(dataDir, "config.yaml"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "backfill_source:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "backfill_source:"))
+		}
+	}
+	return ""
+}
+
+// canOfferSecondAccount reports whether to offer a second account after the
+// first one's setup. Interactive only; never more than two. On macOS a second
+// account is only possible with CloudKit — the local chat.db serves only the
+// one signed-in Apple ID — so it is silently not offered for a chat.db setup.
+func canOfferSecondAccount() bool {
+	if !isInteractive() || hasSecondAccount() {
+		return false
+	}
+	if runtime.GOOS == "darwin" {
+		return configBackfillSource(cortenDataDir()) == "cloudkit"
+	}
+	return true
+}
+
+// runSetupScript runs an embedded setup script with extra env, streaming stdio,
+// and returns its exit error (does NOT exit the process).
+func runSetupScript(extraEnv []string, name string, args ...string) error {
+	data, err := scripts.Files.ReadFile(name)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp("", "corten-*.sh")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	tmp.Close()
+	_ = os.Chmod(tmp.Name(), 0o755)
+	c := exec.Command("/bin/bash", append([]string{tmp.Name()}, args...)...)
+	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+	c.Env = append(os.Environ(), extraEnv...)
+	return c.Run()
+}
+
+// setupAccount runs the install script for account idx (0 = primary, 1 = the
+// optional second account) in the given mode (Beeper vs self-hosted).
+func setupAccount(beeper bool, idx int) error {
+	self := selfPath()
+	bbctlPath := filepath.Join(filepath.Dir(self), "bbctl")
+	dataDir := cortenDataDir()
+	bundleID := cortenBundleID
+	var env []string
+	if idx == 1 {
+		dataDir = secondDataDir()
+		bundleID = cortenBundleID + "-1"
+		env = []string{
+			"BRIDGE_NAME=sh-imessage1",     // Beeper appservice name for the 2nd account
+			"SERVICE_NAME=corten-matrix-1", // local systemd unit / launchd suffix
+			"XDG_DATA_HOME=" + dataDir,     // 2nd account's own login/session dir
+		}
+	}
+	var name string
+	var args []string
+	switch {
+	case beeper && runtime.GOOS == "darwin":
+		name, args = "install-beeper.sh", []string{self, dataDir, bundleID, bbctlPath}
+	case beeper:
+		name, args = "install-beeper-linux.sh", []string{self, dataDir, bbctlPath}
+	case runtime.GOOS == "darwin":
+		name, args = "install.sh", []string{self, dataDir, bundleID}
+	default:
+		name, args = "install-linux.sh", []string{self, dataDir}
+	}
+	return runSetupScript(env, name, args...)
+}
+
+func exitCodeOf(err error) int {
+	if ee, ok := err.(*exec.ExitError); ok {
+		return ee.ExitCode()
+	}
+	return 1
+}
+
+// runSetup runs the primary account's setup, then offers ONE optional second
+// account (Beeper appservice sh-imessage1 / local corten-matrix-1).
+func runSetup(beeper bool) {
+	if err := setupAccount(beeper, 0); err != nil {
+		os.Exit(exitCodeOf(err))
+	}
+	if canOfferSecondAccount() {
+		fmt.Print("\nAdd a second iMessage account (different Apple ID)? [y/N]: ")
+		var ans string
+		fmt.Scanln(&ans)
+		switch ans {
+		case "y", "Y", "yes", "Yes":
+			fmt.Printf("\n%s═══ Setting up the second account ═══%s\n", cAccent, cReset)
+			if err := setupAccount(beeper, 1); err != nil {
+				fmt.Fprintf(os.Stderr, "second account setup failed: %v\n", err)
+				os.Exit(exitCodeOf(err))
+			}
+		}
+	}
+	os.Exit(0)
 }
 
 // offerAddToPath offers to symlink the binary into /usr/local/bin so `corten-matrix`
@@ -228,8 +405,13 @@ func serviceUninstall() {
 	os.Exit(0)
 }
 
-func tailLogs() {
-	exitWith("tail", "-F", filepath.Join(cortenDataDir(), "logs", "bridge.log"))
+// tailLogs tails a bridge log. `logs` → primary account; `logs 2` → 2nd account.
+func tailLogs(args []string) {
+	dir := cortenDataDir()
+	if len(args) > 0 && args[0] == "2" {
+		dir = secondDataDir()
+	}
+	exitWith("tail", "-F", filepath.Join(dir, "logs", "bridge.log"))
 }
 
 func runBbctl(args []string) {
@@ -252,7 +434,7 @@ func PrintHelp() {
 		{"stop", "stop the bridge"},
 		{"restart", "restart the bridge"},
 		{"status", "show service status"},
-		{"logs", "tail the bridge log"},
+		{"logs [2]", "tail a bridge log (2 = second account)"},
 		{"install-service", "install + start the background service"},
 		{"uninstall-service", "stop + remove the background service"},
 		{"reset", "reset bridge state"},
@@ -265,6 +447,9 @@ func PrintHelp() {
 		fmt.Printf("    %s%-14s%s %s%s%s\n", cAccent, r[0], cReset, cDim, r[1], cReset)
 	}
 	fmt.Println()
+	if hasSecondAccount() {
+		fmt.Printf("  %sTwo accounts configured — start/stop/restart act on both; use 'logs 2' for the second.%s\n\n", cDim, cReset)
+	}
 }
 
 // isManagementCommand reports whether cmd is a host-management subcommand.
@@ -281,21 +466,11 @@ func IsManagementCommand(cmd string) bool {
 // runManagementCommand dispatches a host-management subcommand. It always
 // terminates the process (os.Exit) — it is only called for known commands.
 func RunManagement(cmd string, args []string) {
-	self := selfPath()
-	dataDir := cortenDataDir()
-	bbctl := filepath.Join(filepath.Dir(self), "bbctl")
-
 	switch cmd {
 	case "setup":
-		if runtime.GOOS == "darwin" {
-			runEmbeddedScript("install.sh", self, dataDir, cortenBundleID)
-		}
-		runEmbeddedScript("install-linux.sh", self, dataDir)
+		runSetup(false)
 	case "setup-beeper":
-		if runtime.GOOS == "darwin" {
-			runEmbeddedScript("install-beeper.sh", self, dataDir, cortenBundleID, bbctl)
-		}
-		runEmbeddedScript("install-beeper-linux.sh", self, dataDir, bbctl)
+		runSetup(true)
 	case "reset":
 		if runtime.GOOS == "darwin" {
 			runEmbeddedScript("reset-bridge.sh", cortenBundleID)
@@ -308,7 +483,7 @@ func RunManagement(cmd string, args []string) {
 	case "start", "stop", "restart", "status":
 		serviceCtl(cmd)
 	case "logs":
-		tailLogs()
+		tailLogs(args)
 	case "bbctl":
 		runBbctl(args)
 	}
