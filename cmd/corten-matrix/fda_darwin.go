@@ -27,11 +27,10 @@ func fdaCheck() int {
 	result := filepath.Join(os.TempDir(), label+"."+strconv.Itoa(os.Getpid()))
 	_ = os.Remove(result)
 
-	laDir := filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents")
-	if err := os.MkdirAll(laDir, 0o755); err != nil {
-		return 1
-	}
-	plistPath := filepath.Join(laDir, label+".plist")
+	// Keep the transient probe plist OUT of ~/Library/LaunchAgents — launchctl
+	// bootstrap loads it from any path, and writing it there makes it flash in
+	// and out of the user's agents folder during setup. A temp path is invisible.
+	plistPath := filepath.Join(os.TempDir(), label+".plist")
 	plist := `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
