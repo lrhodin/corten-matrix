@@ -129,6 +129,7 @@ The `corten-matrix` binary is both the bridge and its management CLI — it repl
 | `corten-matrix reset` | Reset bridge state (with prompts) — see the warning under [Configuration](#configuration). |
 | `corten-matrix uninstall` | Stop and remove the background service. |
 | `corten-matrix update` | **Official binary releases only.** Update in place to the latest release and restart — see [Updating](#updating). |
+| `corten-matrix update check` / `update force` | `check` previews the latest version + release notes without installing; `force` re-downloads and reinstalls the current release. |
 | `corten-matrix bbctl <args>` | Beeper bridge-manager CLI (register / auth / stop / delete the bridge in Beeper infra). |
 | `corten-matrix help` | Show the command list. |
 
