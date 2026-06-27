@@ -128,8 +128,11 @@ The `corten-matrix` binary is both the bridge and its management CLI — it repl
 | `corten-matrix install-service` / `uninstall-service` | Install or remove the background service without re-running full setup. |
 | `corten-matrix reset` | Reset bridge state (with prompts) — see the warning under [Configuration](#configuration). |
 | `corten-matrix uninstall` | Stop and remove the background service. |
+| `corten-matrix update` | **Official binary releases only.** Update in place to the latest release and restart — see [Updating](#updating). |
 | `corten-matrix bbctl <args>` | Beeper bridge-manager CLI (register / auth / stop / delete the bridge in Beeper infra). |
 | `corten-matrix help` | Show the command list. |
+
+> `update` is shown by `corten-matrix help` **only on the official prebuilt binaries**. If you built from source it isn't there — update by pulling this repo and rebuilding (see [Updating](#updating)).
 
 The same `start` / `stop` / `restart` / `status` / `logs` commands work on both platforms, so you don't have to remember whether the host uses `launchctl` or `systemctl` — the raw equivalents are in [Management](#management) if you'd rather wire your own thing.
 
@@ -153,6 +156,22 @@ corten-matrix can bridge **two Apple IDs** on the same machine (max two), each a
 | chat.db | chat.db | ❌ — only one local Messages database exists |
 
 So **at most one** account can use chat.db backfill — the Apple ID signed into Messages on the Mac — and the other must use CloudKit. This only limits *history backfill*; real-time messaging works for both accounts regardless. (Linux has no chat.db, so both accounts always use CloudKit.)
+
+## Updating
+
+How you update depends on how you're running corten-matrix:
+
+- **Official prebuilt binaries (macOS & Linux)** — run `corten-matrix update`. It pulls the latest [release](https://github.com/lrhodin/corten-matrix/releases) for your platform (macOS universal, Linux amd64, or Linux arm64), replaces the installed binary in place, prints the release notes, and restarts the bridge. Your config, login, and data are untouched.
+
+  ```bash
+  corten-matrix update            # update & restart
+  corten-matrix update --check    # show what's available + release notes, change nothing
+  corten-matrix update --force    # re-download & reinstall the current release
+  ```
+
+  **The service must be installed first.** `update` doesn't take a path or guess where your binary lives — it locates it through the `corten-matrix` entry on your `PATH`. That entry is a symlink into `/usr/local/bin` that `corten-matrix setup` (and `install-service`) creates, pointing at wherever you actually keep the binary; `update` follows the symlink to that real file and replaces it in place, leaving the symlink intact. So you must have run `setup` / `install-service` (and added it to `PATH` when prompted) before `update` will work. If `corten-matrix` isn't on your `PATH`, `update` stops and tells you to install the service first rather than guessing. (If the binary lives somewhere only root can write, it uses `sudo` for the swap.)
+
+- **Built from source (macOS)** — the `update` command isn't included in source builds. Update the normal way: `git pull` and rebuild (see [Build from source (macOS)](#build-from-source-macos)), then `corten-matrix restart`.
 
 ## Login
 
