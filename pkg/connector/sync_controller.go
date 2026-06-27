@@ -3799,17 +3799,40 @@ func (c *IMClient) consolidateCarrierGroupPortals(ctx context.Context, log zerol
 		return
 	}
 
-	consolidated := 0
+	// Bound the Matrix room moves (re-ID / tombstone — each a homeserver round
+	// trip) performed per startup, so a large backlog of split groups can't stall
+	// startup or flood the homeserver with tombstones in one burst. The migration
+	// is idempotent and self-healing, so groups deferred here are consolidated on
+	// subsequent startups. At least one group always runs so progress is
+	// guaranteed even if a single group exceeds the budget on its own.
+	maxRooms := 0
 	for _, g := range groups {
-		if c.consolidateOneCarrierGroup(ctx, log, g) {
-			consolidated++
-		}
+		maxRooms += len(g.members)
 	}
-	if consolidated > 0 {
-		log.Info().Int("groups", consolidated).
-			Msg("Consolidated split carrier group portals by participant set")
+	log.Info().Int("groups", len(groups)).Int("max_member_rooms", maxRooms).
+		Msg("Planning carrier group consolidation")
+
+	consolidated, roomMoves := 0, 0
+	for _, g := range groups {
+		if consolidated > 0 && roomMoves >= carrierGroupRoomMoveBudgetPerStartup {
+			break
+		}
+		roomMoves += c.consolidateOneCarrierGroup(ctx, log, g)
+		consolidated++
+	}
+	deferred := len(groups) - consolidated
+	log.Info().Int("groups", consolidated).Int("room_moves", roomMoves).Int("deferred_groups", deferred).
+		Msg("Consolidated split carrier group portals by participant set")
+	if deferred > 0 {
+		log.Info().Int("deferred_groups", deferred).
+			Msg("Deferred remaining carrier group consolidations to next startup (room-move budget reached)")
 	}
 }
+
+// carrierGroupRoomMoveBudgetPerStartup caps how many room re-ID/tombstone
+// operations consolidateCarrierGroupPortals performs per startup. Bounds startup
+// latency and tombstone bursts; the rest converge on later startups (idempotent).
+const carrierGroupRoomMoveBudgetPerStartup = 50
 
 // carrierMemberRoom is one member portal's Matrix-room state, gathered for the
 // room-move decision in planCarrierRoomMoves.
@@ -3867,8 +3890,9 @@ func planCarrierRoomMoves(canonical string, canonicalHasRoom bool, members []car
 }
 
 // consolidateOneCarrierGroup performs the data + room moves for a single carrier
-// group. Returns true if it took any action.
-func (c *IMClient) consolidateOneCarrierGroup(ctx context.Context, log zerolog.Logger, g carrierConsolidationGroup) bool {
+// group. Returns the number of room re-ID/tombstone operations it attempted, so
+// the caller can budget room moves across groups per startup.
+func (c *IMClient) consolidateOneCarrierGroup(ctx context.Context, log zerolog.Logger, g carrierConsolidationGroup) int {
 	canonicalKey := networkid.PortalKey{ID: networkid.PortalID(g.canonical), Receiver: c.UserLogin.ID}
 
 	// Gather room state, then let planCarrierRoomMoves decide the survivor and the
@@ -3903,13 +3927,15 @@ func (c *IMClient) consolidateOneCarrierGroup(ctx context.Context, log zerolog.L
 	// Apply the room moves. The survivor rename (when present) is reIDs[0] and
 	// must claim the canonical key before the rest tombstone into it, so a failure
 	// there aborts rather than merging rooms into a non-canonical survivor.
+	moves := 0
 	for _, m := range plan.reIDs {
 		mk := networkid.PortalKey{ID: networkid.PortalID(m), Receiver: c.UserLogin.ID}
+		moves++
 		if _, _, err := c.reIDPortalWithCacheUpdate(ctx, mk, canonicalKey); err != nil {
 			log.Warn().Err(err).Str("portal", m).Str("canonical", g.canonical).
 				Msg("Failed to re-ID carrier portal onto canonical key")
 			if m == plan.survivor {
-				return false
+				return moves
 			}
 		}
 	}
@@ -3918,8 +3944,9 @@ func (c *IMClient) consolidateOneCarrierGroup(ctx context.Context, log zerolog.L
 		Str("canonical", g.canonical).
 		Int("members", len(g.members)).
 		Str("survivor", plan.survivor).
+		Int("room_moves", moves).
 		Msg("Consolidated carrier group portals")
-	return true
+	return moves
 }
 
 // portalHasRoom reports whether a portal exists and has a Matrix room.
