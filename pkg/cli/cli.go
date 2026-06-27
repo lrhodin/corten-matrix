@@ -198,36 +198,6 @@ func isInteractive() bool {
 	return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
 }
 
-// configBackfillSource returns an account's `backfill_source:` value
-// ("cloudkit" / "chatdb"), or "" if unset/unreadable.
-func configBackfillSource(dataDir string) string {
-	data, err := os.ReadFile(filepath.Join(dataDir, "config.yaml"))
-	if err != nil {
-		return ""
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "backfill_source:") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "backfill_source:"))
-		}
-	}
-	return ""
-}
-
-// canOfferSecondAccount reports whether to offer a second account after the
-// first one's setup. Interactive only; never more than two. On macOS a second
-// account is only possible with CloudKit — the local chat.db serves only the
-// one signed-in Apple ID — so it is silently not offered for a chat.db setup.
-func canOfferSecondAccount() bool {
-	if !isInteractive() || hasSecondAccount() {
-		return false
-	}
-	if runtime.GOOS == "darwin" {
-		return configBackfillSource(cortenDataDir()) == "cloudkit"
-	}
-	return true
-}
-
 // runSetupScript runs an embedded setup script with extra env, streaming stdio,
 // and returns its exit error (does NOT exit the process).
 func runSetupScript(extraEnv []string, name string, args ...string) error {
@@ -299,21 +269,8 @@ func runSetup(beeper bool) {
 	if err := setupAccount(beeper, 0); err != nil {
 		os.Exit(exitCodeOf(err))
 	}
-	if canOfferSecondAccount() {
-		fmt.Print("\nAdd a second iMessage account (different Apple ID)? [y/N]: ")
-		var ans string
-		fmt.Scanln(&ans)
-		switch ans {
-		case "y", "Y", "yes", "Yes":
-			fmt.Printf("\n%s═══ Setting up the second account ═══%s\n", cAccent, cReset)
-			if err := setupAccount(beeper, 1); err != nil {
-				fmt.Fprintf(os.Stderr, "second account setup failed: %v\n", err)
-				os.Exit(exitCodeOf(err))
-			}
-		}
-	}
-	// Now that every account is configured, start them together — this is why the
-	// scripts defer starting: the second-account prompt comes BEFORE any start.
+	// No mid-setup "add a second account?" prompt — a second bridge is added
+	// explicitly later with `setup 1` / `setup-beeper 1` (see reconfigureSecond).
 	startAfterSetup()
 	os.Exit(0)
 }
@@ -564,10 +521,11 @@ func serviceUninstall() {
 	os.Exit(0)
 }
 
-// tailLogs tails a bridge log. `logs` → primary account; `logs 2` → 2nd account.
+// tailLogs tails a bridge log. `logs` → primary account; `logs 1` → 2nd account
+// (the corten-matrix-1 account — matching `setup 1`).
 func tailLogs(args []string) {
 	dir := cortenDataDir()
-	if len(args) > 0 && args[0] == "2" {
+	if len(args) > 0 && args[0] == "1" {
 		dir = secondDataDir()
 	}
 	exitWith("tail", "-F", filepath.Join(dir, "logs", "bridge.log"))
@@ -595,7 +553,7 @@ func PrintHelp() {
 		{"stop", "stop the bridge"},
 		{"restart", "restart the bridge"},
 		{"status", "show service status"},
-		{"logs [2]", "tail a bridge log (2 = second account)"},
+		{"logs [1]", "tail a bridge log (1 = second account)"},
 		{"install-service", "install + start the background service"},
 		{"uninstall-service", "stop + remove the background service"},
 		{"reset", "reset bridge state"},
@@ -611,7 +569,7 @@ func PrintHelp() {
 	fmt.Printf("  %sOne service runs every configured account. Re-run a setup command to flip a%s\n", cDim, cReset)
 	fmt.Printf("  %stoggle (backfill, contacts…); add '1' to reconfigure the second account.%s\n\n", cDim, cReset)
 	if hasSecondAccount() {
-		fmt.Printf("  %sTwo accounts configured — start/stop/restart act on the one service; 'logs 2' = second.%s\n\n", cDim, cReset)
+		fmt.Printf("  %sTwo accounts configured — start/stop/restart act on the one service; 'logs 1' = second.%s\n\n", cDim, cReset)
 	}
 }
 
