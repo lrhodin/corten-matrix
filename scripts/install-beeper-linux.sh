@@ -1196,7 +1196,7 @@ After=network.target
 Type=simple
 WorkingDirectory=$DATA_DIR
 Environment=XDG_DATA_HOME=$ACCOUNT_XDG
-ExecStart=/bin/bash $DATA_DIR/start.sh
+ExecStart=$BINARY bridge-all
 Restart=always
 RestartSec=5
 # Headroom for busy/heavy-message bridges; the binary also raises this at
@@ -1221,7 +1221,7 @@ Type=simple
 User=$USER
 WorkingDirectory=$DATA_DIR
 Environment=XDG_DATA_HOME=$ACCOUNT_XDG
-ExecStart=/bin/bash $DATA_DIR/start.sh
+ExecStart=$BINARY bridge-all
 Restart=always
 RestartSec=5
 # Headroom for busy/heavy-message bridges; the binary also raises this at
@@ -1235,7 +1235,11 @@ EOF
     systemctl enable "$SERVICE_NAME"
 }
 
-if [ -n "${CORTEN_DEFER_START:-}" ]; then
+if [ -n "${CORTEN_SKIP_SERVICE:-}" ]; then
+    # Second account: ONE shared corten-matrix service runs BOTH bridges
+    # (ExecStart=corten-matrix bridge-all), so don't install a separate unit for it.
+    echo "✓ Second account configured — runs under the shared corten-matrix service"
+elif [ -n "${CORTEN_DEFER_START:-}" ]; then
     # Orchestrator-driven (pkg/cli): install/enable the unit (hard dep) but don't
     # start — the Go CLI starts every account together after the 2nd-account prompt.
     [ "$SYSTEMD_MODE" = "user" ] && install_systemd_user

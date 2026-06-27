@@ -94,6 +94,10 @@ func main() {
 				_ = os.WriteFile(os.Args[2], res, 0o644)
 			}
 			os.Exit(0)
+		case "bridge-all":
+			// ExecStart of the single service: run every configured account's
+			// bridge under this one process (see pkg/cli.RunAllBridges).
+			cli.RunAllBridges()
 		case "setup", "setup-beeper", "start", "stop", "restart",
 			"status", "logs", "bbctl", "reset", "uninstall",
 			"install-service", "uninstall-service":

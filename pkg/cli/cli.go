@@ -26,6 +26,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/lrhodin/corten-matrix/pkg/bbctl"
 	"github.com/lrhodin/corten-matrix/scripts"
@@ -126,21 +127,12 @@ func runEmbeddedScript(name string, args ...string) {
 	exitWith("/bin/bash", append([]string{tmp.Name()}, args...)...)
 }
 
-// serviceCtl runs a lifecycle action on EVERY configured account's service:
-// start/stop/restart/status act on both accounts in one shot. (Only `logs` is
-// per-account — see tailLogs.) Exits non-zero if any account's action failed.
+// serviceCtl runs a lifecycle action on THE bridge service. There is ONE service
+// for both accounts — its ExecStart is `corten-matrix bridge-all`, which runs
+// every configured account's bridge (see RunAllBridges) — so start/stop/restart/
+// status act on a single unit, not one-per-account. (`logs N` is still per-account.)
 func serviceCtl(action string) {
-	labels := []string{serviceLabel(0)}
-	if hasSecondAccount() {
-		labels = append(labels, serviceLabel(1))
-	}
-	failed := false
-	for _, label := range labels {
-		if err := serviceCtlOne(action, label); err != nil {
-			failed = true
-		}
-	}
-	if failed {
+	if err := serviceCtlOne(action, serviceLabel(0)); err != nil {
 		os.Exit(1)
 	}
 	os.Exit(0)
@@ -274,8 +266,9 @@ func setupAccount(beeper bool, idx int) error {
 		bundleID = cortenBundleID + "-1"
 		env = append(env,
 			"BRIDGE_NAME=sh-imessage1",     // Beeper appservice name for the 2nd account
-			"SERVICE_NAME=corten-matrix-1", // local systemd unit / launchd suffix
+			"SERVICE_NAME=corten-matrix-1", // 2nd account's stop/identity name
 			"XDG_DATA_HOME="+dataDir,       // 2nd account's own login/session dir
+			"CORTEN_SKIP_SERVICE=1",        // ONE service runs both bridges — don't install a 2nd
 		)
 	}
 	var name string
@@ -325,6 +318,20 @@ func runSetup(beeper bool) {
 	os.Exit(0)
 }
 
+// reconfigureSecond runs setup for ONLY the second account (`setup 1` /
+// `setup-beeper 1`). It both ADDS a second bridge later (if none exists yet) and
+// RECONFIGURES an existing one (e.g. to flip a toggle like CloudKit backfill),
+// then restarts the single service so bridge-all (re)loads both bridges together.
+func reconfigureSecond(beeper bool) {
+	fmt.Printf("%s═══ Second account (add / reconfigure) ═══%s\n", cAccent, cReset)
+	if err := setupAccount(beeper, 1); err != nil {
+		os.Exit(exitCodeOf(err))
+	}
+	_ = serviceCtlOne("restart", serviceLabel(0)) // one service → both bridges (re)load
+	fmt.Printf("\n%s✓%s Second bridge ready.\n", cGreen, cReset)
+	os.Exit(0)
+}
+
 // startAfterSetup prompts once (default Yes) and starts every configured account.
 // The install scripts only install each service; starting is centralized here so
 // the "add a second account?" prompt is never preceded by a "bridge started".
@@ -339,14 +346,76 @@ func startAfterSetup() {
 			return
 		}
 	}
-	idxs := []int{0}
-	if hasSecondAccount() {
-		idxs = append(idxs, 1)
-	}
-	for _, idx := range idxs {
-		startOneNow(idx)
-	}
+	startOneNow(0) // one service runs every configured account (bridge-all)
 	fmt.Printf("\n%s✓%s Bridge started — view logs with: corten-matrix logs\n", cGreen, cReset)
+}
+
+// RunAllBridges is the ExecStart of the ONE service: it runs every configured
+// account's bridge — account 0 always, plus the optional second account — each
+// logging to its own data dir. If any bridge exits, the rest are signalled and we
+// exit non-zero so systemd/launchd restarts the whole service (both) together.
+func RunAllBridges() {
+	self := selfPath()
+	dirs := []string{cortenDataDir()}
+	if hasSecondAccount() {
+		dirs = append(dirs, secondDataDir())
+	}
+	var cmds []*exec.Cmd
+	for i, d := range dirs {
+		cfg := filepath.Join(d, "config.yaml")
+		if _, err := os.Stat(cfg); err != nil {
+			continue // account not configured yet — skip
+		}
+		// Beeper accounts run via their generated start.sh (permission-fix + the
+		// right flags); a self-hosted account runs the binary against its config.
+		var c *exec.Cmd
+		if _, err := os.Stat(filepath.Join(d, "start.sh")); err == nil {
+			c = exec.Command("/bin/bash", filepath.Join(d, "start.sh"))
+		} else {
+			c = exec.Command(self, "-c", cfg)
+		}
+		c.Env = os.Environ()
+		if i > 0 {
+			c.Env = setEnv(c.Env, "XDG_DATA_HOME", d) // 2nd account's own session dir
+		}
+		_ = os.MkdirAll(filepath.Join(d, "logs"), 0o755)
+		if f, err := os.OpenFile(filepath.Join(d, "logs", "bridge.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+			c.Stdout, c.Stderr = f, f
+		} else {
+			c.Stdout, c.Stderr = os.Stdout, os.Stderr
+		}
+		if err := c.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "corten-matrix: start account %d: %v\n", i, err)
+			continue
+		}
+		cmds = append(cmds, c)
+	}
+	if len(cmds) == 0 {
+		fmt.Fprintln(os.Stderr, "corten-matrix: no configured account to run (run setup first)")
+		os.Exit(1)
+	}
+	exited := make(chan struct{}, len(cmds))
+	for _, c := range cmds {
+		go func(c *exec.Cmd) { _ = c.Wait(); exited <- struct{}{} }(c)
+	}
+	<-exited // first bridge to stop takes the service down → restart as a unit
+	for _, c := range cmds {
+		if c.Process != nil {
+			_ = c.Process.Signal(syscall.SIGTERM)
+		}
+	}
+	os.Exit(1)
+}
+
+// setEnv returns env with key set to val (replacing any existing entry).
+func setEnv(env []string, key, val string) []string {
+	var out []string
+	for _, e := range env {
+		if !strings.HasPrefix(e, key+"=") {
+			out = append(out, e)
+		}
+	}
+	return append(out, key+"="+val)
 }
 
 // startOneNow loads (and force-starts) one account's already-installed service.
@@ -409,7 +478,7 @@ func serviceInstall() {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>%s</string>
-  <key>ProgramArguments</key><array><string>%s</string></array>
+  <key>ProgramArguments</key><array><string>%s</string><string>bridge-all</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>WorkingDirectory</key><string>%s</string>
@@ -439,7 +508,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=%s
+ExecStart=%s bridge-all
 WorkingDirectory=%s
 Restart=on-failure
 RestartSec=5
@@ -518,8 +587,10 @@ func PrintHelp() {
 	fmt.Printf("  %s  %sMatrix ↔ iMessage bridge%s\n\n", hdr, cDim, cReset)
 	fmt.Printf("  %sUsage:%s corten-matrix <command>\n\n", cDim, cReset)
 	rows := [][2]string{
-		{"setup", "configure & start the bridge"},
-		{"setup-beeper", "configure for Beeper"},
+		{"setup", "configure & start (re-run to flip a toggle, e.g. backfill)"},
+		{"setup-beeper", "configure for Beeper (re-run to reconfigure)"},
+		{"setup 1", "add / reconfigure the SECOND account"},
+		{"setup-beeper 1", "add / reconfigure the SECOND account (Beeper)"},
 		{"start", "start the bridge"},
 		{"stop", "stop the bridge"},
 		{"restart", "restart the bridge"},
@@ -537,8 +608,10 @@ func PrintHelp() {
 		fmt.Printf("    %s%-14s%s %s%s%s\n", cAccent, r[0], cReset, cDim, r[1], cReset)
 	}
 	fmt.Println()
+	fmt.Printf("  %sOne service runs every configured account. Re-run a setup command to flip a%s\n", cDim, cReset)
+	fmt.Printf("  %stoggle (backfill, contacts…); add '1' to reconfigure the second account.%s\n\n", cDim, cReset)
 	if hasSecondAccount() {
-		fmt.Printf("  %sTwo accounts configured — start/stop/restart act on both; use 'logs 2' for the second.%s\n\n", cDim, cReset)
+		fmt.Printf("  %sTwo accounts configured — start/stop/restart act on the one service; 'logs 2' = second.%s\n\n", cDim, cReset)
 	}
 }
 
@@ -558,8 +631,14 @@ func IsManagementCommand(cmd string) bool {
 func RunManagement(cmd string, args []string) {
 	switch cmd {
 	case "setup":
+		if len(args) > 0 && args[0] == "1" {
+			reconfigureSecond(false)
+		}
 		runSetup(false)
 	case "setup-beeper":
+		if len(args) > 0 && args[0] == "1" {
+			reconfigureSecond(true)
+		}
 		runSetup(true)
 	case "reset":
 		if runtime.GOOS == "darwin" {

@@ -1100,8 +1100,8 @@ cat > "$PLIST" << PLIST_EOF
     <string>$BUNDLE_ID</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>$DATA_ABS/start.sh</string>
+        <string>$BINARY</string>
+        <string>bridge-all</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$DATA_ABS</string>
@@ -1141,7 +1141,12 @@ cat > "$PLIST" << PLIST_EOF
 </plist>
 PLIST_EOF
 
-if [ -n "${CORTEN_DEFER_START:-}" ]; then
+if [ -n "${CORTEN_SKIP_SERVICE:-}" ]; then
+    # Second account: ONE shared corten-matrix service runs BOTH bridges
+    # (bridge-all), so don't keep a separate LaunchAgent for it.
+    rm -f "$PLIST" 2>/dev/null || true
+    echo "✓ Second account configured — runs under the shared corten-matrix service"
+elif [ -n "${CORTEN_DEFER_START:-}" ]; then
     # Orchestrator-driven (pkg/cli): started centrally after the optional 2nd account.
     echo "✓ Account configured"
 else
