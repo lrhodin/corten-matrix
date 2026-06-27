@@ -139,38 +139,32 @@ func (c *IMClient) lookupContact(identifier string) *imessage.Contact {
 	return nil
 }
 
-// getUniqueParticipantCount counts the number of unique *people* in a
-// participant list by collapsing multiple self-handles into one and merging
-// handles that belong to the same contact.
-func (c *IMClient) getUniqueParticipantCount(participants []string) int {
+// countNonSelfMembers counts the unique non-self members of a conversation
+// across the participant list and the sender, collapsing a contact's alternate
+// handles so a multi-number contact isn't double-counted. The group/DM signal
+// for inbound routing: self is implicit, so >=2 other members means a group.
+// Sender is included because relayed carrier groups omit self from participants.
+func (c *IMClient) countNonSelfMembers(participants []string, sender *string) int {
 	seen := make(map[string]bool)
-	selfSeen := false
 	count := 0
-	for _, p := range participants {
-		normalized := normalizeIdentifierForPortalID(p)
-		if normalized == "" {
-			count++
-			continue
+	add := func(raw string) {
+		n := normalizeIdentifierForPortalID(raw)
+		if n == "" || c.isMyHandle(n) || seen[n] {
+			return
 		}
-		if c.isMyHandle(normalized) {
-			if !selfSeen {
-				selfSeen = true
-				count++
-			}
-			continue
-		}
-		if seen[normalized] {
-			continue
-		}
+		seen[n] = true
 		count++
-		seen[normalized] = true
-		contact := c.lookupContact(normalized)
-		if contact == nil {
-			continue
+		if contact := c.lookupContact(n); contact != nil {
+			for _, altID := range contactPortalIDs(contact) {
+				seen[altID] = true
+			}
 		}
-		for _, altID := range contactPortalIDs(contact) {
-			seen[altID] = true
-		}
+	}
+	for _, p := range participants {
+		add(p)
+	}
+	if sender != nil {
+		add(*sender)
 	}
 	return count
 }

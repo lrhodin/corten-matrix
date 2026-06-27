@@ -736,7 +736,7 @@ func fnRestoreChatFromCloudKit(ce *commands.Event, login *bridgev2.UserLogin, cl
 		recoverableChats, err := client.client.ListRecoverableChats()
 		if err == nil {
 			for _, chat := range recoverableChats {
-				portalID := client.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style)
+				portalID := client.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style, chat.Service)
 				if portalID == "" || seenPortalIDs[portalID] {
 					continue
 				}
@@ -1231,7 +1231,7 @@ func fnRestoreDebug(ce *commands.Event) {
 				photo = " photo=" + g + "…"
 			}
 
-			portalID := client.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style)
+			portalID := client.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style, chat.Service)
 			cacheBackfillable := "?"
 			cacheContentful := "?"
 			if portalID != "" {

@@ -2163,6 +2163,85 @@ func (s *cloudBackfillStore) resetForwardBackfillDone(ctx context.Context, porta
 	return err
 }
 
+// carrierGroupChatRow is one carrier-service (SMS/RCS/MMS) group cloud_chat row
+// used by the participant-set consolidation migration.
+type carrierGroupChatRow struct {
+	portalID     string
+	participants []string
+}
+
+// listCarrierGroupChats returns the distinct group portals (gid: or comma) for
+// non-deleted SMS/RCS/MMS chats, each with its normalized participant roster, for
+// consolidateCarrierGroupPortals. DM portals and empty-roster rows are excluded.
+func (s *cloudBackfillStore) listCarrierGroupChats(ctx context.Context) ([]carrierGroupChatRow, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT DISTINCT portal_id, participants_json FROM cloud_chat
+		 WHERE login_id=$1 AND UPPER(TRIM(service)) IN ('SMS','RCS','MMS') AND deleted=FALSE
+		   AND portal_id <> '' AND participants_json IS NOT NULL AND participants_json <> ''
+		   AND (portal_id LIKE 'gid:%' OR portal_id LIKE '%,%')`,
+		s.loginID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []carrierGroupChatRow
+	seen := make(map[string]bool)
+	for rows.Next() {
+		var portalID, participantsJSON string
+		if err = rows.Scan(&portalID, &participantsJSON); err != nil {
+			return nil, err
+		}
+		if seen[portalID] {
+			continue
+		}
+		var raw []string
+		if err = json.Unmarshal([]byte(participantsJSON), &raw); err != nil {
+			continue
+		}
+		normalized := make([]string, 0, len(raw))
+		for _, p := range raw {
+			if n := normalizeIdentifierForPortalID(p); n != "" {
+				normalized = append(normalized, n)
+			}
+		}
+		if len(normalized) == 0 {
+			continue
+		}
+		seen[portalID] = true
+		out = append(out, carrierGroupChatRow{portalID: portalID, participants: normalized})
+	}
+	return out, rows.Err()
+}
+
+// reKeyPortalID re-points all cloud_chat and cloud_message rows from oldPortalID
+// to newPortalID and resets forward-backfill state so the re-keyed messages
+// re-backfill into the new portal's room. updated_ts is bumped so the portal
+// isn't skipped by the "fully backfilled, no new content" startup filter.
+// Mirrors the normalizeGroup*PortalIDs migrations. No-op-safe.
+func (s *cloudBackfillStore) reKeyPortalID(ctx context.Context, oldPortalID, newPortalID string) error {
+	if oldPortalID == "" || newPortalID == "" || oldPortalID == newPortalID {
+		return nil
+	}
+	nowMS := time.Now().UnixMilli()
+	if _, err := s.db.Exec(ctx,
+		`UPDATE cloud_chat SET portal_id=$3, fwd_backfill_done=0, updated_ts=$4
+		 WHERE login_id=$1 AND portal_id=$2`,
+		s.loginID, oldPortalID, newPortalID, nowMS,
+	); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(ctx,
+		`UPDATE cloud_message SET portal_id=$3, updated_ts=$4
+		 WHERE login_id=$1 AND portal_id=$2`,
+		s.loginID, oldPortalID, newPortalID, nowMS,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
 // persistMessageUUID inserts a minimal cloud_message record for a realtime
 // APNs message so the UUID survives restarts. CloudKit-synced messages are
 // already stored via upsertMessageBatch; this covers the realtime path.
