@@ -133,14 +133,26 @@ The `corten-matrix` binary is both the bridge and its management CLI — it repl
 
 The same `start` / `stop` / `restart` / `status` / `logs` commands work on both platforms, so you don't have to remember whether the host uses `launchctl` or `systemctl` — the raw equivalents are in [Management](#management) if you'd rather wire your own thing.
 
-### A second iMessage account
+### Dual accounts (two Apple IDs)
 
-corten-matrix can bridge a **second Apple ID** on the same machine (max two). It's an explicit, one-line command — there's no mid-setup prompt:
+corten-matrix can bridge **two Apple IDs** on the same machine (max two), each as its own fully-isolated bridge — separate iMessage login/session, data dir, config, and Matrix appservice — run together under a **single** background service.
 
-- **Add it any time** with `corten-matrix setup 1` (self-hosted) or `corten-matrix setup-beeper 1` (Beeper). You'll get the same configuration prompts and iMessage login, scoped to the second bridge.
+**Add or reconfigure a second account** — it's an explicit one-line command, there's no mid-setup prompt:
+
+- **Add it any time** with `corten-matrix setup 1` (self-hosted) or `corten-matrix setup-beeper 1` (Beeper). You get the same configuration prompts and iMessage login, scoped to the second bridge.
 - **Reconfigure it later** by re-running the same command — e.g. to flip a toggle like CloudKit backfill.
 
-Both accounts run under a **single** background service (one launchd agent / systemd unit), so `start` / `stop` / `restart` / `status` act on both at once. The second account's data lives in `~/.local/share/corten-matrix-1`, and `corten-matrix logs 1` tails its log.
+**How it works.** The two accounts never share login state. The first lives in `~/.local/share/corten-matrix`, the second in `~/.local/share/corten-matrix-1`. A single service runs *both* bridge processes (`bridge-all`), so `start` / `stop` / `restart` / `status` act on both at once; `corten-matrix logs` tails the first account and `corten-matrix logs 1` the second.
+
+**macOS history-backfill caveat.** Each account backfills message history from either **CloudKit** (iCloud sync) or the local **chat.db** (the Mac's Messages database). chat.db only ever holds the messages of the *one* Apple ID signed into Messages on that Mac, so the two accounts can't both use it:
+
+| Account 1 | Account 2 | Works? |
+|---|---|---|
+| CloudKit | CloudKit | ✅ |
+| chat.db | CloudKit | ✅ |
+| chat.db | chat.db | ❌ — only one local Messages database exists |
+
+So **at most one** account can use chat.db backfill — the Apple ID signed into Messages on the Mac — and the other must use CloudKit. This only limits *history backfill*; real-time messaging works for both accounts regardless. (Linux has no chat.db, so both accounts always use CloudKit.)
 
 ## Login
 
