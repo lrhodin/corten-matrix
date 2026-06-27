@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -34,12 +35,31 @@ import (
 
 const cortenBundleID = "com.lrhodin.corten-matrix"
 
+// effectiveHome resolves the REAL target user's home even when the binary is
+// invoked via sudo. Under sudo, $HOME / os.UserHomeDir() point at root's home
+// (/root), so config, session, and anisette state would land there while the
+// service — which runs as the real login user — looks for them under that user's
+// home. That split is exactly the "logged in fine under /home/<user>, then a
+// later run provisioned fresh under /root and failed" symptom. When running as
+// root with a real $SUDO_USER, use that user's home; otherwise (a normal user,
+// or true root in an LXC container) keep the existing $HOME behaviour.
+func effectiveHome() string {
+	if os.Geteuid() == 0 {
+		if su := os.Getenv("SUDO_USER"); su != "" && su != "root" {
+			if u, err := user.Lookup(su); err == nil && u.HomeDir != "" {
+				return u.HomeDir
+			}
+		}
+	}
+	home, _ := os.UserHomeDir()
+	return home
+}
+
 func cortenDataDir() string {
 	if x := os.Getenv("XDG_DATA_HOME"); x != "" {
 		return filepath.Join(x, "corten-matrix")
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "share", "corten-matrix")
+	return filepath.Join(effectiveHome(), ".local", "share", "corten-matrix")
 }
 
 // DataDir returns the bridge data directory (~/.local/share/corten-matrix, or
@@ -214,10 +234,33 @@ func runSetupScript(extraEnv []string, name string, args ...string) error {
 		return err
 	}
 	tmp.Close()
-	_ = os.Chmod(tmp.Name(), 0o755)
-	c := exec.Command("/bin/bash", append([]string{tmp.Name()}, args...)...)
+	_ = os.Chmod(tmp.Name(), 0o755) // 0o755 so a dropped-to user can read/exec it
+
+	bashArgs := append([]string{tmp.Name()}, args...)
+	var c *exec.Cmd
+	// When launched via sudo (root, but a real $SUDO_USER), run the script — and
+	// the bridge `login` it spawns — AS that user via `sudo -u`, so config,
+	// session, and anisette are owned by the login user (not root) and land in
+	// their home. The script then sudo-elevates only the systemd bits itself
+	// ($SUDO). Without this, a sudo-launched setup writes root-owned state into
+	// /home/<user> (or into /root) that the service, running as the login user,
+	// can't read — the "logged in fine once, then it stopped working" symptom.
+	// True root with no SUDO_USER (e.g. LXC) runs directly, unchanged.
+	if os.Geteuid() == 0 {
+		if su := os.Getenv("SUDO_USER"); su != "" && su != "root" {
+			// `env KEY=VAL …` re-injects the orchestration vars (sudo would
+			// otherwise scrub them); -H sets HOME to the target user's home.
+			sudoArgs := []string{"-u", su, "-H", "env"}
+			sudoArgs = append(sudoArgs, extraEnv...)
+			sudoArgs = append(sudoArgs, "/bin/bash")
+			c = exec.Command("sudo", append(sudoArgs, bashArgs...)...)
+		}
+	}
+	if c == nil {
+		c = exec.Command("/bin/bash", bashArgs...)
+		c.Env = append(os.Environ(), extraEnv...)
+	}
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
-	c.Env = append(os.Environ(), extraEnv...)
 	return c.Run()
 }
 
