@@ -1,7 +1,7 @@
 # Corten-Matrix
 
 
-**Please Note: Prebuily Releases are Currently in BETA and will reuqire a new key extraction. If you would like to try these releases please read the [README](https://github.com/lrhodin/corten-matrix/blob/beta/README.md) and use the new extraction tool.**
+**Please Note: Prebuilt binaries are currently in BETA and will reuqire a new key extraction. If you would like to try these releases please read the [README](https://github.com/lrhodin/corten-matrix/blob/beta/README.md) and use the new extraction tool.**
 
 A Matrix–iMessage puppeting bridge built on [rustpush](https://github.com/OpenBubbles/rustpush) — like its namesake steel, the oxidation is the protective layer. Send and receive iMessages from any Matrix client.
 
