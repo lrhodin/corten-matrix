@@ -1627,22 +1627,19 @@ func (c *IMClient) Disconnect() {
 		close(c.stopChan)
 		c.stopChan = nil
 	}
-	// Close the APNs ResourceManager before stopping the Client. The death
-	// signal aborts any ongoing generate() reconnect attempt inside the Tokio
-	// runtime, freeing worker threads that would otherwise prevent client.Stop()
-	// from being scheduled. Without this ordering, a prolonged reconnect storm
-	// can exhaust all Tokio workers and cause client.Stop() to block forever.
-	//
-	// Do NOT nil c.connection here — the watchdog goroutine may still be in its
-	// 5-second poll sleep and will call SecondsSinceLastInbound() before it sees
-	// the stopChan close. Close() is safe to call on a live WrappedApsConnection;
-	// it only signals the ResourceManager to stop, it does not free the Go object.
+	// Close the APNs ResourceManager BEFORE stopping the Client: its death signal
+	// aborts any in-flight generate() reconnect, freeing Tokio workers so Stop()
+	// can be scheduled. With the reverse ordering a prolonged reconnect storm can
+	// exhaust all workers and make Stop() block forever. Don't nil c.connection —
+	// the watchdog may still poll it; Close() signals stop without freeing the Go object.
 	if c.connection != nil {
 		c.connection.Close()
 	}
 	if c.client != nil {
-		// Stop() is an async Rust/UniFFI call. Wrap it with a timeout so that a
-		// wedged Tokio runtime cannot block the reconnect path indefinitely.
+		// Stop() is an async Rust/UniFFI call; bound it with a timeout so a wedged
+		// Tokio runtime can't block the reconnect path forever. Destroy() runs
+		// regardless — UniFFI refcounting defers the free until any in-flight Stop()
+		// returns, so the leaked goroutine never touches freed memory.
 		stopDone := make(chan struct{})
 		go func() {
 			c.client.Stop()
