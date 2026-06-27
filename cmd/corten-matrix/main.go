@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/beeper/bridge-manager/api/beeperapi"
@@ -67,8 +68,16 @@ func init() {
 func main() {
 	m.InitVersion(Tag, Commit, BuildTime)
 
+	// Let any host-command extensions registered by the build configuration
+	// contribute their `help` rows.
+	cli.ExtraHelpRows = connector.ExtraHostHelp()
+
 	// Handle subcommands / flags before normal bridge startup.
 	if len(os.Args) > 1 && os.Args[0] != "-" {
+		// Give host-command extensions first refusal on the subcommand.
+		if connector.HandleHostCommand(os.Args[1:], Tag, runtime.GOOS, runtime.GOARCH) {
+			return
+		}
 		switch os.Args[1] {
 		case "help", "-h", "--help":
 			cli.PrintHelp()

@@ -581,6 +581,11 @@ func runBbctl(args []string) {
 	os.Exit(0)
 }
 
+// ExtraHelpRows holds extra {command, description} rows contributed by the
+// build configuration's host-command extensions (none in the base build). Set
+// from main before any help is printed; appended to the listing by PrintHelp.
+var ExtraHelpRows [][2]string
+
 // printHelp shows the user-facing command list (clean, accent-colored).
 func PrintHelp() {
 	hdr := cBold + cAccent + "◆ corten-matrix" + cReset
@@ -605,6 +610,7 @@ func PrintHelp() {
 		{"bbctl <args>", "Beeper bridge-manager CLI"},
 		{"help", "show this help"},
 	}
+	rows = append(rows, ExtraHelpRows...)
 	for _, r := range rows {
 		fmt.Printf("    %s%-14s%s %s%s%s\n", cAccent, r[0], cReset, cDim, r[1], cReset)
 	}
