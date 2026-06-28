@@ -7478,6 +7478,34 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 					return avatarData, nil
 				},
 			}
+		} else if contact.AvatarURL != "" {
+			// The address book knows this contact has a photo, but its bytes
+			// aren't cached yet — still downloading, or its last fetch hit a
+			// transient failure (e.g. an iCloud rate-limit when a restart
+			// re-downloads the whole address book at once). Hand the framework a
+			// NON-nil avatar regardless. A nil avatar takes UpdateInfo's
+			// "not expecting one ever" branch, which latches AvatarSet=true on an
+			// empty MXC permanently: once latched, UpdateInfoIfNecessary
+			// early-returns forever and the photo is never re-fetched, so the DM
+			// shows no picture for good even after the bytes arrive. (This is the
+			// recurring "moon froze the contact photo" report — the moon's
+			// NameIsCustom blocks the ghost->room sync, exposing the blanked
+			// ghost avatar.) Get returns the bytes once a sync fills them in, else
+			// errors so the framework leaves AvatarSet=false and the next contact
+			// reconcile retries. Keyed on the photo URL so it stays idempotent
+			// until the contact actually changes their picture.
+			urlHash := sha256.Sum256([]byte(contact.AvatarURL))
+			ui.Avatar = &bridgev2.Avatar{
+				ID: networkid.AvatarID(fmt.Sprintf("contact:%s:url:%s", identifier, hex.EncodeToString(urlHash[:8]))),
+				Get: func(ctx context.Context) ([]byte, error) {
+					// Re-read under the cache lock for the freshest bytes and to
+					// avoid racing the download goroutines that write Avatar.
+					if fresh, _ := c.contacts.GetContactInfo(localID); fresh != nil && len(fresh.Avatar) > 0 {
+						return fresh.Avatar, nil
+					}
+					return nil, fmt.Errorf("contact photo pending download")
+				},
+			}
 		}
 		return ui, nil
 	}
