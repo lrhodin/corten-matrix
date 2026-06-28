@@ -7461,9 +7461,29 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		// parse as a phone number, so the contact renders with no number.
 		// contactPortalIDs() already produces clean E.164 tel: / lowercased
 		// mailto: IDs and dedupes them — reuse it instead of re-deriving here.
+		portalIDs := contactPortalIDs(contact)
+		// Default to the phone number when the contact has one. Beeper resolves a
+		// DM's contact card — avatar, and the phone/call button — from this
+		// identifier list, and the framework SORTS it (ghost.go prepareContactInfo),
+		// so "mailto:" sorts ahead of "tel:". Leaking an email alongside the phone
+		// made Beeper treat a phone DM as an email contact: it picked the email as
+		// the primary handle, blanking the generated avatar and dropping the phone
+		// (no call button). So when the contact has any phone, emit ONLY tel: IDs;
+		// fall back to emails only for genuinely phone-less (email-addressed)
+		// contacts. Matches the phone-preference of canonicalContactHandle.
+		hasPhone := strings.HasPrefix(identifier, "tel:")
+		for _, id := range portalIDs {
+			if strings.HasPrefix(id, "tel:") {
+				hasPhone = true
+				break
+			}
+		}
 		seen := map[string]bool{identifier: true}
-		for _, id := range contactPortalIDs(contact) {
+		for _, id := range portalIDs {
 			if seen[id] {
+				continue
+			}
+			if hasPhone && strings.HasPrefix(id, "mailto:") {
 				continue
 			}
 			seen[id] = true
