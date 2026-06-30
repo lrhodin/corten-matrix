@@ -1632,8 +1632,23 @@ func (c *IMClient) Disconnect() {
 	// can be scheduled. With the reverse ordering a prolonged reconnect storm can
 	// exhaust all workers and make Stop() block forever. Don't nil c.connection —
 	// the watchdog may still poll it; Close() signals stop without freeing the Go object.
+	//
+	// Close() is a synchronous Rust/UniFFI call, but during a prolonged
+	// receive-wedge ResourceManager's close() can itself contend with the
+	// same saturated Tokio runtime it's trying to tear down (see #56/#63).
+	// Bound it the same way as client.Stop() below so a wedge in either call
+	// can't hang Disconnect() indefinitely.
 	if c.connection != nil {
-		c.connection.Close()
+		closeDone := make(chan struct{})
+		go func() {
+			c.connection.Close()
+			close(closeDone)
+		}()
+		select {
+		case <-closeDone:
+		case <-time.After(10 * time.Second):
+			c.UserLogin.Log.Warn().Msg("connection.Close() timed out during disconnect; proceeding to client.Stop()")
+		}
 	}
 	if c.client != nil {
 		// Stop() is an async Rust/UniFFI call; bound it with a timeout so a wedged
