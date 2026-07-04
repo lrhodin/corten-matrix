@@ -1,6 +1,6 @@
-# Corten-Matrix (beta)
+# Corten-Matrix
 
-> **Beta** This branch has breaking changes! Corten-Matrix now ships as **prebuilt binaries**, and moving onto them requires a clean reinstall and a fresh backfill (and, on Linux, a new key extraction) — see [Upgrading to binary releases](#upgrading-to-binary-releases) before you update.
+> **NEW** This branch has breaking changes! Corten-Matrix now ships as **prebuilt binaries**, and moving onto them requires a clean reinstall and a fresh backfill and, on Linux, a new key [extraction](#step-1-extract-hardware-key-one-time-on-a-mac) with a new [tool](https://github.com/lrhodin/corten-matrix/tree/2d3e3f5ac7fd312a23993c9083df2d6dba2495ef/tools) — see [Upgrading to binary releases](#upgrading-to-binary-releases) before you update.
 
 
 **Please Note: Prebuilt binaries are currently in BETA and will require a new key extraction. If you would like to try these releases please read the [README](https://github.com/lrhodin/corten-matrix/blob/beta/README.md) and use the new extraction tool.**
