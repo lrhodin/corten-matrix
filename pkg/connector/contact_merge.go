@@ -67,8 +67,27 @@ func (c *IMClient) resolveContactPortalID(identifier string) networkid.PortalID 
 	return defaultID
 }
 
+// validateTargetsSafe wraps Client.ValidateTargets with a recover guard.
+// The call crosses into the identity-manager FFI path, which has reachable
+// panic sites upstream (identity_manager.rs:249/335/542/555); a panic must
+// not crash the bridge, so it degrades to "nothing validated" (nil). Shared
+// by the send path and user-triggered commands.
+func (c *IMClient) validateTargetsSafe(targets []string) (valid []string) {
+	if c.client == nil || len(targets) == 0 {
+		return nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			c.UserLogin.Log.Error().Interface("panic", r).Int("targets", len(targets)).
+				Msg("ValidateTargets panicked in FFI path")
+			valid = nil
+		}
+	}()
+	return c.client.ValidateTargets(targets, c.handle)
+}
+
 // resolveSendTarget determines the best identifier to send to for a DM portal.
-func (c *IMClient) resolveSendTarget(portalID string) (target string) {
+func (c *IMClient) resolveSendTarget(portalID string) string {
 	if c.client == nil || strings.Contains(portalID, ",") {
 		return portalID
 	}
@@ -78,17 +97,6 @@ func (c *IMClient) resolveSendTarget(portalID string) (target string) {
 	if contact == nil || len(altIDs) <= 1 {
 		return portalID
 	}
-	// ValidateTargets crosses into the identity-manager FFI path. Upstream
-	// has reachable panic sites (identity_manager.rs:249/335/542/555); fall
-	// back to the original portalID if the FFI call panics rather than
-	// crashing the send path.
-	defer func() {
-		if r := recover(); r != nil {
-			c.UserLogin.Log.Error().Interface("panic", r).Str("portal_id", portalID).
-				Msg("resolveSendTarget panicked in FFI path — falling back to original portalID")
-			target = portalID
-		}
-	}()
 
 	// Validate the portal's own handle alone first. In the common case it is
 	// reachable and this stays a single-handle IDS query; including the
@@ -97,7 +105,7 @@ func (c *IMClient) resolveSendTarget(portalID string) (target string) {
 	// rust-side, so dead alternates would be re-fetched from Apple hourly),
 	// and it would couple the portal handle's validation to the alternates'
 	// failure domain — one erroring batch would blank out everything.
-	if valid := c.client.ValidateTargets([]string{portalID}, c.handle); len(valid) > 0 {
+	if valid := c.validateTargetsSafe([]string{portalID}); len(valid) > 0 {
 		return portalID
 	}
 
@@ -113,7 +121,7 @@ func (c *IMClient) resolveSendTarget(portalID string) (target string) {
 		Int("alternates", len(alternates)).
 		Msg("Portal ID not reachable on iMessage, trying alternate contact numbers")
 
-	valid := c.client.ValidateTargets(alternates, c.handle)
+	valid := c.validateTargetsSafe(alternates)
 	validSet := make(map[string]struct{}, len(valid))
 	for _, id := range valid {
 		validSet[id] = struct{}{}

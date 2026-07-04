@@ -78,3 +78,13 @@ func TestPickSendTargetNothingValid(t *testing.T) {
 		t.Fatalf("pickSendTarget() = (%q, %v), want (%q, false)", got, ok, portalID)
 	}
 }
+
+func TestValidateTargetsSafeGuardsNilClientAndEmptyTargets(t *testing.T) {
+	c := &IMClient{}
+	if got := c.validateTargetsSafe([]string{"tel:+15551234567"}); got != nil {
+		t.Fatalf("validateTargetsSafe() with nil client = %#v, want nil", got)
+	}
+	if got := c.validateTargetsSafe(nil); got != nil {
+		t.Fatalf("validateTargetsSafe(nil) = %#v, want nil", got)
+	}
+}
