@@ -9485,18 +9485,42 @@ func (c *IMClient) persistState(log zerolog.Logger) {
 			log.Warn().Interface("panic", r).Msg("persistState panicked — skipped this cycle")
 		}
 	}()
-	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+	// Snapshot FFI state into locals before touching Metadata: the final
+	// stopChan-triggered save can stall inside connection.State() on a
+	// wedged runtime, and by the time it returns bridgev2 may have replaced
+	// this client (recreateClient after a wedge rebuild). Metadata is shared
+	// with the successor, so a late write would clobber its fresh state both
+	// in memory and, via Save, in the DB.
+	var apsState, idsUsers, idsIdentity, deviceID string
+	var haveAPS, haveUsers, haveIdentity, haveDevice bool
 	if c.connection != nil {
-		meta.APSState = c.connection.State().ToString()
+		apsState, haveAPS = c.connection.State().ToString(), true
 	}
 	if c.users != nil {
-		meta.IDSUsers = c.users.ToString()
+		idsUsers, haveUsers = c.users.ToString(), true
 	}
 	if c.identity != nil {
-		meta.IDSIdentity = c.identity.ToString()
+		idsIdentity, haveIdentity = c.identity.ToString(), true
 	}
 	if c.config != nil {
-		meta.DeviceID = c.config.GetDeviceId()
+		deviceID, haveDevice = c.config.GetDeviceId(), true
+	}
+	if cur, _ := c.UserLogin.Client.(*IMClient); cur != c {
+		log.Debug().Msg("Dropping state save from a replaced client")
+		return
+	}
+	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+	if haveAPS {
+		meta.APSState = apsState
+	}
+	if haveUsers {
+		meta.IDSUsers = idsUsers
+	}
+	if haveIdentity {
+		meta.IDSIdentity = idsIdentity
+	}
+	if haveDevice {
+		meta.DeviceID = deviceID
 	}
 	if err := c.UserLogin.Save(context.Background()); err != nil {
 		log.Err(err).Msg("Failed to persist state")
