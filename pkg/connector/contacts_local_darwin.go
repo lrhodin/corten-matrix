@@ -5,8 +5,8 @@ package connector
 import (
 	"github.com/rs/zerolog"
 
-	"github.com/lrhodin/imessage/imessage"
-	"github.com/lrhodin/imessage/imessage/mac"
+	"github.com/lrhodin/corten-matrix/imessage"
+	"github.com/lrhodin/corten-matrix/imessage/mac"
 )
 
 // localContactSource wraps the macOS Contacts framework as a contactSource.

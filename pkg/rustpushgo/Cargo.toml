@@ -4,18 +4,63 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["staticlib", "rlib"]
+# cdylib: Seam 1 — the prebuilt Go bridge dynamically loads librustpushgo
+# (.dylib/.so) at runtime, so rustpush is never baked into our shipped binary
+# (the user builds the .dylib locally at install). staticlib/rlib retained for
+# the legacy in-tree static build path.
+crate-type = ["cdylib", "staticlib", "rlib"]
 name = "rustpushgo"
 
 [features]
-# hardware-key enables open-absinthe (x86 NAC emulator via unicorn-engine).
-# Required on Linux; unnecessary on macOS (native AAAbsintheContext is used).
-# The Makefile passes --features hardware-key on Linux only.
-default = []
+# Public/release default: source-portable clean-room registration crypto on
+# every supported OS, including Linux (the bridge's default deployment target).
+#
+# - NAC: open-absinthe/native-nac-rust (pure Rust ValidationCtx::new/
+#   key_establishment/sign; no unicorn or Apple framework required)
+# - ADI/anisette: omnisette + icloud_auth remote-clearadi (ClearADIClient backed
+#   by the clearadi crate's portable ProvisioningSession + gen_otp)
+default = ["cleanroom-registration"]
+cleanroom-registration = [
+    "open-absinthe/native-nac-rust",
+    "rustpush/remote-clearadi",
+    "icloud_auth/remote-clearadi",
+    "omnisette/remote-clearadi",
+]
+# hardware-key enables the cross-platform hardware-key config API in this
+# wrapper. With default features enabled (the Makefile's Linux path), the NAC
+# implementation selected underneath it is native-nac-rust. With
+# `--no-default-features --features hardware-key`, it remains possible to build
+# the legacy emulator path explicitly for debugging.
 hardware-key = ["rustpush/macos-validation-data"]
 # Enables CloudKit avid (Live Photo MOV) download paths when the linked
 # rustpush fork exposes the required API and record fields.
 rustpush-avid-download = []
+
+# --- Off-by-default fallbacks ------------------------------------------------
+# These are ADDITIVE toggles (Cargo features can only be turned ON, never OFF,
+# so each legacy path is re-enabled by opting IN, not by opting out of the
+# clean-room default). To reproduce the old Linux dependency shape exactly, use
+# `--no-default-features --features hardware-key,anisette-remote-v3`.
+#
+# nac-apple-framework: compile Apple's AAAbsintheContext NAC path
+# (open-absinthe `native-nac`, via the nac-validation crate) back in as a
+# fallback. NOTE: with native-nac-rust enabled it is still tried first in
+# ValidationCtx::new() and is byte-exact producing, so this only restores
+# availability of the framework path; it does not change the selected default.
+nac-apple-framework = ["open-absinthe/native-nac"]
+# anisette-aoskit: re-select Apple's native AOSKit anisette provider on macOS
+# even though the clearadi (clean-room ADI) provider is compiled in. Used to
+# fall back to the framework provider without rebuilding without remote-clearadi.
+anisette-aoskit = ["omnisette/prefer-aoskit"]
+# anisette-remote-v3: legacy Linux remote anisette service provider, including
+# the bridge wrapper that retries/guards RemoteAnisetteProviderV3. Intended for
+# debugging only; public Linux builds should use cleanroom-registration.
+anisette-remote-v3 = [
+    "rustpush/remote-anisette-v3",
+    "icloud_auth/remote-anisette-v3",
+    "omnisette/remote-anisette-v3",
+    "omnisette/prefer-remote-anisette-v3",
+]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -24,16 +69,19 @@ uniffi = { version = "0.25.0", features = ["tokio"] }
 pretty_env_logger = "0.5.0"
 log = "0.4.20"
 rustpush = { path = "../../third_party/rustpush-upstream", default-features = false, features = ["macos-validation-data"] }
+icloud_auth = { path = "../../third_party/rustpush-upstream/apple-private-apis/icloud-auth", default-features = false }
+omnisette = { path = "../../third_party/rustpush-upstream/apple-private-apis/omnisette", default-features = false }
 # Direct path dep on cloudkit-proto so the `CloudKitRecord` derive macro (which
 # emits `cloudkit_proto::*` references in its generated code) can resolve the
 # crate name inside our wrapper. Without this, defining a local CloudKitRecord
 # type in lib.rs fails to compile because the derive expects the crate to be
 # importable by its literal name.
 cloudkit-proto = { path = "../../third_party/rustpush-upstream/cloudkit-proto", package = "cloudkit-proto" }
-# Direct dep on open-absinthe so the wrapper can call
-# `open_absinthe::nac::set_relay_config` from Linux and macOS alike.
-# Points to third_party/ — the Makefile applies our overlay from
-# rustpush/open-absinthe/ on top after cloning upstream.
+# Direct dep on open-absinthe so the cleanroom-registration feature can enable
+# native-nac-rust for the rustpush dependency via Cargo feature unification, and
+# so nac-apple-framework can enable open-absinthe/native-nac. Points to
+# third_party/ — the Makefile applies our overlay from rustpush/open-absinthe/
+# on top after cloning upstream.
 open-absinthe = { path = "../../third_party/rustpush-upstream/open-absinthe" }
 keystore = { path = "../../third_party/rustpush-upstream/keystore" }
 plist = "1.7.0"
@@ -61,7 +109,10 @@ aes-siv = "0.7.0"
 hkdf = "0.12.4"
 aes = "0.8.4"
 ctr = "0.9.2"
-openssl = "0.10.56"
+# vendored: build OpenSSL from source and link it statically into every target.
+# Required for cross-compiling (no system OpenSSL for x86_64-darwin / Linux on an
+# arm64 Mac) and gives users a self-contained Linux binary with no libssl to install.
+openssl = { version = "0.10.56", features = ["vendored"] }
 reqwest = { version = "0.11", features = ["stream", "rustls-tls", "rustls-tls-webpki-roots", "gzip"] }
 # Direct dep on rustls 0.23 so we can install the aws-lc-rs CryptoProvider
 # at startup. Upstream rustpush pulled in rustls 0.23 (transitively, via the
@@ -71,29 +122,6 @@ reqwest = { version = "0.11", features = ["stream", "rustls-tls", "rustls-tls-we
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 once_cell = "1"
 rand = { version = "0.8.5", features = ["min_const_gen"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-icloud_auth = { path = "../../third_party/rustpush-upstream/apple-private-apis/icloud-auth", default-features = false }
-omnisette = { path = "../../third_party/rustpush-upstream/apple-private-apis/omnisette", default-features = false }
-nac-validation = { path = "../../nac-validation" }
-# Enable the `native-nac` feature on open-absinthe so its `ValidationCtx`
-# delegates to nac-validation (AAAbsintheContext) instead of running the
-# unicorn XNU emulator. This preserves the bridge's "Local NAC" behavior
-# (native macOS NAC generation, no relay, no emulator) while keeping the
-# OSConfig impl as upstream's `rustpush::macos::MacOSConfig`. Cargo unifies
-# this dep with rustpush's own path dep on open-absinthe; features are
-# additive so the `native-nac` flag propagates into both users.
-open-absinthe = { path = "../../third_party/rustpush-upstream/open-absinthe", features = ["native-nac"] }
-
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-icloud_auth = { path = "../../third_party/rustpush-upstream/apple-private-apis/icloud-auth", default-features = false, features = ["remote-anisette-v3"] }
-omnisette = { path = "../../third_party/rustpush-upstream/apple-private-apis/omnisette", default-features = false, features = ["remote-anisette-v3"] }
-# WebSocket + datetime + futures adapters for the wrapper-level anisette
-# pre-provisioner (see src/anisette.rs). Versions match upstream omnisette
-# exactly so cargo feature unification doesn't double up crates.
-tokio-tungstenite = { version = "0.20.1", features = ["rustls-tls-webpki-roots"] }
-chrono = "0.4.37"
-futures-util = "0.3.28"
 
 [build-dependencies]
 uniffi = { version = "0.25.0", features = ["build"] }

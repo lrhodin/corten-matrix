@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2022 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -28,7 +28,7 @@ import (
 
 	"maunium.net/go/mautrix/id"
 
-	"github.com/lrhodin/imessage/ipc"
+	"github.com/lrhodin/corten-matrix/ipc"
 )
 
 var (
@@ -97,7 +97,7 @@ var TempFilePermissions os.FileMode = 0640
 var TempDirPermissions os.FileMode = 0700
 
 func SendFilePrepare(filename string, data []byte) (string, string, error) {
-	dir, err := TempDir("mautrix-imessage-upload")
+	dir, err := TempDir("corten-matrix-upload")
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create temp dir: %w", err)
 	}

@@ -1,0 +1,15 @@
+#!/bin/bash
+# Hard guard: refuse to commit private/closed-source or build paths, even when
+# staged with `git add -f` (which bypasses .gitignore). Tracked in .githooks/ so
+# it travels with the repo. Activate per clone with:
+#     git config core.hooksPath .githooks
+blocked=$(git diff --cached --name-only | grep -E '^third_party/rustpush-upstream/|^dist/|(^|/)librustpushgo\.a$|(^|/)target/')
+if [ -n "$blocked" ]; then
+  echo "✗ COMMIT BLOCKED — private/build paths are staged:" >&2
+  echo "$blocked" | sed 's/^/   /' >&2
+  echo "" >&2
+  echo "These must NEVER be committed (private APIs / sealed clean-room / build output)." >&2
+  echo "Unstage with:  git restore --staged <path>" >&2
+  exit 1
+fi
+exit 0

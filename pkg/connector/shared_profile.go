@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // This program is free software: you can redistribute it and/or modify
@@ -20,7 +20,7 @@ import (
 	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 
-	"github.com/lrhodin/imessage/pkg/rustpushgo"
+	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
 )
 
 // CloudKit rate-limit guards for the periodic shared-profile re-fetch.

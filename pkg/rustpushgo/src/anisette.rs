@@ -1,6 +1,10 @@
-//! Linux anisette wrapper around upstream's `RemoteAnisetteProviderV3`.
+//! Legacy Linux anisette wrapper around `RemoteAnisetteProviderV3`.
 //!
-//! Upstream's provisioning has three bugs we work around here:
+//! This module is compiled only with rustpushgo's `anisette-remote-v3` fallback
+//! feature. The public/default Linux path uses omnisette's clean-room
+//! `ClearADIClient` instead.
+//!
+//! The `RemoteAnisetteProviderV3` provisioning has three bugs we work around here:
 //!   1. The `ProvisionInput` enum is missing `EndProvisioningError`, so a
 //!      transient Apple rejection crashes serde instead of returning an error.
 //!   2. The provision() loop (`let Some(Ok(data)) = ... else { continue }`)
@@ -14,7 +18,7 @@
 //!      operation deadlocks — including message send.
 //!
 //! This wrapper catches those failures, retries, and adds a timeout. All
-//! Apple-facing requests go through upstream's code unchanged.
+//! Apple-facing requests go through the provider's code unchanged.
 //!
 //! STATE PRESERVATION: we DO NOT automatically delete state.plist on
 //! transient errors. The anisette state carries the device identity
@@ -23,7 +27,7 @@
 //! identity, which Apple treats as a new device — forcing 2FA on the next
 //! `login_email_pass` call. Historically this wrapper wiped state on any
 //! serde error / panic / timeout, which caused identity churn whenever
-//! upstream transiently flaked, and that manifested as daily NeedsDevice2FA
+//! the provider transiently flaked, and that manifested as daily NeedsDevice2FA
 //! failures on every CloudKit auth cycle at the 24h PET-expiration boundary.
 //!
 //! If a user genuinely wants a fresh anisette identity (suspecting state
@@ -73,15 +77,15 @@ impl AnisetteProvider for BridgeAnisetteProvider {
                     call_start.elapsed()
                 );
 
-                // Fresh upstream provider each attempt — it reads state from
-                // disk so a cleared state.plist forces re-provisioning.
+                // Fresh provider each attempt — it reads state from disk so a
+                // cleared state.plist forces re-provisioning.
                 let mut upstream = RemoteAnisetteProviderV3::new(
                     ANISETTE_URL.to_string(),
                     self.info.clone(),
                     self.state_path.clone(),
                 );
 
-                // AssertUnwindSafe + catch_unwind turns upstream's bare
+                // AssertUnwindSafe + catch_unwind turns the provider's bare
                 // `panic!()` into a caught panic payload. Without this the
                 // panic unwinds into the caller's critical section and can
                 // leave shared mutexes locked.
@@ -90,7 +94,7 @@ impl AnisetteProvider for BridgeAnisetteProvider {
                 // mid-retry generates a fresh device identity on the next
                 // attempt, which Apple sees as a brand-new device and rejects
                 // the next login_email_pass with NeedsDevice2FA. The transient
-                // upstream errors below don't correlate with genuine state
+                // provider errors below don't correlate with genuine state
                 // corruption, so we leave state alone and just retry.
                 match tokio::time::timeout(PROVISION_TIMEOUT, inner).await {
                     Ok(Ok(Ok(headers))) => {
@@ -123,11 +127,11 @@ impl AnisetteProvider for BridgeAnisetteProvider {
                         return Err(e);
                     }
                     Ok(Err(panic_payload)) => {
-                        // Upstream `RemoteAnisetteProviderV3::get_anisette_headers`
+                        // `RemoteAnisetteProviderV3::get_anisette_headers`
                         // contains `panic!()` for non-`AnisetteNotProvisioned`
                         // errors. Convert to a retryable error so the panic
                         // doesn't unwind past this point. State preserved —
-                        // the panic is a control-flow bug in upstream, not a
+                        // the panic is a control-flow bug in the provider, not a
                         // sign that our identity is invalid.
                         let msg = if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
                             (*s).to_string()
@@ -150,7 +154,7 @@ impl AnisetteProvider for BridgeAnisetteProvider {
                         )));
                     }
                     Err(_) => {
-                        // Timeout — upstream's infinite-loop bug on WS drop.
+                        // Timeout — the provider's infinite-loop bug on WS drop.
                         // Network-layer issue, not state corruption.
                         warn!(
                             "anisette: upstream timed out on attempt {}/{} (state preserved, likely infinite loop on WS drop)",

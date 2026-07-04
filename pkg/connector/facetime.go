@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // This program is free software: you can redistribute it and/or modify
@@ -34,7 +34,7 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/format"
 
-	"github.com/lrhodin/imessage/pkg/rustpushgo"
+	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
 )
 
 // cmdFaceTime generates a shareable FaceTime link via the rustpush FaceTime

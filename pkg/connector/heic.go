@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // This program is free software: you can redistribute it and/or modify
@@ -9,10 +9,72 @@
 package connector
 
 /*
-#cgo pkg-config: libheif
+#cgo linux LDFLAGS: -ldl
 #include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
 #include <libheif/heif.h>
+
+// libheif is loaded at RUNTIME via dlopen — it is NOT linked at build time.
+// This keeps it out of the redistributed binary (it's LGPL + patent-encumbered
+// codecs), lets the binary build with zero libheif dependency (so it cross-builds
+// cleanly), and lets the binary RUN before libheif exists so `setup` can install
+// it via the system package manager. HEIC features are simply disabled until then.
+//
+// We keep <libheif/heif.h> for the types/enums but redirect every function call
+// to a dlopen'd pointer (via the macros below), so nothing links against -lheif.
+#define HEIF_DECL(n) static __typeof__(n)* p_##n = 0;
+HEIF_DECL(heif_context_alloc) HEIF_DECL(heif_context_read_from_memory) HEIF_DECL(heif_context_free)
+HEIF_DECL(heif_context_get_primary_image_handle) HEIF_DECL(heif_context_get_number_of_top_level_images)
+HEIF_DECL(heif_image_handle_get_number_of_metadata_blocks) HEIF_DECL(heif_image_handle_get_list_of_metadata_block_IDs)
+HEIF_DECL(heif_image_handle_get_metadata_size) HEIF_DECL(heif_image_handle_get_metadata)
+HEIF_DECL(heif_image_handle_get_raw_color_profile_size) HEIF_DECL(heif_image_handle_get_raw_color_profile)
+HEIF_DECL(heif_image_handle_get_metadata_content_type) HEIF_DECL(heif_image_handle_release)
+HEIF_DECL(heif_decode_image) HEIF_DECL(heif_image_get_width) HEIF_DECL(heif_image_get_height)
+HEIF_DECL(heif_image_get_plane_readonly) HEIF_DECL(heif_image_release)
+#undef HEIF_DECL
+
+static int cr_heif_state = 0; // 0=unloaded, 1=ok, -1=failed
+static int cr_heif_load(void) {
+	if (cr_heif_state != 0) return cr_heif_state > 0;
+	void* h = dlopen("libheif.so.1", RTLD_NOW | RTLD_GLOBAL);
+	if (!h) h = dlopen("libheif.1.dylib", RTLD_NOW | RTLD_GLOBAL);
+	if (!h) h = dlopen("libheif.dylib", RTLD_NOW | RTLD_GLOBAL);
+	if (!h) h = dlopen("libheif.so", RTLD_NOW | RTLD_GLOBAL);
+	if (!h) { cr_heif_state = -1; return 0; }
+#define HEIF_LOAD(n) p_##n = (__typeof__(n)*)dlsym(h, #n); if (!p_##n) { cr_heif_state = -1; return 0; }
+	HEIF_LOAD(heif_context_alloc) HEIF_LOAD(heif_context_read_from_memory) HEIF_LOAD(heif_context_free)
+	HEIF_LOAD(heif_context_get_primary_image_handle) HEIF_LOAD(heif_context_get_number_of_top_level_images)
+	HEIF_LOAD(heif_image_handle_get_number_of_metadata_blocks) HEIF_LOAD(heif_image_handle_get_list_of_metadata_block_IDs)
+	HEIF_LOAD(heif_image_handle_get_metadata_size) HEIF_LOAD(heif_image_handle_get_metadata)
+	HEIF_LOAD(heif_image_handle_get_raw_color_profile_size) HEIF_LOAD(heif_image_handle_get_raw_color_profile)
+	HEIF_LOAD(heif_image_handle_get_metadata_content_type) HEIF_LOAD(heif_image_handle_release)
+	HEIF_LOAD(heif_decode_image) HEIF_LOAD(heif_image_get_width) HEIF_LOAD(heif_image_get_height)
+	HEIF_LOAD(heif_image_get_plane_readonly) HEIF_LOAD(heif_image_release)
+#undef HEIF_LOAD
+	cr_heif_state = 1;
+	return 1;
+}
+
+// Redirect the call sites below to the dlopen'd pointers (no -lheif link).
+#define heif_context_alloc p_heif_context_alloc
+#define heif_context_read_from_memory p_heif_context_read_from_memory
+#define heif_context_free p_heif_context_free
+#define heif_context_get_primary_image_handle p_heif_context_get_primary_image_handle
+#define heif_context_get_number_of_top_level_images p_heif_context_get_number_of_top_level_images
+#define heif_image_handle_get_number_of_metadata_blocks p_heif_image_handle_get_number_of_metadata_blocks
+#define heif_image_handle_get_list_of_metadata_block_IDs p_heif_image_handle_get_list_of_metadata_block_IDs
+#define heif_image_handle_get_metadata_size p_heif_image_handle_get_metadata_size
+#define heif_image_handle_get_metadata p_heif_image_handle_get_metadata
+#define heif_image_handle_get_raw_color_profile_size p_heif_image_handle_get_raw_color_profile_size
+#define heif_image_handle_get_raw_color_profile p_heif_image_handle_get_raw_color_profile
+#define heif_image_handle_get_metadata_content_type p_heif_image_handle_get_metadata_content_type
+#define heif_image_handle_release p_heif_image_handle_release
+#define heif_decode_image p_heif_decode_image
+#define heif_image_get_width p_heif_image_get_width
+#define heif_image_get_height p_heif_image_get_height
+#define heif_image_get_plane_readonly p_heif_image_get_plane_readonly
+#define heif_image_release p_heif_image_release
 
 // extractAllMetadataFromHEIC extracts EXIF, ICC color profile, and XMP metadata
 // from HEIC data in a single parse pass. Callers must free any non-NULL output
@@ -27,6 +89,7 @@ static void extractAllMetadataFromHEIC(
 	*icc_out  = NULL; *icc_len  = 0;
 	*xmp_out  = NULL; *xmp_len  = 0;
 
+	if (!cr_heif_load()) return;  // load libheif before any heif_* call (NULL ptr otherwise)
 	struct heif_context* ctx = heif_context_alloc();
 	if (!ctx) return;
 
@@ -125,6 +188,7 @@ static void extractAllMetadataFromHEIC(
 
 // getTopLevelImageCount returns the number of top-level images in the HEIC.
 static int getTopLevelImageCount(const void* data, size_t data_len) {
+	if (!cr_heif_load()) return -1;  // load libheif before any heif_* call (NULL ptr otherwise)
 	struct heif_context* ctx = heif_context_alloc();
 	if (!ctx) return -1;
 
@@ -152,6 +216,7 @@ static int decodeHEICToRGBA(
 	*height_out = 0;
 	*stride_out = 0;
 
+	if (!cr_heif_load()) return -1;  // load libheif before any heif_* call (NULL ptr otherwise)
 	struct heif_context* ctx = heif_context_alloc();
 	if (!ctx) return -1;
 

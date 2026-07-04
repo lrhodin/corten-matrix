@@ -24,10 +24,6 @@ dpkg -s pkg-config   >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES pkg-config"
 dpkg -s libolm-dev   >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libolm-dev"
 dpkg -s libclang-dev >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libclang-dev"
 dpkg -s libssl-dev   >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libssl-dev"
-# libunicorn-dev: pre-built Unicorn Engine (CPU emulator). Without this,
-# the Rust unicorn-engine-sys crate tries to build QEMU from source via CMake,
-# which often fails on WSL2 due to qemu/configure issues.
-dpkg -s libunicorn-dev >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libunicorn-dev"
 dpkg -s libheif-dev    >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libheif-dev"
 command -v sqlite3 >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES sqlite3"
 

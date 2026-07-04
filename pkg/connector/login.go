@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // This program is free software: you can redistribute it and/or modify
@@ -22,7 +22,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/id"
 
-	"github.com/lrhodin/imessage/pkg/rustpushgo"
+	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
 )
 
 const (
@@ -338,11 +338,6 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 		l.conn = rustpushgo.Connect(cfg, apsState)
 
 		nacNote := "Registration uses the hardware key for NAC validation (no Mac needed at runtime)."
-		if cfg.RequiresNacRelay() {
-			nacNote = "Apple Silicon hardware key detected.\n" +
-				"The NAC relay server must be running on the Mac that provided this key during registration.\n" +
-				"Start it with: go run tools/nac-relay/main.go"
-		}
 		return &bridgev2.LoginStep{
 			Type:   bridgev2.LoginStepTypeUserInput,
 			StepID: LoginStepAppleIDPassword,

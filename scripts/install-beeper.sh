@@ -4,18 +4,18 @@ set -euo pipefail
 BINARY="$1"
 DATA_DIR="$2"
 BUNDLE_ID="$3"
-PREBUILT_BBCTL="${4:-}"
 
 BRIDGE_NAME="${BRIDGE_NAME:-sh-imessage}"
+# Session/login dir root for this account. The bridge reads session.json from
+# $XDG_DATA_HOME/corten-matrix, so a second account points this at its own dir
+# (and the launchd service below sets it so the running bridge agrees).
+ACCOUNT_XDG="${XDG_DATA_HOME:-$HOME/.local/share}"
 
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
 PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
 
 # Where we build/cache bbctl (sparse clone — only cmd/bbctl/)
-BBCTL_DIR="${BBCTL_DIR:-$HOME/.local/share/mautrix-imessage/bbctl}"
-BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/imessage.git}"
-BBCTL_BRANCH="${BBCTL_BRANCH:-master}"
 
 echo ""
 echo "═══════════════════════════════════════════════"
@@ -51,88 +51,22 @@ fix_permissions() {
     return 1
 }
 
-# ── Build bbctl from source ───────────────────────────────────
-BBCTL="$BBCTL_DIR/bbctl"
-
-# Warn about old full-repo clone and offer to remove it
-OLD_BBCTL_DIR="$HOME/.local/share/mautrix-imessage/bridge-manager"
-if [ -d "$OLD_BBCTL_DIR/.git" ] && [ "$BBCTL_DIR" != "$OLD_BBCTL_DIR" ]; then
-    echo "⚠  Found old full-repo clone at $OLD_BBCTL_DIR"
-    echo "   This is no longer needed (bbctl now uses a sparse checkout)."
-    if [ -t 0 ]; then
-        read -p "   Delete it to free disk space? [Y/n]: " DEL_OLD
-        case "$DEL_OLD" in
-            [nN]*) ;;
-            *)     rm -rf "$OLD_BBCTL_DIR"
-                   echo "   ✓ Removed $OLD_BBCTL_DIR" ;;
-        esac
-    else
-        echo "   You can safely delete it: rm -rf $OLD_BBCTL_DIR"
-    fi
-fi
-
-build_bbctl() {
-    echo "Building bbctl..."
-    mkdir -p "$(dirname "$BBCTL_DIR")"
-    if [ -d "$BBCTL_DIR/.git" ]; then
-        cd "$BBCTL_DIR"
-        git fetch --quiet origin
-        git reset --hard --quiet "origin/$BBCTL_BRANCH"
-    else
-        rm -rf "$BBCTL_DIR"
-        git clone --filter=blob:none --no-checkout --quiet \
-            --branch "$BBCTL_BRANCH" "$BBCTL_REPO" "$BBCTL_DIR"
-        cd "$BBCTL_DIR"
-        git sparse-checkout init --cone
-        git checkout --quiet "$BBCTL_BRANCH"
-    fi
-    # bbctl imports pkg/imconfig, so the sparse checkout must include it too.
-    # Applied unconditionally (outside the clone branch) so existing checkouts
-    # pick it up when they update, not just fresh clones.
-    git sparse-checkout set cmd/bbctl pkg/imconfig
-    go build -o bbctl ./cmd/bbctl/ 2>&1
-    cd - >/dev/null
-    echo "✓ Built bbctl"
-}
-
-if [ -n "$PREBUILT_BBCTL" ] && [ -x "$PREBUILT_BBCTL" ]; then
-    # Install the bbctl built by `make build` into BBCTL_DIR
-    mkdir -p "$BBCTL_DIR"
-    cp "$PREBUILT_BBCTL" "$BBCTL"
-    echo "✓ Installed bbctl to $BBCTL_DIR/"
-elif [ ! -x "$BBCTL" ]; then
-    build_bbctl
-else
-    echo "✓ Found bbctl: $BBCTL"
-    # Update if repo has changes
-    if [ -d "$BBCTL_DIR/.git" ]; then
-        cd "$BBCTL_DIR"
-        git fetch --quiet origin 2>/dev/null || true
-        LOCAL=$(git rev-parse HEAD 2>/dev/null)
-        REMOTE=$(git rev-parse "origin/$BBCTL_BRANCH" 2>/dev/null || echo "$LOCAL")
-        cd - >/dev/null
-        if [ "$LOCAL" != "$REMOTE" ]; then
-            echo "  Updating bbctl..."
-            build_bbctl
-        fi
-    fi
-fi
 
 # ── Check bbctl login ────────────────────────────────────────
-if ! "$BBCTL" whoami >/dev/null 2>&1 || "$BBCTL" whoami 2>&1 | grep -qi "not logged in"; then
+if ! "$BINARY" bbctl whoami >/dev/null 2>&1 || "$BINARY" bbctl whoami 2>&1 | grep -qi "not logged in"; then
     echo ""
     echo "Not logged into Beeper. Running bbctl login..."
     echo ""
-    "$BBCTL" login
+    "$BINARY" bbctl login
 fi
 # Capture username (discard stderr so "Fetching whoami..." doesn't contaminate)
-WHOAMI=$("$BBCTL" whoami 2>/dev/null | head -1 || true)
+WHOAMI=$("$BINARY" bbctl whoami 2>/dev/null | head -1 || true)
 # On slow machines the Beeper API may not have the username ready yet — retry
 if [ -z "$WHOAMI" ] || [ "$WHOAMI" = "null" ]; then
     for i in 1 2 3 4 5; do
         echo "  Waiting for username from Beeper API (attempt $i/5)..."
         sleep 3
-        WHOAMI=$("$BBCTL" whoami 2>/dev/null | head -1 || true)
+        WHOAMI=$("$BINARY" bbctl whoami 2>/dev/null | head -1 || true)
         [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ] && break
     done
 fi
@@ -140,7 +74,7 @@ if [ -z "$WHOAMI" ] || [ "$WHOAMI" = "null" ]; then
     echo ""
     echo "ERROR: Could not get username from Beeper API."
     echo "  This can happen when the API is slow to propagate after login."
-    echo "  Wait a minute and re-run: make install-beeper"
+    echo "  Wait a minute and re-run: corten-matrix setup-beeper"
     exit 1
 fi
 echo "✓ Logged in: $WHOAMI"
@@ -149,7 +83,7 @@ echo "✓ Logged in: $WHOAMI"
 # If the bridge is already registered on the server but we're about to
 # generate a fresh config (no local config file), the old registration's
 # rooms would be orphaned.  Delete it first so the server cleans up rooms.
-EXISTING_BRIDGE=$("$BBCTL" whoami 2>&1 | grep "^\s*$BRIDGE_NAME " || true)
+EXISTING_BRIDGE=$("$BINARY" bbctl whoami 2>&1 | grep "^\s*$BRIDGE_NAME " || true)
 if [ -n "$EXISTING_BRIDGE" ] && [ ! -f "$CONFIG" ]; then
     echo ""
     echo "⚠  Found existing '$BRIDGE_NAME' registration on server but no local config."
@@ -160,7 +94,7 @@ if [ -n "$EXISTING_BRIDGE" ] && [ ! -f "$CONFIG" ]; then
     # a 404 means it's already deleted, and any other error is non-fatal
     # because config regeneration re-registers anyway (worst case: a few
     # orphaned rooms, far better than a failed setup).
-    if DELETE_OUT=$("$BBCTL" delete "$BRIDGE_NAME" 2>&1); then
+    if DELETE_OUT=$("$BINARY" bbctl delete "$BRIDGE_NAME" 2>&1); then
         echo "✓ Old registration cleaned up"
         echo "   Waiting for server-side deletion to complete..."
         sleep 5
@@ -184,13 +118,13 @@ if [ -f "$CONFIG" ] && [ -z "$EXISTING_BRIDGE" ]; then
     # the registration is fine.
     echo "⚠  Bridge not found in bbctl whoami — retrying in 3s to rule out transient error..."
     sleep 3
-    EXISTING_BRIDGE=$("$BBCTL" whoami 2>&1 | grep "^\s*$BRIDGE_NAME " || true)
+    EXISTING_BRIDGE=$("$BINARY" bbctl whoami 2>&1 | grep "^\s*$BRIDGE_NAME " || true)
     if [ -z "$EXISTING_BRIDGE" ]; then
         echo "⚠  Local config exists but bridge is not registered on server."
         echo "   Removing stale config and database to re-register..."
         rm -f "$CONFIG"
         DB_DIR="$(cd "$DATA_DIR" && pwd)"
-        rm -f "$DB_DIR"/mautrix-imessage.db*
+        rm -f "$DB_DIR"/corten-matrix.db*
     else
         echo "✓ Bridge found on retry — keeping existing config and database"
     fi
@@ -201,7 +135,7 @@ if [ -f "$CONFIG" ]; then
 else
     echo "Generating Beeper config..."
     for attempt in 1 2 3 4 5; do
-        if "$BBCTL" config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME" 2>&1; then
+        if "$BINARY" bbctl config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME" 2>&1; then
             break
         fi
         if [ "$attempt" -eq 5 ]; then
@@ -213,7 +147,7 @@ else
     done
     # Make DB path absolute so it doesn't depend on working directory
     DATA_ABS_TMP="$(cd "$DATA_DIR" && pwd)"
-    sed -i '' "s|uri: file:mautrix-imessage.db|uri: file:$DATA_ABS_TMP/mautrix-imessage.db|" "$CONFIG"
+    sed -i '' -E "s#^([[:space:]]*uri:[[:space:]]*).*\.db.*\$#\1file:$DATA_ABS_TMP/corten-matrix.db?_txlock=immediate#" "$CONFIG"
     # iMessage CloudKit chats can have tens of thousands of messages.
     # Deliver all history in one forward batch to avoid DAG fragmentation.
     sed -i '' 's/max_initial_messages: [0-9]*/max_initial_messages: 2147483647/' "$CONFIG"
@@ -239,7 +173,7 @@ else
     if grep -q '"@:\|"@":\|@.*example\.com' "$CONFIG" 2>/dev/null; then
         echo ""
         echo "ERROR: Config has broken permissions and cannot determine your username."
-        echo "  Try: $BBCTL login && rm $CONFIG && re-run make install-beeper"
+        echo "  Try: $BINARY bbctl login && rm $CONFIG && re-run corten-matrix setup-beeper"
         echo ""
         exit 1
     fi
@@ -275,7 +209,7 @@ fi
 if ! grep -q "beeper" "$CONFIG" 2>/dev/null; then
     echo ""
     echo "WARNING: Config doesn't appear to contain Beeper details."
-    echo "  Try: rm $CONFIG && re-run make install-beeper"
+    echo "  Try: rm $CONFIG && re-run corten-matrix setup-beeper"
     echo ""
     exit 1
 fi
@@ -351,14 +285,14 @@ CURRENT_SOURCE=$(grep 'backfill_source:' "$CONFIG" 2>/dev/null | head -1 | sed '
 if [ "$CURRENT_SOURCE" = "chatdb" ] && [ "$(uname -s)" = "Darwin" ]; then
     CHATDB_PATH="$HOME/Library/Messages/chat.db"
     if [ -f "$CHATDB_PATH" ]; then
-        if ! sqlite3 "$CHATDB_PATH" "SELECT 1 FROM message LIMIT 1" >/dev/null 2>&1; then
+        if ! "$BINARY" fda-check >/dev/null 2>&1; then
             echo ""
             echo "⚠ Full Disk Access is required for chat.db backfill."
             echo "  Opening System Settings → Privacy & Security → Full Disk Access..."
             echo "  Grant access to the bridge binary, then press Enter to continue."
             open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null
             read -p "Press Enter when Full Disk Access has been granted..."
-            if sqlite3 "$CHATDB_PATH" "SELECT 1 FROM message LIMIT 1" >/dev/null 2>&1; then
+            if "$BINARY" fda-check >/dev/null 2>&1; then
                 echo "✓ Full Disk Access confirmed"
             else
                 echo "⚠ chat.db still not accessible — the bridge will prompt again on startup"
@@ -626,7 +560,7 @@ fi
 DB_URI=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
 NEEDS_LOGIN=false
 
-SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
+SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/corten-matrix"
 SESSION_FILE="$SESSION_DIR/session.json"
 
 # ── Brief init start (fresh install only) ────────────────────
@@ -949,7 +883,7 @@ if [ "$IS_FRESH_DB" = "true" ] && [ "$_ck_backfill" = "true" ] && [ "$_ck_source
         [yY]*) echo "✓ Starting bridge" ;;
         *)
             echo ""
-            echo "Re-run 'make install-beeper' after syncing iCloud Messages."
+            echo "Re-run 'corten-matrix setup-beeper' after syncing iCloud Messages."
             exit 0
             ;;
     esac
@@ -1007,62 +941,8 @@ _SHORTCUT_LOG_OUT="$_SHORTCUT_DATA_ABS/bridge.stdout.log"
 _SHORTCUT_GUI_DOMAIN="gui/$(id -u)"
 
 echo ""
-echo "Want easy commands you can type from any terminal to control the bridge?"
-echo "  start-imessage     stop-imessage     restart-imessage     imessage-log"
-read -r -p "Add them? [y/N]: " _shortcut_ans
-case "$_shortcut_ans" in
-    [yY]|[yY][eE][sS])
-        case "$SHELL" in
-            */zsh)  RC_FILE="$HOME/.zshrc" ;;
-            */bash) RC_FILE="$HOME/.bashrc" ;;
-            *)      RC_FILE="" ;;
-        esac
-        if [ -z "$RC_FILE" ]; then
-            echo "  Couldn't detect your shell from \$SHELL ($SHELL) — skipping. (Bash and Zsh are supported.)"
-        else
-            MARKER_START="# >>> mautrix-imessage shortcuts (managed) >>>"
-            MARKER_END="# <<< mautrix-imessage shortcuts (managed) <<<"
-            if [ -f "$RC_FILE" ] && grep -qF "$MARKER_START" "$RC_FILE"; then
-                awk -v s="$MARKER_START" -v e="$MARKER_END" '
-                    $0 == s { skip = 1; next }
-                    $0 == e { skip = 0; next }
-                    !skip   { print }
-                ' "$RC_FILE" > "$RC_FILE.tmp" && mv "$RC_FILE.tmp" "$RC_FILE"
-            fi
-            cat >> "$RC_FILE" <<EOF
-$MARKER_START
-alias start-imessage='launchctl bootstrap $_SHORTCUT_GUI_DOMAIN $PLIST'
-alias stop-imessage='launchctl bootout $_SHORTCUT_GUI_DOMAIN/$BUNDLE_ID'
-alias restart-imessage='launchctl kickstart -k $_SHORTCUT_GUI_DOMAIN/$BUNDLE_ID'
-alias imessage-log='tail -f $_SHORTCUT_LOG_OUT'
-$MARKER_END
-EOF
-            echo "  ✓ Shortcuts added. Open a new terminal (or run \`source $RC_FILE\` here) and you can type:"
-            echo "      start-imessage   stop-imessage   restart-imessage   imessage-log"
-        fi
-        ;;
-    *)
-        # User declined. If a previous run installed shortcuts, treat the
-        # decline as "remove them" so the rc file matches the user's choice.
-        case "$SHELL" in
-            */zsh)  RC_FILE="$HOME/.zshrc" ;;
-            */bash) RC_FILE="$HOME/.bashrc" ;;
-            *)      RC_FILE="" ;;
-        esac
-        MARKER_START="# >>> mautrix-imessage shortcuts (managed) >>>"
-        MARKER_END="# <<< mautrix-imessage shortcuts (managed) <<<"
-        if [ -n "$RC_FILE" ] && [ -f "$RC_FILE" ] && grep -qF "$MARKER_START" "$RC_FILE"; then
-            awk -v s="$MARKER_START" -v e="$MARKER_END" '
-                $0 == s { skip = 1; next }
-                $0 == e { skip = 0; next }
-                !skip   { print }
-            ' "$RC_FILE" > "$RC_FILE.tmp" && mv "$RC_FILE.tmp" "$RC_FILE"
-            echo "  Removed previously-installed shortcuts from $RC_FILE."
-        else
-            echo "  Skipped — re-run this installer to add them later."
-        fi
-        ;;
-esac
+echo ""
+echo "Tip: control the bridge with:  corten-matrix start | stop | restart | logs"
 echo ""
 
 # ── Preferred handle (runs every time, can reconfigure) ────────
@@ -1155,13 +1035,10 @@ LOG_ERR="$DATA_ABS/bridge.stderr.log"
 # ── Write auto-update wrapper ─────────────────────────────────
 cat > "$DATA_ABS/start.sh" << HEADER_EOF
 #!/bin/bash
-BBCTL_DIR="$BBCTL_DIR"
-BBCTL_BRANCH="$BBCTL_BRANCH"
 BINARY="$BINARY"
 CONFIG="$CONFIG_ABS"
 HEADER_EOF
 cat >> "$DATA_ABS/start.sh" << 'BODY_EOF'
-BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/imessage.git}"
 
 # ANSI helpers
 BOLD='\033[1m'
@@ -1178,50 +1055,12 @@ warn() { printf "${DIM}$(ts)${RESET}  ${YELLOW}⚠${RESET}  %s\n" "$*"; }
 
 printf "\n  ${BOLD}iMessage Bridge${RESET}\n\n"
 
-# Bootstrap sparse clone if it doesn't exist yet
-if [ ! -d "$BBCTL_DIR/.git" ] && command -v go >/dev/null 2>&1; then
-    step "Setting up bbctl sparse checkout..."
-    EXISTING_BBCTL=""
-    [ -x "$BBCTL_DIR/bbctl" ] && EXISTING_BBCTL=$(mktemp)  && cp "$BBCTL_DIR/bbctl" "$EXISTING_BBCTL"
-    rm -rf "$BBCTL_DIR"
-    mkdir -p "$(dirname "$BBCTL_DIR")"
-    git clone --filter=blob:none --no-checkout --quiet \
-        --branch "$BBCTL_BRANCH" "$BBCTL_REPO" "$BBCTL_DIR"
-    git -C "$BBCTL_DIR" sparse-checkout init --cone
-    git -C "$BBCTL_DIR" sparse-checkout set cmd/bbctl pkg/imconfig
-    git -C "$BBCTL_DIR" checkout --quiet "$BBCTL_BRANCH"
-    (cd "$BBCTL_DIR" && go build -o bbctl ./cmd/bbctl/ 2>&1) | sed 's/^/  /'
-    [ -n "$EXISTING_BBCTL" ] && rm -f "$EXISTING_BBCTL"
-    ok "bbctl ready"
-fi
-
-if [ -d "$BBCTL_DIR/.git" ] && command -v go >/dev/null 2>&1; then
-    git -C "$BBCTL_DIR" fetch origin --quiet 2>/dev/null || true
-    LOCAL=$(git -C "$BBCTL_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
-    REMOTE=$(git -C "$BBCTL_DIR" rev-parse --short "origin/$BBCTL_BRANCH" 2>/dev/null || echo "unknown")
-    if [ "$LOCAL" != "$REMOTE" ] && [ "$LOCAL" != "unknown" ] && [ "$REMOTE" != "unknown" ]; then
-        step "Updating bbctl  $LOCAL → $REMOTE"
-        T0=$(date +%s)
-        git -C "$BBCTL_DIR" reset --hard "origin/$BBCTL_BRANCH" --quiet
-        git -C "$BBCTL_DIR" sparse-checkout set cmd/bbctl pkg/imconfig
-        step "Building bbctl..."
-        (cd "$BBCTL_DIR" && go build -o bbctl ./cmd/bbctl/ 2>&1) | sed 's/^/  /'
-        T1=$(date +%s)
-        ok "bbctl updated  ($(( T1 - T0 ))s)"
-    else
-        ok "bbctl $LOCAL"
-    fi
-elif [ -d "$BBCTL_DIR/.git" ]; then
-    warn "go not found — skipping bbctl update"
-fi
-
 # Fix permissions before starting — the config upgrader may have replaced
 # the user's permissions with example.com defaults on a previous run.
 # Detects: empty username (@:, @":), example.com defaults, wildcard relay.
 if grep -q '"@:\|"@":\|@.*example\.com\|"\*":.*relay' "$CONFIG" 2>/dev/null; then
-    BBCTL_BIN="$BBCTL_DIR/bbctl"
-    if [ -x "$BBCTL_BIN" ]; then
-        FIX_USER=$("$BBCTL_BIN" whoami 2>/dev/null | head -1 || true)
+    if command -v "$BINARY" >/dev/null 2>&1; then
+        FIX_USER=$("$BINARY" bbctl whoami 2>/dev/null | head -1 || true)
         if [ -n "$FIX_USER" ] && [ "$FIX_USER" != "null" ]; then
             FIX_MXID="@${FIX_USER}:beeper.com"
             sed -i '' '/permissions:/,/^[^ ]/{
@@ -1241,8 +1080,14 @@ exec "$BINARY" -n -c "$CONFIG"
 BODY_EOF
 chmod +x "$DATA_ABS/start.sh"
 
-mkdir -p "$(dirname "$PLIST")"
 GUI_DOMAIN="gui/$(id -u)"
+DOMAIN=$(grep '^\s*domain:' "$CONFIG" | head -1 | awk '{print $2}' || true)
+DOMAIN="${DOMAIN:-beeper.local}"
+
+# Always install the plist — the start/stop/restart subcommands act on it by path
+# (launchctl load/unload "$PLIST"), so it's a hard dependency even if we don't
+# load it now. Clear any previous instance first.
+mkdir -p "$(dirname "$PLIST")"
 launchctl bootout "$GUI_DOMAIN/$BUNDLE_ID" 2>/dev/null || true
 launchctl unload "$PLIST" 2>/dev/null || true
 
@@ -1255,8 +1100,8 @@ cat > "$PLIST" << PLIST_EOF
     <string>$BUNDLE_ID</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>$DATA_ABS/start.sh</string>
+        <string>$BINARY</string>
+        <string>bridge-all</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$DATA_ABS</string>
@@ -1289,50 +1134,78 @@ cat > "$PLIST" << PLIST_EOF
         <string>-I/opt/homebrew/include</string>
         <key>CGO_LDFLAGS</key>
         <string>-L/opt/homebrew/lib</string>
+        <key>XDG_DATA_HOME</key>
+        <string>$ACCOUNT_XDG</string>
     </dict>
 </dict>
 </plist>
 PLIST_EOF
 
-if ! launchctl bootstrap "$GUI_DOMAIN" "$PLIST" 2>/dev/null; then
-    if ! launchctl load "$PLIST" 2>/dev/null; then
-        echo ""
-        echo "⚠  LaunchAgent failed to load. You can run the bridge manually:"
-        echo "   $BINARY -c $CONFIG_ABS"
-        echo ""
-        echo "   This is a known issue on macOS 13 (Ventura). Try:"
-        echo "   1. Remove and re-add the .app in Full Disk Access"
-        echo "   2. Re-run: make install-beeper"
-        echo ""
-    fi
+if [ -n "${CORTEN_SKIP_SERVICE:-}" ]; then
+    # Second account: ONE shared corten-matrix service runs BOTH bridges
+    # (bridge-all), so don't keep a separate LaunchAgent for it.
+    rm -f "$PLIST" 2>/dev/null || true
+    echo "✓ Second account configured — runs under the shared corten-matrix service"
+elif [ -n "${CORTEN_DEFER_START:-}" ]; then
+    # Orchestrator-driven (pkg/cli): started centrally after the optional 2nd account.
+    echo "✓ Account configured"
+else
+# The plist is installed; the prompt only decides whether to LOAD (start) it now.
+# Either way 'corten-matrix start/stop/restart' work later, since they act on it.
+if [ -t 0 ]; then
+    printf "\nStart the bridge now (and automatically at login)? [Y/n]: "
+    read START_NOW
+else
+    START_NOW=""
 fi
-echo "✓ Bridge started (LaunchAgent installed)"
-echo ""
-
-# ── Wait for bridge to connect ────────────────────────────────
-DOMAIN=$(grep '^\s*domain:' "$CONFIG" | head -1 | awk '{print $2}' || true)
-DOMAIN="${DOMAIN:-beeper.local}"
-
-echo "Waiting for bridge to start..."
-for i in $(seq 1 15); do
-    if grep -q "Bridge started\|UNCONFIGURED\|Backfill queue starting" "$LOG_OUT" 2>/dev/null; then
-        echo "✓ Bridge is running"
+case "${START_NOW}" in
+[nN]*)
+    echo "✓ Service installed (not started). Start it any time with: corten-matrix start"
+    ;;
+*)
+    # Load it, then force-start — RunAtLoad starts it on a clean load and
+    # kickstart -k guarantees it even if a stale registration no-ops bootstrap.
+    if launchctl bootstrap "$GUI_DOMAIN" "$PLIST" 2>/dev/null \
+        || launchctl load -w "$PLIST" 2>/dev/null; then
+        launchctl kickstart -k "$GUI_DOMAIN/$BUNDLE_ID" 2>/dev/null || true
+        echo "✓ Bridge started"
+    else
         echo ""
-        echo "═══════════════════════════════════════════════"
-        echo "  Setup Complete"
-        echo "═══════════════════════════════════════════════"
+        echo "⚠  Could not load the service. Run the bridge manually:"
+        echo "   $BINARY -n -c $CONFIG_ABS"
         echo ""
-        echo "  Logs:    tail -f $LOG_OUT"
-        echo "  Stop:    launchctl bootout $GUI_DOMAIN/$BUNDLE_ID"
-        echo "  Start:   launchctl bootstrap $GUI_DOMAIN $PLIST"
-        echo "  Restart: launchctl kickstart -k $GUI_DOMAIN/$BUNDLE_ID"
-        exit 0
     fi
-    sleep 1
-done
+
+    echo ""
+    echo "Waiting for bridge to start..."
+    for i in $(seq 1 15); do
+        if grep -q "Bridge started\|UNCONFIGURED\|Backfill queue starting" "$LOG_OUT" 2>/dev/null; then
+            echo "✓ Bridge is running"
+            break
+        fi
+        sleep 1
+    done
+    ;;
+esac
 
 echo ""
-echo "Bridge is starting up (check logs for status):"
-echo "  tail -f $LOG_OUT"
+echo "═══════════════════════════════════════════════"
+echo "  Setup Complete"
+echo "═══════════════════════════════════════════════"
 echo ""
-echo "Once running, DM @${BRIDGE_NAME}bot:$DOMAIN and send: login"
+echo "  Logs:    tail -f $LOG_OUT"
+echo "  Stop:    launchctl bootout $GUI_DOMAIN/$BUNDLE_ID"
+echo "  Restart: launchctl kickstart -k $GUI_DOMAIN/$BUNDLE_ID"
+fi
+
+# ── Add to PATH (optional; symlink only, no shell-rc edits) ────
+if [ -t 0 ] && ! command -v corten-matrix >/dev/null 2>&1; then
+    printf "\nAdd 'corten-matrix' to your PATH (symlink in /usr/local/bin)? [Y/n]: "
+    read ADD_PATH
+    case "$ADD_PATH" in
+        [nN]*) ;;
+        *) sudo ln -sf "$BINARY" /usr/local/bin/corten-matrix 2>/dev/null \
+             && echo "OK - corten-matrix added to PATH" \
+             || echo "  Couldn't symlink. Run: sudo ln -sf $BINARY /usr/local/bin/corten-matrix" ;;
+    esac
+fi

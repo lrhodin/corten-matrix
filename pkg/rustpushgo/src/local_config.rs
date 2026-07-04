@@ -1,7 +1,7 @@
 //! LocalMacOSConfig — reads hardware info from IOKit and produces a
 //! `rustpush::macos::MacOSConfig` via `into_macos_config()`.
 //!
-//! `MacOSConfig` already implements `OSConfig` (inside the upstream crate where
+//! `MacOSConfig` already implements `OSConfig` (inside the rustpush crate where
 //! `ActivationInfo` is visible), so we don't need to re-implement `OSConfig` here.
 //! Our overlaid `rustpush/open-absinthe/src/nac.rs` provides the native NAC path
 //! (`AAAbsintheContext` via `nac-validation`) when the `native-nac` feature is on,
@@ -153,7 +153,7 @@ impl LocalMacOSConfig {
         self
     }
 
-    /// Convert to the upstream `MacOSConfig` that implements `OSConfig`.
+    /// Convert to the `MacOSConfig` that implements `OSConfig`.
     ///
     /// `_enc` fields are empty — the native NAC path (our overlaid
     /// `rustpush/open-absinthe/src/nac.rs`) reads hardware identifiers from

@@ -1,6 +1,6 @@
 //go:build darwin
 
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2021 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -30,7 +30,7 @@ import (
 
 	"maunium.net/go/mautrix/id"
 
-	"github.com/lrhodin/imessage/imessage"
+	"github.com/lrhodin/corten-matrix/imessage"
 )
 
 const sendMessage = `

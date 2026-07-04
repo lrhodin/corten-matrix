@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // This program is free software: you can redistribute it and/or modify
@@ -23,7 +23,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 
-	"github.com/lrhodin/imessage/imessage"
+	"github.com/lrhodin/corten-matrix/imessage"
 )
 
 // resolveContactPortalID checks if the given DM identifier belongs to a contact
@@ -67,55 +67,95 @@ func (c *IMClient) resolveContactPortalID(identifier string) networkid.PortalID 
 	return defaultID
 }
 
+// validateTargetsSafe wraps Client.ValidateTargets with a recover guard.
+// The call crosses into the identity-manager FFI path, which has reachable
+// panic sites upstream (identity_manager.rs:249/335/542/555); a panic must
+// not crash the bridge, so it degrades to "nothing validated" (nil). Shared
+// by the send path and user-triggered commands.
+func (c *IMClient) validateTargetsSafe(targets []string) (valid []string) {
+	if c.client == nil || len(targets) == 0 {
+		return nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			c.UserLogin.Log.Error().Interface("panic", r).Int("targets", len(targets)).
+				Msg("ValidateTargets panicked in FFI path")
+			valid = nil
+		}
+	}()
+	return c.client.ValidateTargets(targets, c.handle)
+}
+
 // resolveSendTarget determines the best identifier to send to for a DM portal.
-func (c *IMClient) resolveSendTarget(portalID string) (target string) {
+func (c *IMClient) resolveSendTarget(portalID string) string {
 	if c.client == nil || strings.Contains(portalID, ",") {
 		return portalID
 	}
 
 	contact := c.lookupContact(portalID)
-	if contact == nil || len(contactPortalIDs(contact)) <= 1 {
+	altIDs := contactPortalIDs(contact)
+	if contact == nil || len(altIDs) <= 1 {
 		return portalID
 	}
-	// ValidateTargets crosses into the identity-manager FFI path. Upstream
-	// has reachable panic sites (identity_manager.rs:249/335/542/555); fall
-	// back to the original portalID if the FFI call panics rather than
-	// crashing the send path.
-	defer func() {
-		if r := recover(); r != nil {
-			c.UserLogin.Log.Error().Interface("panic", r).Str("portal_id", portalID).
-				Msg("resolveSendTarget panicked in FFI path — falling back to original portalID")
-			target = portalID
-		}
-	}()
 
-	valid := c.client.ValidateTargets([]string{portalID}, c.handle)
-	if len(valid) > 0 {
+	// Validate the portal's own handle alone first. In the common case it is
+	// reachable and this stays a single-handle IDS query; including the
+	// alternates here would fetch keys for every handle of the contact on the
+	// send path (unregistered handles are only cached for EMPTY_REFRESH = 1h
+	// rust-side, so dead alternates would be re-fetched from Apple hourly),
+	// and it would couple the portal handle's validation to the alternates'
+	// failure domain — one erroring batch would blank out everything.
+	if valid := c.validateTargetsSafe([]string{portalID}); len(valid) > 0 {
 		return portalID
+	}
+
+	alternates := make([]string, 0, len(altIDs))
+	for _, altID := range altIDs {
+		if altID != portalID {
+			alternates = append(alternates, altID)
+		}
 	}
 
 	c.UserLogin.Log.Info().
 		Str("portal_id", portalID).
+		Int("alternates", len(alternates)).
 		Msg("Portal ID not reachable on iMessage, trying alternate contact numbers")
 
-	for _, altID := range contactPortalIDs(contact) {
-		if altID == portalID {
-			continue
-		}
-		valid := c.client.ValidateTargets([]string{altID}, c.handle)
-		if len(valid) > 0 {
-			c.UserLogin.Log.Info().
-				Str("portal_id", portalID).
-				Str("send_target", altID).
-				Msg("Resolved send target to alternate contact number")
-			return altID
-		}
+	valid := c.validateTargetsSafe(alternates)
+	validSet := make(map[string]struct{}, len(valid))
+	for _, id := range valid {
+		validSet[id] = struct{}{}
+	}
+	if picked, ok := pickSendTarget(portalID, alternates, validSet); ok {
+		c.UserLogin.Log.Info().
+			Str("portal_id", portalID).
+			Str("send_target", picked).
+			Int("alternates", len(alternates)).
+			Int("valid", len(valid)).
+			Msg("Resolved send target to alternate contact number")
+		return picked
 	}
 
 	c.UserLogin.Log.Warn().
 		Str("portal_id", portalID).
-		Msg("No reachable number found for contact")
+		Int("alternates", len(alternates)).
+		Msg("No reachable number found for contact; falling back to original portal ID")
 	return portalID
+}
+
+func pickSendTarget(portalID string, altIDs []string, validSet map[string]struct{}) (string, bool) {
+	if _, ok := validSet[portalID]; ok {
+		return portalID, true
+	}
+	for _, altID := range altIDs {
+		if altID == portalID {
+			continue
+		}
+		if _, ok := validSet[altID]; ok {
+			return altID, true
+		}
+	}
+	return portalID, false
 }
 
 // lookupContact resolves a portal/identifier string to a Contact using
@@ -139,38 +179,32 @@ func (c *IMClient) lookupContact(identifier string) *imessage.Contact {
 	return nil
 }
 
-// getUniqueParticipantCount counts the number of unique *people* in a
-// participant list by collapsing multiple self-handles into one and merging
-// handles that belong to the same contact.
-func (c *IMClient) getUniqueParticipantCount(participants []string) int {
+// countNonSelfMembers counts the unique non-self members of a conversation
+// across the participant list and the sender, collapsing a contact's alternate
+// handles so a multi-number contact isn't double-counted. The group/DM signal
+// for inbound routing: self is implicit, so >=2 other members means a group.
+// Sender is included because relayed carrier groups omit self from participants.
+func (c *IMClient) countNonSelfMembers(participants []string, sender *string) int {
 	seen := make(map[string]bool)
-	selfSeen := false
 	count := 0
-	for _, p := range participants {
-		normalized := normalizeIdentifierForPortalID(p)
-		if normalized == "" {
-			count++
-			continue
+	add := func(raw string) {
+		n := normalizeIdentifierForPortalID(raw)
+		if n == "" || c.isMyHandle(n) || seen[n] {
+			return
 		}
-		if c.isMyHandle(normalized) {
-			if !selfSeen {
-				selfSeen = true
-				count++
-			}
-			continue
-		}
-		if seen[normalized] {
-			continue
-		}
+		seen[n] = true
 		count++
-		seen[normalized] = true
-		contact := c.lookupContact(normalized)
-		if contact == nil {
-			continue
+		if contact := c.lookupContact(n); contact != nil {
+			for _, altID := range contactPortalIDs(contact) {
+				seen[altID] = true
+			}
 		}
-		for _, altID := range contactPortalIDs(contact) {
-			seen[altID] = true
-		}
+	}
+	for _, p := range participants {
+		add(p)
+	}
+	if sender != nil {
+		add(*sender)
 	}
 	return count
 }
@@ -239,7 +273,11 @@ func contactPortalIDs(contact *imessage.Contact) []string {
 	}
 
 	for _, email := range contact.Emails {
-		pid := "mailto:" + strings.ToLower(email)
+		email = strings.ToLower(strings.TrimSpace(email))
+		if email == "" {
+			continue
+		}
+		pid := "mailto:" + email
 		if !seen[pid] {
 			seen[pid] = true
 			ids = append(ids, pid)

@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // This program is free software: you can redistribute it and/or modify
@@ -402,7 +402,7 @@ func writeOGGPage(buf *bytes.Buffer, serial, seq uint32, granule int64, flags by
 func buildOpusTags() []byte {
 	var tags bytes.Buffer
 	tags.WriteString("OpusTags")
-	vendor := "mautrix-imessage"
+	vendor := "corten-matrix"
 	binary.Write(&tags, binary.LittleEndian, uint32(len(vendor)))
 	tags.WriteString(vendor)
 	binary.Write(&tags, binary.LittleEndian, uint32(0)) // no comments

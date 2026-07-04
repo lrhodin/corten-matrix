@@ -1,4 +1,4 @@
-module github.com/lrhodin/imessage
+module github.com/lrhodin/corten-matrix
 
 go 1.25.0
 

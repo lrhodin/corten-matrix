@@ -83,7 +83,7 @@ statuskit_notifications: true
 #   1. Logs are NOT anonymized — raw iMessage handles (phone/email) and full
 #      URLs appear verbatim instead of opaque tokens / scheme+host forms.
 #   2. The periodic body scrubber is disabled — plaintext message bodies
-#      cached locally (in the cloud_message table of mautrix-imessage.db)
+#      cached locally (in the cloud_message table of corten-matrix.db)
 #      are no longer cleared after delivery to Matrix, so they persist.
 #   3. On the next CloudKit sync, rows that were already scrubbed are
 #      re-filled: the scrub flags are cleared and the CloudKit sync tokens

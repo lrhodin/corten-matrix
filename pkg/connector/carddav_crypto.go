@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // AES-256-GCM encryption for CardDAV credentials stored in config.
@@ -25,7 +25,7 @@ func cardDAVKeyDir() string {
 		home, _ := os.UserHomeDir()
 		dir = filepath.Join(home, ".local", "share")
 	}
-	return filepath.Join(dir, "mautrix-imessage")
+	return filepath.Join(dir, "corten-matrix")
 }
 
 // cardDAVKeyPath returns the full path to the CardDAV encryption key file.

@@ -4,9 +4,23 @@ set -euo pipefail
 BINARY="$1"
 DATA_DIR="$2"
 
+# Per-account systemd unit name. The first account uses the bare name; a second
+# account passes a suffixed value so the two services never collide.
+SERVICE_NAME="${SERVICE_NAME:-corten-matrix}"
+# Session/login dir root for this account. The bridge reads session.json from
+# $XDG_DATA_HOME/corten-matrix, so a second account points this at its own dir.
+ACCOUNT_XDG="${XDG_DATA_HOME:-$HOME/.local/share}"
+
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
 REGISTRATION="$DATA_DIR/registration.yaml"
+
+# sudo prefix for SYSTEM-mode systemd calls. Root (e.g. LXC, where sudo often
+# isn't even installed) drives the system manager directly; a non-root sudo user
+# needs sudo to touch root-owned /etc/systemd/system and the system manager bus.
+# Mirrors the Go linuxSystemctl(): empty when uid 0, else "sudo". User-mode
+# (`systemctl --user`) calls never use this — they run as the logged-in user.
+if [ "$(id -u)" = "0" ]; then SUDO=""; else SUDO="sudo"; fi
 
 echo ""
 echo "═══════════════════════════════════════════════"
@@ -43,11 +57,11 @@ else
 
     if [ "$DB_CHOICE" = "1" ]; then
         DB_TYPE="postgres"
-        read -p "PostgreSQL URI [postgres://localhost/mautrix_imessage?sslmode=disable]: " DB_URI
-        DB_URI="${DB_URI:-postgres://localhost/mautrix_imessage?sslmode=disable}"
+        read -p "PostgreSQL URI [postgres://localhost/corten_matrix?sslmode=disable]: " DB_URI
+        DB_URI="${DB_URI:-postgres://localhost/corten_matrix?sslmode=disable}"
     else
         DB_TYPE="sqlite3-fk-wal"
-        DB_URI="file:$DATA_DIR/mautrix-imessage.db?_txlock=immediate"
+        DB_URI="file:$DATA_DIR/corten-matrix.db?_txlock=immediate"
     fi
 
     echo ""
@@ -408,7 +422,7 @@ fi
 # This catches upgrades from pre-keychain versions where the device-passcode
 # step was never run. If trustedpeers.plist exists with a user_identity, the
 # keychain was joined successfully and any transient PCS errors are harmless.
-SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
+SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/corten-matrix"
 TRUSTEDPEERS_FILE="$SESSION_DIR/trustedpeers.plist"
 FORCE_CLEAR_STATE=false
 if [ "$NEEDS_LOGIN" = "false" ]; then
@@ -434,10 +448,10 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     echo "└─────────────────────────────────────────────────┘"
     echo ""
     # Stop the bridge if running (otherwise it holds the DB lock)
-    if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
-        systemctl --user stop mautrix-imessage
-    elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
-        sudo systemctl stop mautrix-imessage
+    if systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+        systemctl --user stop "$SERVICE_NAME"
+    elif systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+        $SUDO systemctl stop "$SERVICE_NAME"
     fi
 
     if [ "${FORCE_CLEAR_STATE:-false}" = "true" ]; then
@@ -460,74 +474,20 @@ if [ -z "${IN_DOCKER:-}" ]; then
 # default to --user (the common path for non-root installs).
 _SHORTCUT_SYSCTL=""
 _SHORTCUT_JCTL=""
-if systemctl --user list-unit-files mautrix-imessage.service 2>/dev/null | grep -q mautrix-imessage; then
+if systemctl --user list-unit-files "$SERVICE_NAME.service" 2>/dev/null | grep -q "$SERVICE_NAME"; then
     _SHORTCUT_SYSCTL="systemctl --user"
     _SHORTCUT_JCTL="journalctl --user"
-elif systemctl list-unit-files mautrix-imessage.service 2>/dev/null | grep -q mautrix-imessage; then
-    _SHORTCUT_SYSCTL="sudo systemctl"
-    _SHORTCUT_JCTL="sudo journalctl"
+elif systemctl list-unit-files "$SERVICE_NAME.service" 2>/dev/null | grep -q "$SERVICE_NAME"; then
+    _SHORTCUT_SYSCTL="${SUDO:+$SUDO }systemctl"
+    _SHORTCUT_JCTL="${SUDO:+$SUDO }journalctl"
 else
     _SHORTCUT_SYSCTL="systemctl --user"
     _SHORTCUT_JCTL="journalctl --user"
 fi
 
 echo ""
-echo "Want easy commands you can type from any terminal to control the bridge?"
-echo "  start-imessage     stop-imessage     restart-imessage     imessage-log"
-read -r -p "Add them? [y/N]: " _shortcut_ans
-case "$_shortcut_ans" in
-    [yY]|[yY][eE][sS])
-        case "$SHELL" in
-            */zsh)  RC_FILE="$HOME/.zshrc" ;;
-            */bash) RC_FILE="$HOME/.bashrc" ;;
-            *)      RC_FILE="" ;;
-        esac
-        if [ -z "$RC_FILE" ]; then
-            echo "  Couldn't detect your shell from \$SHELL ($SHELL) — skipping. (Bash and Zsh are supported.)"
-        else
-            MARKER_START="# >>> mautrix-imessage shortcuts (managed) >>>"
-            MARKER_END="# <<< mautrix-imessage shortcuts (managed) <<<"
-            if [ -f "$RC_FILE" ] && grep -qF "$MARKER_START" "$RC_FILE"; then
-                awk -v s="$MARKER_START" -v e="$MARKER_END" '
-                    $0 == s { skip = 1; next }
-                    $0 == e { skip = 0; next }
-                    !skip   { print }
-                ' "$RC_FILE" > "$RC_FILE.tmp" && mv "$RC_FILE.tmp" "$RC_FILE"
-            fi
-            cat >> "$RC_FILE" <<EOF
-$MARKER_START
-alias start-imessage='$_SHORTCUT_SYSCTL start mautrix-imessage'
-alias stop-imessage='$_SHORTCUT_SYSCTL stop mautrix-imessage'
-alias restart-imessage='$_SHORTCUT_SYSCTL restart mautrix-imessage'
-alias imessage-log='$_SHORTCUT_JCTL -u mautrix-imessage -f'
-$MARKER_END
-EOF
-            echo "  ✓ Shortcuts added. Open a new terminal (or run \`source $RC_FILE\` here) and you can type:"
-            echo "      start-imessage   stop-imessage   restart-imessage   imessage-log"
-        fi
-        ;;
-    *)
-        # User declined. If a previous run installed shortcuts, treat the
-        # decline as "remove them" so the rc file matches the user's choice.
-        case "$SHELL" in
-            */zsh)  RC_FILE="$HOME/.zshrc" ;;
-            */bash) RC_FILE="$HOME/.bashrc" ;;
-            *)      RC_FILE="" ;;
-        esac
-        MARKER_START="# >>> mautrix-imessage shortcuts (managed) >>>"
-        MARKER_END="# <<< mautrix-imessage shortcuts (managed) <<<"
-        if [ -n "$RC_FILE" ] && [ -f "$RC_FILE" ] && grep -qF "$MARKER_START" "$RC_FILE"; then
-            awk -v s="$MARKER_START" -v e="$MARKER_END" '
-                $0 == s { skip = 1; next }
-                $0 == e { skip = 0; next }
-                !skip   { print }
-            ' "$RC_FILE" > "$RC_FILE.tmp" && mv "$RC_FILE.tmp" "$RC_FILE"
-            echo "  Removed previously-installed shortcuts from $RC_FILE."
-        else
-            echo "  Skipped — re-run this installer to add them later."
-        fi
-        ;;
-esac
+echo ""
+echo "Tip: control the bridge with:  corten-matrix start | stop | restart | logs"
 echo ""
 fi  # IN_DOCKER gate — shortcuts block
 
@@ -877,8 +837,8 @@ if [ -z "${IN_DOCKER:-}" ]; then
 # Detect whether systemd user sessions work. In containers (LXC) or when
 # running as root, the user instance is often unavailable — fall back to a
 # system-level service in that case.
-USER_SERVICE_FILE="$HOME/.config/systemd/user/mautrix-imessage.service"
-SYSTEM_SERVICE_FILE="/etc/systemd/system/mautrix-imessage.service"
+USER_SERVICE_FILE="$HOME/.config/systemd/user/$SERVICE_NAME.service"
+SYSTEM_SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
 
 if command -v systemctl >/dev/null 2>&1; then
     if systemctl --user status >/dev/null 2>&1; then
@@ -901,13 +861,14 @@ install_systemd_user() {
     mkdir -p "$(dirname "$USER_SERVICE_FILE")"
     cat > "$USER_SERVICE_FILE" << EOF
 [Unit]
-Description=mautrix-imessage bridge
+Description=corten-matrix bridge
 After=network.target
 
 [Service]
 Type=simple
 WorkingDirectory=$(dirname "$BINARY")
-ExecStart=$BINARY -c $CONFIG
+Environment=XDG_DATA_HOME=$ACCOUNT_XDG
+ExecStart=$BINARY bridge-all
 Restart=always
 RestartSec=5
 # Headroom for busy/heavy-message bridges; the binary also raises this at
@@ -918,20 +879,24 @@ LimitNOFILE=65536
 WantedBy=default.target
 EOF
     systemctl --user daemon-reload
-    systemctl --user enable mautrix-imessage
+    systemctl --user enable "$SERVICE_NAME"
 }
 
 install_systemd_system() {
-    cat > "$SYSTEM_SERVICE_FILE" << EOF
+    # $SUDO (defined near the top) is empty for root/LXC, "sudo" otherwise. This
+    # is the path that failed for a non-root sudo user with "Permission denied"
+    # on the heredoc redirect into root-owned /etc/systemd/system.
+    $SUDO tee "$SYSTEM_SERVICE_FILE" >/dev/null << EOF
 [Unit]
-Description=mautrix-imessage bridge
+Description=corten-matrix bridge
 After=network.target
 
 [Service]
 Type=simple
 User=$USER
 WorkingDirectory=$(dirname "$BINARY")
-ExecStart=$BINARY -c $CONFIG
+Environment=XDG_DATA_HOME=$ACCOUNT_XDG
+ExecStart=$BINARY bridge-all
 Restart=always
 RestartSec=5
 # Headroom for busy/heavy-message bridges; the binary also raises this at
@@ -941,14 +906,24 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable mautrix-imessage
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable "$SERVICE_NAME"
 }
 
-if [ "$SYSTEMD_MODE" = "user" ]; then
+if [ -n "${CORTEN_SKIP_SERVICE:-}" ]; then
+    # Second account: ONE shared corten-matrix service runs BOTH bridges
+    # (ExecStart=corten-matrix bridge-all), so don't install a separate unit for it.
+    echo "✓ Second account configured — runs under the shared corten-matrix service"
+elif [ -n "${CORTEN_DEFER_START:-}" ]; then
+    # Orchestrator-driven (pkg/cli): install/enable the unit (hard dep) but don't
+    # start — the Go CLI starts every account together after the 2nd-account prompt.
+    [ "$SYSTEMD_MODE" = "user" ] && install_systemd_user
+    [ "$SYSTEMD_MODE" = "system" ] && install_systemd_system
+    echo "✓ Account configured (service installed)"
+elif [ "$SYSTEMD_MODE" = "user" ]; then
     if [ -f "$USER_SERVICE_FILE" ]; then
         install_systemd_user
-        systemctl --user restart mautrix-imessage
+        systemctl --user restart "$SERVICE_NAME"
         echo "✓ Bridge restarted"
     else
         echo ""
@@ -956,14 +931,14 @@ if [ "$SYSTEMD_MODE" = "user" ]; then
         case "$answer" in
             [nN]*) ;;
             *)     install_systemd_user
-                   systemctl --user start mautrix-imessage
+                   systemctl --user start "$SERVICE_NAME"
                    echo "✓ Bridge started (systemd user service installed)" ;;
         esac
     fi
 elif [ "$SYSTEMD_MODE" = "system" ]; then
     if [ -f "$SYSTEM_SERVICE_FILE" ]; then
         install_systemd_system
-        systemctl restart mautrix-imessage
+        $SUDO systemctl restart "$SERVICE_NAME"
         echo "✓ Bridge restarted"
     else
         echo ""
@@ -972,7 +947,7 @@ elif [ "$SYSTEMD_MODE" = "system" ]; then
         case "$answer" in
             [nN]*) ;;
             *)     install_systemd_system
-                   systemctl start mautrix-imessage
+                   $SUDO systemctl start "$SERVICE_NAME"
                    echo "✓ Bridge started (system service installed)" ;;
         esac
     fi
@@ -990,18 +965,30 @@ echo "  Config: $CONFIG"
 echo "  Registration: $REGISTRATION"
 echo ""
 if [ "$SYSTEMD_MODE" = "user" ] && [ -f "$USER_SERVICE_FILE" ]; then
-    echo "  Status:  systemctl --user status mautrix-imessage"
-    echo "  Logs:    journalctl --user -u mautrix-imessage -f"
-    echo "  Stop:    systemctl --user stop mautrix-imessage"
-    echo "  Restart: systemctl --user restart mautrix-imessage"
+    echo "  Status:  systemctl --user status "$SERVICE_NAME""
+    echo "  Logs:    journalctl --user -u "$SERVICE_NAME" -f"
+    echo "  Stop:    systemctl --user stop "$SERVICE_NAME""
+    echo "  Restart: systemctl --user restart "$SERVICE_NAME""
 elif [ "$SYSTEMD_MODE" = "system" ] && [ -f "$SYSTEM_SERVICE_FILE" ]; then
-    echo "  Status:  systemctl status mautrix-imessage"
-    echo "  Logs:    journalctl -u mautrix-imessage -f"
-    echo "  Stop:    systemctl stop mautrix-imessage"
-    echo "  Restart: systemctl restart mautrix-imessage"
+    echo "  Status:  systemctl status "$SERVICE_NAME""
+    echo "  Logs:    journalctl -u "$SERVICE_NAME" -f"
+    echo "  Stop:    systemctl stop "$SERVICE_NAME""
+    echo "  Restart: systemctl restart "$SERVICE_NAME""
 else
     echo "  Run manually:"
     echo "    cd $(dirname "$CONFIG") && $BINARY -c $CONFIG"
 fi
 echo ""
 
+
+# ── Add to PATH (optional; symlink only, no shell-rc edits) ────
+if [ -t 0 ] && ! command -v corten-matrix >/dev/null 2>&1; then
+    printf "\nAdd 'corten-matrix' to your PATH (symlink in /usr/local/bin)? [Y/n]: "
+    read ADD_PATH
+    case "$ADD_PATH" in
+        [nN]*) ;;
+        *) sudo ln -sf "$BINARY" /usr/local/bin/corten-matrix 2>/dev/null \
+             && echo "OK - corten-matrix added to PATH" \
+             || echo "  Couldn't symlink. Run: sudo ln -sf $BINARY /usr/local/bin/corten-matrix" ;;
+    esac
+fi

@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // External CardDAV contact source for non-iCloud servers (Google, Nextcloud,
@@ -19,7 +19,7 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"github.com/lrhodin/imessage/imessage"
+	"github.com/lrhodin/corten-matrix/imessage"
 )
 
 // externalCardDAVClient fetches contacts from an external CardDAV server

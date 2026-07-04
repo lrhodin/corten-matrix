@@ -1,50 +1,5 @@
 # Dev notes
 
-## ⚠️ Privacy / PII — READ FIRST (this is a PUBLIC repo)
-
-`lrhodin/corten-matrix` is **public on GitHub**. Anything you commit — code,
-**comments**, **commit messages**, test fixtures, docs — is public the moment it's
-pushed, and **stays** public: redacting later needs a history rewrite + force-push,
-and GitHub still retains the old commit via its commit-URL/API caches, forks, and
-PR refs. **Prevent, don't fix** — treat any leaked value as permanently compromised.
-
-This has already bitten us: a **real phone number**, used as a "malformed vCard"
-example *in a code comment*, shipped to public master and survived a
-commit-message redaction (it had to be scrubbed from the source separately).
-
-**Never put real personal data anywhere in the repo.** Redact ALL of:
-- **Phone numbers** (real ones — even as examples in comments/messages)
-- **Email addresses** (real ones), **real names** (contacts, family, the user, the
-  upstream author), **physical/mailing addresses**
-- **Apple IDs / account handles**, real **iMessage/CloudKit GUIDs**, portal/chat
-  IDs, record names, or push topics tied to a real account
-- **Device identifiers**: serial number, MLB, ROM, UDID/UUID, IMEI, machine-id,
-  `X-Apple-I-MD-M`, `X-Mme-Device-Id`, hardware-key `_enc` values
-- **Secrets/identity material**: validation data, anisette, push/PET tokens,
-  keychain identifiers, `client_secret`, OTP/`ptm`/`tk`
-- **Raw vCard / address-book content** from a real account (test fixtures must be
-  fully synthetic)
-
-**Where it sneaks in — check every one before committing:** code comments (the one
-that bit us), commit messages, test fixtures (`.vcf`/`.vcard`, golden files),
-example configs, **debug logs** (`eprintln`/`info!`/`warn!`/zerolog), docs/handoff
-markdown.
-
-**Use placeholders instead:** phone `(XXX) XXX-XXXX` or `+15551234567` (555 is
-reserved); email `user@example.com`; name `Jane Doe`; IDs/GUIDs obviously fake
-(`AAAA…`, `00000000-0000-0000-0000-000000000000`).
-
-**Logging:** never log raw handles/numbers/emails/URLs/device-IDs. Route them
-through the existing sanitizers — `logSafeHandle`, `logSafeURL` (`pkg/connector/`)
-— which is why those helpers exist.
-
-**Before every commit:** scan the diff for real PII — `git diff` and grep for
-phone patterns (`\([0-9]{3}\)`, `[0-9]{3}-[0-9]{4}`), `@` emails, serial/MLB/UDID,
-real names. If you used real data to debug, keep it **local and uncommitted**;
-never stage it. If PII does land in a commit, tell the maintainer immediately —
-a forward commit cleans the tree, but full removal needs `filter-repo` +
-force-push and may persist in GitHub caches/forks regardless.
-
 ## FFI boundary (Go ↔ Rust)
 
 **Never hand-edit** `pkg/rustpushgo/rustpushgo.go` or `rustpushgo.h`. Always regenerate.

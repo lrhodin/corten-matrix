@@ -174,8 +174,8 @@ func TestBuildOpusTags(t *testing.T) {
 	}
 	vendorLen := binary.LittleEndian.Uint32(tags[8:12])
 	vendor := string(tags[12 : 12+vendorLen])
-	if vendor != "mautrix-imessage" {
-		t.Errorf("vendor = %q, want %q", vendor, "mautrix-imessage")
+	if vendor != "corten-matrix" {
+		t.Errorf("vendor = %q, want %q", vendor, "corten-matrix")
 	}
 }
 

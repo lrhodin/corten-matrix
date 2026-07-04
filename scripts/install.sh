@@ -5,6 +5,11 @@ BINARY="$1"
 DATA_DIR="$2"
 BUNDLE_ID="$3"
 
+# Session/login dir root for this account. The bridge reads session.json from
+# $XDG_DATA_HOME/corten-matrix, so a second account points this at its own dir
+# (and the launchd service below sets it so the running bridge agrees).
+ACCOUNT_XDG="${XDG_DATA_HOME:-$HOME/.local/share}"
+
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
 REGISTRATION="$DATA_DIR/registration.yaml"
@@ -46,11 +51,11 @@ else
 
     if [ "$DB_CHOICE" = "1" ]; then
         DB_TYPE="postgres"
-        read -p "PostgreSQL URI [postgres://localhost/mautrix_imessage?sslmode=disable]: " DB_URI
-        DB_URI="${DB_URI:-postgres://localhost/mautrix_imessage?sslmode=disable}"
+        read -p "PostgreSQL URI [postgres://localhost/corten_matrix?sslmode=disable]: " DB_URI
+        DB_URI="${DB_URI:-postgres://localhost/corten_matrix?sslmode=disable}"
     else
         DB_TYPE="sqlite3-fk-wal"
-        DB_URI="file:$DATA_DIR/mautrix-imessage.db?_txlock=immediate"
+        DB_URI="file:$DATA_DIR/corten-matrix.db?_txlock=immediate"
     fi
 
     echo ""
@@ -177,14 +182,14 @@ CURRENT_SOURCE=$(grep 'backfill_source:' "$CONFIG" 2>/dev/null | head -1 | sed '
 if [ "$CURRENT_SOURCE" = "chatdb" ] && [ "$(uname -s)" = "Darwin" ]; then
     CHATDB_PATH="$HOME/Library/Messages/chat.db"
     if [ -f "$CHATDB_PATH" ]; then
-        if ! sqlite3 "$CHATDB_PATH" "SELECT 1 FROM message LIMIT 1" >/dev/null 2>&1; then
+        if ! "$BINARY" fda-check >/dev/null 2>&1; then
             echo ""
             echo "⚠ Full Disk Access is required for chat.db backfill."
             echo "  Opening System Settings → Privacy & Security → Full Disk Access..."
             echo "  Grant access to the bridge binary, then press Enter to continue."
             open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null
             read -p "Press Enter when Full Disk Access has been granted..."
-            if sqlite3 "$CHATDB_PATH" "SELECT 1 FROM message LIMIT 1" >/dev/null 2>&1; then
+            if "$BINARY" fda-check >/dev/null 2>&1; then
                 echo "✓ Full Disk Access confirmed"
             else
                 echo "⚠ chat.db still not accessible — the bridge will prompt again on startup"
@@ -489,7 +494,7 @@ fi
 # This catches upgrades from pre-keychain versions where the device-passcode
 # step was never run. If trustedpeers.plist exists with a user_identity, the
 # keychain was joined successfully and any transient PCS errors are harmless.
-SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
+SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/corten-matrix"
 TRUSTEDPEERS_FILE="$SESSION_DIR/trustedpeers.plist"
 FORCE_CLEAR_STATE=false
 # Trust-circle only applies to CloudKit backfill — chatdb never creates
@@ -540,62 +545,8 @@ _SHORTCUT_DATA_ABS="$(cd "$DATA_DIR" && pwd)"
 _SHORTCUT_LOG_OUT="$_SHORTCUT_DATA_ABS/bridge.stdout.log"
 
 echo ""
-echo "Want easy commands you can type from any terminal to control the bridge?"
-echo "  start-imessage     stop-imessage     restart-imessage     imessage-log"
-read -r -p "Add them? [y/N]: " _shortcut_ans
-case "$_shortcut_ans" in
-    [yY]|[yY][eE][sS])
-        case "$SHELL" in
-            */zsh)  RC_FILE="$HOME/.zshrc" ;;
-            */bash) RC_FILE="$HOME/.bashrc" ;;
-            *)      RC_FILE="" ;;
-        esac
-        if [ -z "$RC_FILE" ]; then
-            echo "  Couldn't detect your shell from \$SHELL ($SHELL) — skipping. (Bash and Zsh are supported.)"
-        else
-            MARKER_START="# >>> mautrix-imessage shortcuts (managed) >>>"
-            MARKER_END="# <<< mautrix-imessage shortcuts (managed) <<<"
-            if [ -f "$RC_FILE" ] && grep -qF "$MARKER_START" "$RC_FILE"; then
-                awk -v s="$MARKER_START" -v e="$MARKER_END" '
-                    $0 == s { skip = 1; next }
-                    $0 == e { skip = 0; next }
-                    !skip   { print }
-                ' "$RC_FILE" > "$RC_FILE.tmp" && mv "$RC_FILE.tmp" "$RC_FILE"
-            fi
-            cat >> "$RC_FILE" <<EOF
-$MARKER_START
-alias start-imessage='launchctl bootstrap gui/\$(id -u) $PLIST'
-alias stop-imessage='launchctl bootout gui/\$(id -u)/$BUNDLE_ID'
-alias restart-imessage='launchctl kickstart -k gui/\$(id -u)/$BUNDLE_ID'
-alias imessage-log='tail -f $_SHORTCUT_LOG_OUT'
-$MARKER_END
-EOF
-            echo "  ✓ Shortcuts added. Open a new terminal (or run \`source $RC_FILE\` here) and you can type:"
-            echo "      start-imessage   stop-imessage   restart-imessage   imessage-log"
-        fi
-        ;;
-    *)
-        # User declined. If a previous run installed shortcuts, treat the
-        # decline as "remove them" so the rc file matches the user's choice.
-        case "$SHELL" in
-            */zsh)  RC_FILE="$HOME/.zshrc" ;;
-            */bash) RC_FILE="$HOME/.bashrc" ;;
-            *)      RC_FILE="" ;;
-        esac
-        MARKER_START="# >>> mautrix-imessage shortcuts (managed) >>>"
-        MARKER_END="# <<< mautrix-imessage shortcuts (managed) <<<"
-        if [ -n "$RC_FILE" ] && [ -f "$RC_FILE" ] && grep -qF "$MARKER_START" "$RC_FILE"; then
-            awk -v s="$MARKER_START" -v e="$MARKER_END" '
-                $0 == s { skip = 1; next }
-                $0 == e { skip = 0; next }
-                !skip   { print }
-            ' "$RC_FILE" > "$RC_FILE.tmp" && mv "$RC_FILE.tmp" "$RC_FILE"
-            echo "  Removed previously-installed shortcuts from $RC_FILE."
-        else
-            echo "  Skipped — re-run this installer to add them later."
-        fi
-        ;;
-esac
+echo ""
+echo "Tip: control the bridge with:  corten-matrix start | stop | restart | logs"
 echo ""
 
 # ── Preferred handle (runs every time, can reconfigure) ────────
@@ -903,7 +854,11 @@ DATA_ABS="$(cd "$DATA_DIR" && pwd)"
 LOG_OUT="$DATA_ABS/bridge.stdout.log"
 LOG_ERR="$DATA_ABS/bridge.stderr.log"
 
+# Always install the plist — the start/stop/restart subcommands act on it by path
+# (launchctl load/unload "$PLIST"), so it's a hard dependency even if we don't
+# load it now. Clear any previous instance first.
 mkdir -p "$(dirname "$PLIST")"
+launchctl bootout "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || true
 launchctl unload "$PLIST" 2>/dev/null || true
 
 cat > "$PLIST" << PLIST_EOF
@@ -916,8 +871,7 @@ cat > "$PLIST" << PLIST_EOF
     <key>ProgramArguments</key>
     <array>
         <string>$BINARY</string>
-        <string>-c</string>
-        <string>$CONFIG_ABS</string>
+        <string>bridge-all</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$DATA_ABS</string>
@@ -939,23 +893,59 @@ cat > "$PLIST" << PLIST_EOF
     <string>$LOG_OUT</string>
     <key>StandardErrorPath</key>
     <string>$LOG_ERR</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>XDG_DATA_HOME</key>
+        <string>$ACCOUNT_XDG</string>
+    </dict>
 </dict>
 </plist>
 PLIST_EOF
 
-launchctl load "$PLIST"
-echo "✓ Bridge started (LaunchAgent installed)"
-echo ""
-
-# ── Wait for bridge to connect ────────────────────────────────
-echo "Waiting for bridge to start..."
-for i in $(seq 1 15); do
-    if grep -q "Bridge started" "$LOG_OUT" 2>/dev/null; then
-        echo "✓ Bridge is running"
-        break
+if [ -n "${CORTEN_SKIP_SERVICE:-}" ]; then
+    # Second account: ONE shared corten-matrix service runs BOTH bridges
+    # (bridge-all), so don't keep a separate LaunchAgent for it.
+    rm -f "$PLIST" 2>/dev/null || true
+    echo "✓ Second account configured — runs under the shared corten-matrix service"
+elif [ -n "${CORTEN_DEFER_START:-}" ]; then
+    # Orchestrator-driven (pkg/cli): started centrally after the optional 2nd account.
+    echo "✓ Account configured"
+else
+# The plist is installed; the prompt only decides whether to LOAD (start) it now.
+# Either way 'corten-matrix start/stop/restart' work later, since they act on it.
+if [ -t 0 ]; then
+    printf "\nStart the bridge now (and automatically at login)? [Y/n]: "
+    read START_NOW
+else
+    START_NOW=""
+fi
+case "${START_NOW}" in
+[nN]*)
+    echo "✓ Service installed (not started). Start it any time with: corten-matrix start"
+    ;;
+*)
+    if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
+        || launchctl load -w "$PLIST" 2>/dev/null; then
+        launchctl kickstart -k "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || true
+        echo "✓ Bridge started"
+    else
+        echo ""
+        echo "⚠  Could not load the service. Run the bridge manually:"
+        echo "   $BINARY -c $CONFIG_ABS"
+        echo ""
     fi
-    sleep 1
-done
+
+    echo ""
+    echo "Waiting for bridge to start..."
+    for i in $(seq 1 15); do
+        if grep -q "Bridge started" "$LOG_OUT" 2>/dev/null; then
+            echo "✓ Bridge is running"
+            break
+        fi
+        sleep 1
+    done
+    ;;
+esac
 
 echo ""
 echo "═══════════════════════════════════════════════"
@@ -965,5 +955,18 @@ echo ""
 echo "  Logs:    tail -f $LOG_OUT"
 echo "  Restart: launchctl kickstart -k gui/$(id -u)/$BUNDLE_ID"
 echo "  Stop:    launchctl bootout gui/$(id -u)/$BUNDLE_ID"
+fi
 echo ""
 
+
+# ── Add to PATH (optional; symlink only, no shell-rc edits) ────
+if [ -t 0 ] && ! command -v corten-matrix >/dev/null 2>&1; then
+    printf "\nAdd 'corten-matrix' to your PATH (symlink in /usr/local/bin)? [Y/n]: "
+    read ADD_PATH
+    case "$ADD_PATH" in
+        [nN]*) ;;
+        *) sudo ln -sf "$BINARY" /usr/local/bin/corten-matrix 2>/dev/null \
+             && echo "OK - corten-matrix added to PATH" \
+             || echo "  Couldn't symlink. Run: sudo ln -sf $BINARY /usr/local/bin/corten-matrix" ;;
+    esac
+fi

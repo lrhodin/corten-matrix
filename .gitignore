@@ -19,6 +19,9 @@ docker-compose.override.yml
 .env
 
 # Built binaries
+/dist/
+/corten-matrix
+/corten-matrix-v2
 /mautrix-imessage
 /mautrix-imessage-v2
 /mautrix-imessage.app
@@ -29,12 +32,15 @@ docker-compose.override.yml
 /build/
 /bbctl
 
-# Local external worktrees / generated app workspace
+# Local external worktrees / generated app workspace.
+# third_party/rustpush-upstream is where build.sh clones rustpush upstream and
+# overlays our PRIVATE clean-room (open-absinthe + apple-private-apis) — never
+# commit it or the private APIs would leak into the public bridge repo.
 /third_party/rustpush-upstream/
 /openbubbles-app-rustpush/
 /rustpush-master/
 
-# Rust build artifacts
+# Rust build artifacts. librustpushgo.a IS the sealed clean-room as machine code.
 librustpushgo.a
 **/target/
 state/
@@ -45,6 +51,7 @@ rustpush/certs/fairplay/
 ENDTOEND_TEST_PROMPT.md
 RUSTPUSH_INTEGRATION_PROMPT.md
 prompts/
+corten-matrix.app/
 mautrix-imessage-v2.app/
 .build-commit
 .DS_Store

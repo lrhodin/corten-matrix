@@ -1,7 +1,7 @@
 pub mod util;
 #[cfg(target_os = "macos")]
 pub mod local_config;
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), feature = "anisette-remote-v3"))]
 pub mod anisette;
 mod statuskitgo;
 mod statuskit_cloudkit;
@@ -42,28 +42,43 @@ use std::sync::RwLock;
 //
 // `BridgeDefaultAnisetteProvider` is the concrete `AnisetteProvider` type used
 // by every rustpush client that's parameterized over one (AppleAccount,
-// KeychainClient, CloudKitClient, TokenProvider, etc.). On macOS this is
-// upstream's `AOSKitAnisetteProvider` (native, untouched). On Linux this is
-// our `anisette::BridgeAnisetteProvider`, which wraps upstream's
-// `RemoteAnisetteProviderV3` with retry logic, a timeout (upstream's
-// provision() loop spins forever on WS close), and error handling for
-// upstream's missing `EndProvisioningError` serde variant.
-#[cfg(target_os = "macos")]
+// KeychainClient, CloudKitClient, TokenProvider, etc.). With the default
+// `cleanroom-registration` feature this is omnisette's `ClearADIClient` on
+// Linux and macOS, backed by the portable clearadi ProvisioningSession. On
+// macOS, `anisette-aoskit` can explicitly re-select AOSKit. On Linux,
+// `anisette-remote-v3` can explicitly re-select the legacy remote service
+// wrapper for debugging.
+#[cfg(any(target_os = "macos", not(feature = "anisette-remote-v3")))]
 pub type BridgeDefaultAnisetteProvider = omnisette::DefaultAnisetteProvider;
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), feature = "anisette-remote-v3"))]
 pub type BridgeDefaultAnisetteProvider = anisette::BridgeAnisetteProvider;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", not(feature = "anisette-remote-v3")))]
 fn bridge_default_provider(
     info: omnisette::LoginClientInfo,
     path: PathBuf,
+    device_id: String,
 ) -> omnisette::ArcAnisetteClient<BridgeDefaultAnisetteProvider> {
-    omnisette::default_provider(info, path)
+    // The omnisette provider selected with `cleanroom-registration` takes a
+    // `device_id`; upstream OpenBubbles omnisette's `default_provider` is 2-arg.
+    // Gate on the feature so both signatures build: with cleanroom-registration
+    // the 3-arg call is used; without it (this from-source build) the 2-arg
+    // upstream signature is used.
+    #[cfg(feature = "cleanroom-registration")]
+    {
+        omnisette::default_provider(info, path, device_id)
+    }
+    #[cfg(not(feature = "cleanroom-registration"))]
+    {
+        let _ = device_id;
+        omnisette::default_provider(info, path)
+    }
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), feature = "anisette-remote-v3"))]
 fn bridge_default_provider(
     info: omnisette::LoginClientInfo,
     path: PathBuf,
+    _device_id: String,
 ) -> omnisette::ArcAnisetteClient<BridgeDefaultAnisetteProvider> {
     std::sync::Arc::new(tokio::sync::Mutex::new(omnisette::AnisetteClient::new(
         anisette::BridgeAnisetteProvider::new(info, path),
@@ -73,7 +88,7 @@ use tokio::sync::broadcast;
 use util::{plist_from_string, plist_to_string};
 
 // Local helpers to replace rustpush's private `util::{base64_decode, encode_hex, ...}`.
-// Part of the zero-patch refactor: `rustpush::util` is private in upstream, so we
+// Part of the zero-patch refactor: `rustpush::util` is private, so we
 // reimplement the same semantics (infallible on invalid base64/hex input) using the
 // `base64` and `hex` crates directly.
 #[inline]
@@ -101,7 +116,7 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, hex::FromHexError> {
 // in `lqa.protection_info.protection_info`, and MMCS deduplicates identical
 // content at the storage layer. When the same video is uploaded twice, MMCS
 // returns ONE encrypted blob encrypted with the original uploader's key — so
-// the second record's own Ford key cannot SIV-decrypt it, and upstream
+// the second record's own Ford key cannot SIV-decrypt it, and
 // rustpush's `get_mmcs` panics on the `.unwrap()` of the SIV result.
 //
 // This cache holds every Ford key the bridge has ever seen (populated during
@@ -109,7 +124,7 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, hex::FromHexError> {
 // catches the panic and retries `container.get_assets(...)` with each cached
 // key in turn by mutating `Asset.protection_info.protection_info` before the
 // call. This matches the semantics of the original in-rustpush fix without
-// touching upstream source.
+// touching rustpush source.
 
 fn ford_key_cache() -> &'static std::sync::Mutex<HashMap<Vec<u8>, Vec<u8>>> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<Vec<u8>, Vec<u8>>>> =
@@ -215,20 +230,20 @@ fn is_ford_encrypted_asset(
 }
 
 // ============================================================================
-// Manual Ford download (V1 + V2 support — zero-patch workaround for upstream)
+// Manual Ford download (V1 + V2 support — zero-patch workaround)
 // ============================================================================
 //
-// Upstream rustpush's `get_mmcs` supports V1 Ford (`FordItem` with a flat
+// The rustpush crate's `get_mmcs` supports V1 Ford (`FordItem` with a flat
 // `chunks: Vec<FordChunkItem>`) only. When Apple's CloudKit serves a
 // V2 Ford blob (`FordItemV2` with grouped chunks) — which master's fork
-// supports via an extended proto — upstream panics unconditionally at
+// supports via an extended proto — `get_mmcs` panics unconditionally at
 // `chunks.item.expect("Ford chunks missing?")` (mmcs.rs:1117). The panic
 // is post-SIV, so no amount of key brute-forcing in the wrapper can
-// recover: upstream crashes before it ever tries to extract per-chunk
+// recover: it crashes before it ever tries to extract per-chunk
 // keys.
 //
 // This module reimplements the Ford download path entirely at the
-// wrapper layer using upstream's public primitives:
+// wrapper layer using rustpush's public primitives:
 //   - `rustpush::mmcsp::AuthorizeGetResponse` (the proto bytes we get
 //     back from the CloudKit AssetGetResponse body)
 //   - `rustpush::mmcs::transfer_mmcs_container` (the public HTTP fetch)
@@ -240,11 +255,11 @@ fn is_ford_encrypted_asset(
 //   - manual V2 chunk decrypt (AES-256-CTR + HKDF + HMAC verify)
 //   - manual V1 chunk decrypt (AES-128-CFB)
 //
-// The control flow is: upstream's `container.get_assets` is still the
+// The control flow is: rustpush's `container.get_assets` is still the
 // happy path (fast, no panic on V1 correct-key records). Only when that
 // panics or errors do we fall through to `manual_ford_download_asset`.
 // That function handles dedup, V2 Ford, V1 Ford, AND plain V1 chunks
-// all via the same code path, so recovery is a superset of upstream's
+// all via the same code path, so recovery is a superset of rustpush's
 // capabilities.
 
 mod manual_ford {
@@ -263,7 +278,7 @@ mod manual_ford {
     use sha2::{Digest as Sha2Digest, Sha256};
 
     /// Shared reqwest client for HTTP container fetches. We can't use
-    /// upstream's private `REQWEST` static, so we maintain our own.
+    /// rustpush's private `REQWEST` static, so we maintain our own.
     pub(super) static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         reqwest::Client::builder()
             .gzip(true)
@@ -272,8 +287,8 @@ mod manual_ford {
             .expect("reqwest client build")
     });
 
-    /// Local FordChunk message. Upstream's `mmcsp::FordChunk` only has
-    /// field 1 (`item: FordItem`) because upstream's proto doesn't know
+    /// Local FordChunk message. The `mmcsp::FordChunk` type only has
+    /// field 1 (`item: FordItem`) because its proto doesn't know
     /// about V2. We decode the same bytes through this local type to get
     /// access to the V2 `item_v2` field (tag 2), which carries chunks
     /// grouped by size with multiple keys per group.
@@ -437,14 +452,14 @@ mod manual_ford {
         None
     }
 
-    /// V2 chunk decrypt — ported from upstream's private `ChunkDesc::decrypt`
+    /// V2 chunk decrypt — ported from the private `ChunkDesc::decrypt`
     /// at mmcs.rs:696. HKDF(key[1..]) → expand 0x60 bytes → split into
     /// (sig_hmac [0..32], auth_hmac [32..64], aes_key [64..96]). IV is
     /// HMAC(auth_hmac, chunk_id_padded_40)[..16]. Decrypts AES-256-CTR,
     /// truncates to declared length, verifies sig HMAC.
     ///
     /// Returns `Err` on HMAC mismatch (wrong key or corrupt data) — the
-    /// upstream version has `assert_eq!` there, which panics; we return
+    /// rustpush version has `assert_eq!` there, which panics; we return
     /// a typed error instead so the caller can fall through.
     pub(super) fn decrypt_v2_chunk(
         key33: &[u8],
@@ -517,7 +532,7 @@ mod manual_ford {
     }
 
     /// V1 chunk decrypt — AES-128-CFB with `key[1..]` as the 16-byte
-    /// key, no IV. Ported from upstream's mmcs.rs:695.
+    /// key, no IV. Ported from mmcs.rs:695.
     pub(super) fn decrypt_v1_chunk(key17: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
         if key17.len() != 17 {
             return Err(format!("V1 key wrong length: {}", key17.len()));
@@ -586,8 +601,8 @@ mod manual_ford {
     }
 
     /// Manual Ford download of one asset. This is the V1+V2-capable
-    /// replacement for upstream's `get_assets` → `get_mmcs` chain. It
-    /// bypasses all of upstream's panicking code paths by reimplementing
+    /// replacement for the `get_assets` → `get_mmcs` chain. It
+    /// bypasses all of rustpush's panicking code paths by reimplementing
     /// the download primitives at this layer.
     ///
     /// Inputs:
@@ -785,29 +800,10 @@ mod manual_ford {
     }
 }
 
-// ============================================================================
-// NAC relay config (Apple Silicon hardware keys that can't run in the
-// x86-64 unicorn emulator on Linux)
-// ============================================================================
-//
-// Some hardware keys (especially those extracted from Apple Silicon Macs)
-// cannot be driven by the local unicorn x86-64 NAC emulator. For those
-// users, `extract-key` embeds a `nac_relay_url` + bearer token +
-// (optional) TLS cert fingerprint into the hardware-key JSON blob.
-//
-// At runtime, `_create_config_from_hardware_key_inner` calls
-// `register_nac_relay` to stash those values here, then forwards them
-// into `open_absinthe::nac::set_relay_config` so open-absinthe's
-// `ValidationCtx::new()` can use the relay's 3-step NAC protocol
-// instead of running the emulator. This mirrors the macOS Local NAC
-// wiring (where open-absinthe's Native variant delegates to
-// `nac-validation`) — same integration pattern, just over HTTPS to a
-// Mac running `tools/nac-relay`.
-
 // ---------------------------------------------------------------------------
 // rustls 0.23 CryptoProvider initialization.
 //
-// Upstream rustpush pulled in rustls 0.23 transitively. Unlike 0.21/0.22,
+// The rustpush crate pulled in rustls 0.23 transitively. Unlike 0.21/0.22,
 // rustls 0.23 does not auto-install a process-wide CryptoProvider when
 // multiple provider crates are present in the dep graph; the first TLS
 // connection panics with "Could not automatically determine the
@@ -824,85 +820,20 @@ fn ensure_crypto_provider() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// RelayOSConfig — wraps MacOSConfig for Apple Silicon hardware keys.
-//
-// Copies master's relay logic: generate_validation_data() calls the relay
-// directly and returns the data, bypassing the Apple handshake entirely.
-// All other OSConfig methods delegate to the inner MacOSConfig.
-// ---------------------------------------------------------------------------
-
-struct RelayOSConfig {
-    inner: Arc<rustpush::macos::MacOSConfig>,
-    relay_url: String,
-    relay_token: Option<String>,
-}
-
-#[async_trait::async_trait]
-impl OSConfig for RelayOSConfig {
-    fn build_activation_info(&self, csr: Vec<u8>) -> rustpush::activation::ActivationInfo {
-        self.inner.build_activation_info(csr)
-    }
-    fn get_activation_device(&self) -> String { self.inner.get_activation_device() }
-    async fn generate_validation_data(&self) -> Result<Vec<u8>, rustpush::PushError> {
-        // Same logic as master's MacOSConfig relay path: call relay, return directly.
-        use base64::{Engine, engine::general_purpose::STANDARD};
-
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .map_err(|e| rustpush::PushError::RelayError(0, format!("Failed to build relay client: {e}")))?;
-
-        let mut req = client.post(&self.relay_url);
-        if let Some(ref token) = self.relay_token {
-            req = req.header("Authorization", format!("Bearer {token}"));
-        }
-
-        let resp = req.send().await
-            .map_err(|e| rustpush::PushError::RelayError(0, format!("NAC relay request failed: {e}")))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(rustpush::PushError::RelayError(status, format!("NAC relay error: {body}")));
-        }
-        let b64 = resp.text().await
-            .map_err(|e| rustpush::PushError::RelayError(0, format!("NAC relay read error: {e}")))?;
-        let data = STANDARD.decode(b64.trim())
-            .map_err(|e| rustpush::PushError::RelayError(0, format!("NAC relay base64 decode: {e}")))?;
-        info!("NAC relay: got {} bytes of validation data from {}", data.len(), self.relay_url);
-        Ok(data)
-    }
-    fn get_protocol_version(&self) -> u32 { self.inner.get_protocol_version() }
-    fn get_register_meta(&self) -> rustpush::RegisterMeta { self.inner.get_register_meta() }
-    fn get_normal_ua(&self, item: &str) -> String { self.inner.get_normal_ua(item) }
-    fn get_mme_clientinfo(&self, for_item: &str) -> String { self.inner.get_mme_clientinfo(for_item) }
-    fn get_version_ua(&self) -> String { self.inner.get_version_ua() }
-    fn get_device_name(&self) -> String { self.inner.get_device_name() }
-    fn get_device_uuid(&self) -> String { self.inner.get_device_uuid() }
-    fn get_private_data(&self) -> plist::Dictionary { self.inner.get_private_data() }
-    fn get_debug_meta(&self) -> rustpush::DebugMeta { self.inner.get_debug_meta() }
-    fn get_login_url(&self) -> &'static str { self.inner.get_login_url() }
-    fn get_serial_number(&self) -> String { self.inner.get_serial_number() }
-    fn get_gsa_hardware_headers(&self) -> HashMap<String, String> { self.inner.get_gsa_hardware_headers() }
-    fn get_aoskit_version(&self) -> String { self.inner.get_aoskit_version() }
-    fn get_udid(&self) -> String { self.inner.get_udid() }
-}
-
 // ============================================================================
 // Local CloudKit record type that understands the `avid` field.
 // ============================================================================
 //
-// Upstream `rustpush::cloud_messages::CloudAttachment` only declares `cm` and
+// The `rustpush::cloud_messages::CloudAttachment` type only declares `cm` and
 // `lqa`, so parsed records drop the `avid` Asset (Live Photo MOV companion).
 // Our vendored fork added `pub avid: Asset` to support Live Photos.
 //
-// Instead of patching upstream, we define our own CloudKit record type with
+// Instead of patching rustpush, we define our own CloudKit record type with
 // the same `attachment` record ID and the same field names — CloudKit's
 // on-the-wire record format is schema-driven by field name, so a local
 // struct that derives `CloudKitRecord` with an extra `avid: Asset` field
 // parses the exact same server-side records and populates all three fields.
-// Upstream's original `CloudAttachment` still works wherever we don't need
+// The original `CloudAttachment` still works wherever we don't need
 // the avid — this type is used anywhere we DO need it (attachment sync for
 // `has_avid` detection, Live Photo MOV download).
 
@@ -1092,13 +1023,6 @@ impl WrappedIDSNGMIdentity {
 #[derive(uniffi::Object)]
 pub struct WrappedOSConfig {
     pub config: Arc<dyn OSConfig>,
-    /// True when this config was built from an Apple Silicon hardware key
-    /// that requires the NAC relay server to be running during registration.
-    pub has_nac_relay: bool,
-    /// NAC relay URL for pre-fetching validation data (Apple Silicon keys).
-    pub(crate) relay_url: Option<String>,
-    /// NAC relay bearer token.
-    pub(crate) relay_token: Option<String>,
 }
 
 #[uniffi::export]
@@ -1106,12 +1030,6 @@ impl WrappedOSConfig {
     /// Get the device UUID from the underlying OSConfig.
     pub fn get_device_id(&self) -> String {
         self.config.get_device_uuid()
-    }
-
-    /// Returns true if this config requires the NAC relay server to be
-    /// running during initial registration (Apple Silicon hardware keys).
-    pub fn requires_nac_relay(&self) -> bool {
-        self.has_nac_relay
     }
 }
 
@@ -1144,8 +1062,8 @@ fn is_pcs_recoverable_error(err: &rustpush::PushError) -> bool {
     )
 }
 
-/// True when the error is a missing-MME-token failure. Upstream's
-/// `get_mme_token(name)` returns `TokenMissing` when the seeded delegate
+/// True when the error is a missing-MME-token failure. The
+/// `get_mme_token(name)` call returns `TokenMissing` when the seeded delegate
 /// lacks the requested name (e.g. `cloudKitToken`), and it only
 /// auto-refreshes the delegate if it's older than one week. A partial or
 /// stale seeded delegate that's still within that week gets permanently
@@ -1164,12 +1082,12 @@ fn keychain_retry_delay(attempt: usize) -> Duration {
 
 /// Try to recover usable CloudKit keys after a NotInClique failure.
 ///
-/// Upstream's `sync_keychain` gates everything behind `is_in_clique()`, which
+/// The `sync_keychain` call gates everything behind `is_in_clique()`, which
 /// calls `sync_trust()` → Cuttlefish `fetchChanges`. If another device (e.g.
 /// an iPhone running Messages) posts a trust-update that excludes us, every
 /// `is_in_clique()` call returns false and `sync_keychain` is dead.
 ///
-/// Recovery strategy — all public upstream APIs, no internal field access:
+/// Recovery strategy — all public rustpush APIs, no internal field access:
 ///   1. Try to refresh TLK shares via `fetch_shares_for` + `store_keys`.
 ///      These hit a different Cuttlefish endpoint that doesn't check clique
 ///      membership, so they work even when we appear excluded.
@@ -1443,7 +1361,7 @@ pub struct EscrowDeviceInfo {
 /// Used for iCloud services like CardDAV contacts and CloudKit messages.
 ///
 /// This wrapper stores `account`, `os_config`, and `mme_delegate` alongside the
-/// inner TokenProvider because OpenBubbles upstream's TokenProvider keeps these
+/// inner TokenProvider because the TokenProvider keeps these
 /// as private fields with no public getters. As part of the zero-patch refactor,
 /// we pass them in at construction time and read from our own state.
 #[derive(uniffi::Object)]
@@ -1453,7 +1371,7 @@ pub struct WrappedTokenProvider {
     os_config: Arc<dyn OSConfig>,
     // MobileMe delegate stored as opaque plist XML bytes because
     // `rustpush::auth::MobileMeDelegateResponse` is not nameable from outside the
-    // crate in OpenBubbles upstream (`mod auth` is private). Call sites that
+    // crate (`mod auth` is private). Call sites that
     // need a typed `&MobileMeDelegateResponse` reconstruct it via
     // `plist::from_bytes(&bytes)?` and let the compiler infer T from the
     // receiving function's signature (e.g. `KeychainClientState::new(_, _, &T)`).
@@ -1464,13 +1382,13 @@ pub struct WrappedTokenProvider {
     //
     // We cache it because each fresh pair forces a fresh CloudKit container
     // init (`ckAppInit` POST to `gateway.icloud.com/setup/setup/ck/v1/ckAppInit`
-    // inside upstream `CloudKitOpenContainer::init` at
-    // `third_party/rustpush-upstream/src/icloud/cloudkit.rs:1309-1340`).
+    // inside `CloudKitOpenContainer::init` at
+    // `third_party/rustpush/src/icloud/cloudkit.rs:1309-1340`).
     // Apple has been observed returning empty bodies (401-with-no-body) for
     // a *second* `ckAppInit` call from the same process minutes after the
     // first one succeeded — typically the get_escrow_devices → user enters
     // passcode → join_keychain_clique_for_device sequence in the install
-    // flow. Upstream's init handles 401 by calling `refresh_mme` but then
+    // flow. The init handles 401 by calling `refresh_mme` but then
     // still tries to JSON-decode the (empty) 401 response body
     // (cloudkit.rs:1326-1330), surfacing as
     // "HTTP error: error decoding response body: EOF while parsing a value
@@ -1478,7 +1396,7 @@ pub struct WrappedTokenProvider {
     //
     // Caching the pair means the second call reuses the working container
     // from the first call and skips the second ckAppInit entirely, which
-    // sidesteps the upstream bug and any Apple-side rate limiting on
+    // sidesteps the rustpush bug and any Apple-side rate limiting on
     // ckAppInit for the same DSID.
     keychain_clients_cache: tokio::sync::Mutex<Option<(
         Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
@@ -1498,7 +1416,7 @@ pub struct WrappedTokenProvider {
 ///
 /// Reads dsid/adsid/anisette directly from the locally-stored AppleAccount and
 /// the cached MobileMe delegate, avoiding the need for getter methods on
-/// TokenProvider itself (which upstream does not expose).
+/// TokenProvider itself (which rustpush does not expose).
 async fn create_keychain_clients(
     wp: &WrappedTokenProvider,
 ) -> Result<(
@@ -1508,7 +1426,7 @@ async fn create_keychain_clients(
     // Fast path: return the cached pair if we've already built one in this
     // process. See the keychain_clients_cache field docstring on
     // WrappedTokenProvider for why caching is required (Apple returns empty
-    // body on a second ckAppInit, and upstream's CloudKitOpenContainer::init
+    // body on a second ckAppInit, and the CloudKitOpenContainer::init
     // can't recover from it). Holding the lock across the slow construction
     // path below also serializes concurrent callers, so two parallel
     // `get_escrow_devices` calls don't race into two separate ckAppInit POSTs.
@@ -1740,13 +1658,13 @@ async fn join_keychain_with_bottles(
 /// `WrappedTokenProvider::refresh_pet_token` (periodic mid-run).
 ///
 /// Snapshot `account.tokens` before the call, run `login_email_pass`, then
-/// merge the snapshot back so any token upstream didn't (re)write is
-/// preserved. Upstream's `login_email_pass` can unconditionally overwrite
+/// merge the snapshot back so any token `login_email_pass` didn't (re)write is
+/// preserved. The `login_email_pass` call can unconditionally overwrite
 /// `self.tokens` when SPD contains a `t` dict (client.rs:776), which on a
 /// non-LoggedIn return path would partially wipe a good token map. The merge
 /// guarantees we never exit with fewer tokens than we entered.
 ///
-/// NeedsExtraStep with a populated PET is treated as success (see upstream
+/// NeedsExtraStep with a populated PET is treated as success (see
 /// LoginSession::finish / client.rs:1039).
 ///
 /// Infallible — any auth/network error is logged and swallowed so callers
@@ -1789,7 +1707,7 @@ impl WrappedTokenProvider {
     /// Get HTTP headers needed for iCloud MobileMe API calls.
     /// Includes Authorization (X-MobileMe-AuthToken) and anisette headers.
     ///
-    /// OpenBubbles upstream exposes `TokenProvider::get_mme_token(&str)` which
+    /// rustpush exposes `TokenProvider::get_mme_token(&str)` which
     /// returns the mmeAuthToken (and auto-refreshes internally). We build the
     /// Apple-required HTTP headers (X-MobileMe-AuthToken, X-Client-UDID,
     /// X-MMe-Client-Info, plus anisette) locally from our stored state.
@@ -1913,12 +1831,12 @@ impl WrappedTokenProvider {
     /// session from aging out and forcing a manual 2FA.
     ///
     /// Lock scope: holds `self.account` across `login_email_pass` (network
-    /// I/O). This matches upstream's own `TokenProvider::get_token` pattern
+    /// I/O). This matches the `TokenProvider::get_token` pattern
     /// at `icloud-auth/client.rs:338-360` which also holds this lock across
     /// its auto-refresh `login_email_pass` call. Any concurrent `get_dsid` /
     /// `get_adsid` / `get_gsa_token` caller briefly waits (typically 1-3s on
     /// a warm session) once per 12h tick. Not a new contention pattern —
-    /// it's inherent to how upstream serializes access to AppleAccount.
+    /// it's inherent to how rustpush serializes access to AppleAccount.
     ///
     /// Non-fatal: any failure is logged inside `refresh_pet_with_snapshot`
     /// and swallowed so the Go-side caller treats an Err return as "try
@@ -1936,12 +1854,13 @@ impl WrappedTokenProvider {
     }
 
     /// Announce this endpoint as a new "Apple Device" via GSA `/circle`, exactly
-    /// once per persisted login. Matches OB-Android's `restore_account` call to
+    /// once per persisted login. Calls `restore_account` to
     /// `update_postdata("Apple Device", None, &["icloud", "imessage", "facetime"])`
-    /// guarded by `postdata_done` in `gsa.plist` (ob/rust/src/api/api.rs:675-679).
+    /// guarded by `postdata_done` in `gsa.plist`.
     ///
-    /// Why: at the IDS-register layer the bridge and OB are byte-identical, yet
-    /// peer iOS devices only reshape StatusKit keys to OB automatically. The
+    /// Why: at the IDS-register layer the bridge's requests are byte-identical to a
+    /// native Apple client's, yet peer iOS devices only reshape StatusKit keys to a
+    /// native Apple client automatically. The
     /// difference is this GSA side-channel call, which declares a new
     /// Apple-Device-class identity on the account with cdpStatus/circleStatus=true
     /// across iCloud/iMessage/FaceTime. Apple propagates that device-enrollment
@@ -1999,14 +1918,14 @@ impl WrappedTokenProvider {
 }
 
 /// Reshape a stored MobileMe delegate plist value so that deserializing it as
-/// upstream's `MobileMeDelegateResponse` puts the *inner* iCloud service dict
+/// the `MobileMeDelegateResponse` puts the *inner* iCloud service dict
 /// (the one keyed by `com.apple.Dataclass.KeychainSync`,
 /// `com.apple.Dataclass.Files`, etc.) into the `config` field.
 ///
 /// We accept three stored shapes and normalize to a single output:
 ///   1. **Current (post-a7fab47 double-wrapped)**:
 ///      `{tokens, "com.apple.mobileme": {tokens, "com.apple.mobileme": {KeychainSync: ...}}}`
-///      — produced by our serialize path below after upstream's "fix" made
+///      — produced by our serialize path below after the "fix" made
 ///      `mobileme.config` hold the entire delegate service_data.
 ///   2. **Legacy (pre-a7fab47)**:
 ///      `{tokens, "com.apple.mobileme": {KeychainSync: ...}}`
@@ -2047,7 +1966,7 @@ fn normalize_mme_delegate_dict(value: plist::Value) -> plist::Value {
 
 // Non-uniffi impl block: internal helpers used by other wrapper code that need
 // to read state previously available via `TokenProvider::get_xxx()` methods that
-// OpenBubbles upstream doesn't expose. These are not exported as FFI symbols.
+// rustpush doesn't expose. These are not exported as FFI symbols.
 impl WrappedTokenProvider {
     /// Get the ADSID from the AppleAccount's SPD dictionary.
     pub(crate) async fn get_adsid(&self) -> Result<String, WrappedError> {
@@ -2158,7 +2077,7 @@ impl WrappedTokenProvider {
     /// the caller context expects (usually `rustpush::auth::MobileMeDelegateResponse`).
     /// `T` is inferred from the receiving function's signature at the call site —
     /// we intentionally do NOT name the type here because it's not reachable from
-    /// outside the rustpush crate in OpenBubbles upstream (`mod auth` is private).
+    /// outside the rustpush crate (`mod auth` is private).
     ///
     /// Normalizes the dict shape before deserialization so `config` ends up as
     /// the inner iCloud service dict (the one holding `com.apple.Dataclass.KeychainSync`
@@ -2337,12 +2256,18 @@ pub async fn restore_token_provider(
     let conn = connection.inner.clone();
 
     // Create a fresh anisette provider. On Linux the
-    // `BridgeAnisetteProvider` owns provisioning and bypasses upstream's
+    // `BridgeAnisetteProvider` owns provisioning and bypasses rustpush's
     // broken `ProvisionInput` enum entirely (see src/anisette.rs). On
-    // macOS this is upstream's native AOSKit path, unchanged.
+    // macOS this is the native AOSKit path, unchanged.
     let client_info = os_config.get_gsa_config(&*conn.state.read().await, false);
-    let anisette_state_path = PathBuf::from_str("state/anisette").unwrap();
-    let anisette = bridge_default_provider(client_info.clone(), anisette_state_path);
+    // Persist the provisioned ADI machine in the absolute XDG data dir (same place
+    // every other subsystem uses), NOT a cwd-relative path. With the relative
+    // "state/anisette" the machine was re-provisioned on every login (state.plist
+    // never found → exists=false → fresh machine + new X-Mme-Device-Id each run),
+    // and Apple rejects the provision-then-complete churn at GSA `complete` (-22406).
+    // A real device provisions once and persists; this matches that.
+    let anisette_state_path = PathBuf::from(subsystem_state_path("anisette"));
+    let anisette = bridge_default_provider(client_info.clone(), anisette_state_path, os_config.get_device_uuid());
 
     // Create a new AppleAccount and populate it with persisted state
     let mut account = AppleAccount::new_with_anisette(client_info, anisette)
@@ -2366,11 +2291,11 @@ pub async fn restore_token_provider(
     // timestamp. Byte-for-byte port of the master-branch restore path
     // (master's pkg/rustpushgo/src/lib.rs line 805).
     //
-    // Why: upstream's `get_token` short-circuits and returns None when
+    // Why: the `get_token` call short-circuits and returns None when
     // `tokens.is_empty() == false` AND the requested key is absent. So if
     // we leave tokens empty OR populate it without the PET key, the first
     // `get_gsa_token("com.apple.gs.idms.pet")` call either takes a
-    // corner-case path or returns None immediately. Neither gives upstream
+    // corner-case path or returns None immediately. Neither gives `get_token`
     // the opportunity to auto-refresh via `login_email_pass`.
     //
     // With an expired PET entry present, `get_token`'s expiration check
@@ -2382,14 +2307,14 @@ pub async fn restore_token_provider(
     //
     // The 0bbb081 commit that removed this trick said "FetchedToken has
     // private fields so we cannot reconstruct tokens from the persisted
-    // SPD" — that was accurate against raw OpenBubbles upstream but no
+    // SPD" — that was accurate against raw rustpush but no
     // longer applies, because the Makefile's `ensure-rustpush-source`
     // target now sed-patches `pub token`/`pub expiration` onto
     // `FetchedToken` alongside the existing `pub mod activation; pub mod
     // ids;` visibility bumps. See Makefile:208-217.
     //
     // This is the PRIMARY fix for the daily-auth-breaks-at-24h regression
-    // that appeared after the refactor migration to raw OpenBubbles and
+    // that appeared after the refactor migration to raw rustpush and
     // was never fully restored by the subsequent periodic-refresh commits
     // (66d6402, bdd4ebe).
     account.tokens.insert(
@@ -3394,7 +3319,7 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
             // Flip is_ringing_inaccurate=true now that the Invitation is on
             // the wire. create_session_no_ring starts it false to suppress
             // prop_up_conv's RespondedElsewhere diversion; we need it true
-            // here so upstream's missed-call detection (facetime.rs:1411)
+            // here so the missed-call detection (facetime.rs:1411)
             // trips if the callee declines / times out — otherwise a
             // no-answer call silently drops instead of surfacing as Missed.
             let mut state = ft.state.write().await;
@@ -3413,8 +3338,8 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
 
         // Leave the session now that the user's device has joined AND the
         // ring is on the wire. The bridge was only propped in the session
-        // to satisfy upstream's OneOnOne-mode exit requirement (see
-        // upstream facetime.rs:1071-1077 comment: "we solve this by
+        // to satisfy the OneOnOne-mode exit requirement (see
+        // facetime.rs:1071-1077 comment: "we solve this by
         // 'joining' the call until the web client has an opportunity to
         // join, and then leaving ASAP"). Staying propped makes peer's
         // client and the user's Mac Continuity UI render the call as
@@ -3427,7 +3352,7 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
         // maybe_fire_pending_ring is guaranteed to be a non-caller (filtered
         // at line 3153), so at least one user-side participant is active
         // before the bridge leaves. Callee's own join arrives over the
-        // wire when they answer and is processed by upstream handle()
+        // wire when they answer and is processed by rustpush's handle()
         // independently.
         let mut state = ft.state.write().await;
         if let Some(session) = state.sessions.get_mut(guid) {
@@ -3456,16 +3381,16 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
 // doesn't trip this because local CallKit registers the initiating device
 // as an active-call device; the bridge can't do that.
 //
-// Fix: mirror upstream's pattern at facetime.rs:708-725, where
+// Fix: mirror the pattern at facetime.rs:708-725, where
 // `prop_up_conv(ring=false)` sends RespondedElsewhere to own-devices when
 // the user picks up an incoming call. We emit the same wire after our
 // outgoing ring fires so the caller's MacBook/iPad stop ringing. The push
 // is scoped to the caller's own handle only — the target (callee) receives
 // no RespondedElsewhere, so their ring is unaffected.
 //
-// Reuses only public upstream APIs (IdentityManager::cache_keys /
+// Reuses only public rustpush APIs (IdentityManager::cache_keys /
 // send_message, KeyCache::get_participants_targets, ConversationMessage
-// proto). No upstream patching.
+// proto). No rustpush patching.
 async fn suppress_own_device_ring(ft: &rustpush::facetime::FTClient, guid: &str) {
     use prost::Message as _;
     use rustpush::facetime::facetimep::{ConversationMessage, ConversationMessageType};
@@ -3515,7 +3440,7 @@ async fn suppress_own_device_ring(ft: &rustpush::facetime::FTClient, guid: &str)
 
     // Suppress the user's OTHER Apple devices (e.g. a MacBook in the same
     // Apple ID) from ringing when the bridge places/answers a call — but never
-    // the bridge's OWN call-carrying leg. Upstream identifies the bridge's own
+    // the bridge's OWN call-carrying leg. rustpush identifies the bridge's own
     // participant by base64(conn.get_token()) (facetime.rs:730-748); excluding
     // that token here keeps the RespondedElsewhere off the live leg (which
     // would tear the call down) while still reaching genuine sibling devices.
@@ -3555,11 +3480,11 @@ async fn suppress_own_device_ring(ft: &rustpush::facetime::FTClient, guid: &str)
     }
 }
 
-// Wrapper-side replacement for upstream's prop_up_conv on the inbound
-// letmein path, with `video_enabled = Some(true)` instead of upstream's
+// Wrapper-side replacement for the prop_up_conv on the inbound
+// letmein path, with `video_enabled = Some(true)` instead of the
 // hardcoded `Some(false)` (facetime.rs:775).
 //
-// The bug: when the bridge approves an inbound LetMeIn, upstream's
+// The bug: when the bridge approves an inbound LetMeIn, the
 // respond_letmein detects the OneOnOne-mode condition and calls
 // prop_up_conv(session, false). That sends a cmd 207 announcing the
 // bridge participant with video=Some(true), video_enabled=Some(false).
@@ -3576,32 +3501,32 @@ async fn suppress_own_device_ring(ft: &rustpush::facetime::FTClient, guid: &str)
 // upgrades are fragile against that cache. The fix has to land in the
 // first prop peer sees.
 //
-// We can't change line 775 without modifying upstream rustpush source
+// We can't change line 775 without modifying rustpush source
 // (which the project's no-patch rule forbids). Instead: emit the same
 // cmd 207 ourselves with the corrected flag, then mark
-// `session.is_ringing_inaccurate = false` so upstream's respond_letmein
+// `session.is_ringing_inaccurate = false` so the respond_letmein
 // skips its own auto-prop.
 //
 // Implementation notes:
 //  - Builds the wire payload as a raw plist::Dictionary instead of going
-//    through upstream's `FTWireMessage` struct, because two of FTWireMessage's
+//    through the `FTWireMessage` struct, because two of FTWireMessage's
 //    fields are typed Option<ParticipantID> and the ParticipantID enum is
-//    private to the upstream facetime module. The kebab-case keys here mirror
+//    private to the facetime module. The kebab-case keys here mirror
 //    FTWireMessage's `#[serde(rename_all = "kebab-case")]` plus its explicit
 //    `#[serde(rename = ...)]` overrides for s / fanout-groupID-key /
 //    fanout-groupMembers-key. ParticipantID itself is `#[serde(untagged)]`
 //    so its wire form is just the integer — Value::Integer((u64).into()) is
 //    the same bytes the typed path produces.
 //  - sampleavcdata.bplist (participant-data-key) is included from
-//    third_party/ at compile time; upstream uses include_bytes! against the
+//    third_party/ at compile time; rustpush uses include_bytes! against the
 //    same file from inside its own module. CARGO_MANIFEST_DIR is stable
 //    (relative to pkg/rustpushgo/Cargo.toml).
 //  - On success: sets is_propped=true and is_ringing_inaccurate=false on the
-//    session, so upstream's respond_letmein needs_prop check fails and it
-//    skips. On failure: leaves session state untouched so upstream's
+//    session, so the respond_letmein needs_prop check fails and it
+//    skips. On failure: leaves session state untouched so the
 //    auto-prop runs as a fallback (audio-only call > broken call).
-// Hand-rolled cmd 207 prop with video_enabled=Some(true) instead of upstream's
-// hardcoded Some(false) (facetime.rs:775). Mirrors upstream prop_up_conv's
+// Hand-rolled cmd 207 prop with video_enabled=Some(true) instead of the
+// hardcoded Some(false) (facetime.rs:775). Mirrors prop_up_conv's
 // ring=false branch byte-for-byte except for the video_enabled flag and the
 // fact that we operate on &mut FTSession (caller's lock) so we can compose
 // with auto_approve_bridge_letmein's bridge+webview pre-stamp logic without
@@ -3627,7 +3552,7 @@ async fn prop_up_conv_inbound_video_on(
 
     const UNIX_TO_2001_MS: u64 = 978_307_200_000;
 
-    // handle_from_ids reimplemented from upstream facetime.rs:55-70 (private fn).
+    // handle_from_ids reimplemented from facetime.rs:55-70 (private fn).
     fn handle_from_ids(ids: &str) -> Handle {
         let mut handle = Handle::default();
         if let Some(rest) = ids.strip_prefix("mailto:") {
@@ -3684,7 +3609,7 @@ async fn prop_up_conv_inbound_video_on(
 
     let topic = "com.apple.private.alloy.facetime.multi";
 
-    // Mirrors upstream prop_up_conv lines 707-726: when picking up an
+    // Mirrors prop_up_conv lines 707-726: when picking up an
     // incoming call, fan a RespondedElsewhere out to our own handle so any
     // other devices registered to it stop ringing.
     if is_ringing_inaccurate {
@@ -3760,7 +3685,7 @@ async fn prop_up_conv_inbound_video_on(
         .await
         .get_participants_targets(topic, &handle, &member_handles);
 
-    // Inner ConversationMessage: no Invitation here (upstream's `ring=false`
+    // Inner ConversationMessage: no Invitation here (the `ring=false`
     // branch also skips Invitation; this is the post-letmein prop).
     let mut inner_message = ConversationMessage::default();
     inner_message.link = link;
@@ -3810,7 +3735,7 @@ async fn prop_up_conv_inbound_video_on(
     update_context.share_play_protocol_version = 4;
 
     // Build the cmd 207 wire payload as a raw plist Dictionary. Field names
-    // match upstream FTWireMessage: kebab-case for everything except the
+    // match FTWireMessage: kebab-case for everything except the
     // explicit serde renames.
     let is_initiator = true;
     let is_u_plus_one = false;
@@ -3874,7 +3799,7 @@ async fn prop_up_conv_inbound_video_on(
         Value::Dictionary(uri_to_pid_dict),
     );
 
-    // Apple's FT cmd 207 wire is a binary plist (matches upstream's
+    // Apple's FT cmd 207 wire is a binary plist (matches the
     // plist_to_bin at facetime.rs:805). util::plist_to_buf writes XML —
     // peer iOS silently drops it, classification falls back to audio.
     let mut wire_payload: Vec<u8> = Vec::new();
@@ -3906,7 +3831,7 @@ async fn prop_up_conv_inbound_video_on(
         .await?;
 
     // Send succeeded — mark session as propped and clear
-    // is_ringing_inaccurate so upstream's respond_letmein needs_prop check
+    // is_ringing_inaccurate so the respond_letmein needs_prop check
     // fails and it skips its own video_enabled=false prop. Caller already
     // holds a write lock on facetime.state; just mutate session in place.
     session.is_propped = true;
@@ -3921,27 +3846,27 @@ async fn prop_up_conv_inbound_video_on(
 
 // Overlay around FTClient::handle that tolerates Apple sending cmd 207/209
 // wire messages with `ConversationParticipantDidJoinContext.message = None`.
-// Upstream's handler at facetime.rs:1272/1344 hard-requires that field and
+// The handler at facetime.rs:1272/1344 hard-requires that field and
 // returns PushError::BadMsg when it's missing, which means the bridge never
 // records the joiner in session.participants. When wife answers an
 // outbound call (or when a link-tap joiner completes), her device's
 // server-originated 207 trips this path and the session state diverges
 // from Apple's — symptom is "this call is not available" on the callee.
 //
-// Strategy: always try upstream first so successful paths stay on the
-// reference implementation. Only on BadMsg do we re-decode the wire
-// message locally (using upstream's pub types: FTWireMessage +
+// Strategy: always try rustpush's handler first so successful paths stay on the
+// standard path. Only on BadMsg do we re-decode the wire
+// message locally (using rustpush's pub types: FTWireMessage +
 // facetimep::ConversationParticipantDidJoinContext) and register the
-// joiner ourselves. No upstream source changes — see feedback_no_patch_rustpush.
+// joiner ourselves. No rustpush source changes — see feedback_no_patch_rustpush.
 async fn ft_handle_with_join_recovery(
     ft: &rustpush::facetime::FTClient,
     msg: rustpush::APSMessage,
 ) -> Result<Option<rustpush::facetime::FTMessage>, rustpush::PushError> {
     // Locally-mirrored wire-message shape. FTWireMessage's fields are
-    // private upstream, so we can't deserialize into it directly — but the
-    // plist schema is stable (same serde rename attrs as upstream), so a
+    // private to rustpush, so we can't deserialize into it directly — but the
+    // plist schema is stable (same serde rename attrs as rustpush), so a
     // parallel struct here gives us the fields we need without touching
-    // upstream source.
+    // rustpush source.
     #[derive(serde::Deserialize, Debug)]
     #[serde(crate = "serde", rename_all = "kebab-case")]
     struct LocalFTWire {
@@ -3968,7 +3893,7 @@ async fn ft_handle_with_join_recovery(
         }
     }
 
-    // Try upstream first.
+    // Try rustpush's handler first.
     let upstream_result = ft.handle(msg.clone()).await;
     if !matches!(&upstream_result, Err(rustpush::PushError::BadMsg)) {
         return upstream_result;
@@ -4012,8 +3937,8 @@ async fn ft_handle_with_join_recovery(
     };
 
     // Apply minimal state mutation: session lookup/creation + joiner
-    // registration. We intentionally skip session.unpack_members (the
-    // upstream helper is private) — member-list drift is cosmetic; the
+    // registration. We intentionally skip session.unpack_members (that
+    // helper is private) — member-list drift is cosmetic; the
     // load-bearing piece is session.participants so Apple-side state
     // lines up when Apple retries delivery or the callee's device
     // queries participant tokens.
@@ -4042,7 +3967,7 @@ async fn ft_handle_with_join_recovery(
         );
 
         if session.is_propped && sender.starts_with("temp:") {
-            // Matches upstream's behavior at facetime.rs:1315 — once someone
+            // Matches the behavior at facetime.rs:1315 — once someone
             // has joined via link tap, the call is live and the propped-up
             // invitation can retire.
             let _ = ft.unprop_conv(session).await;
@@ -4091,7 +4016,7 @@ async fn auto_approve_bridge_letmein(
     request: &rustpush::facetime::LetMeInRequest,
 ) -> Result<(), rustpush::PushError> {
     // Only auto-approve for links owned by this bridge. We now use the
-    // OpenBubbles-style rotating usage slots ("next" / "current" /
+    // rustpush-style rotating usage slots ("next" / "current" /
     // "current-old" for outbound; "nextincomingcall" / "incomingcall" /
     // "incomingcall-old" for inbound). Session-specific links (from
     // get_session_link) have usage=None but session_link=Some. All are
@@ -4149,7 +4074,7 @@ async fn auto_approve_bridge_letmein(
         // builds the Matrix-side "Answer" link. That pins session_link →
         // inbound session, which makes `linked_group` match on pure
         // inbound calls. `session.mode` is the authoritative discriminator:
-        // upstream sets mode=Incoming on inbound Invitation wire handling
+        // rustpush sets mode=Incoming on inbound Invitation wire handling
         // (facetime.rs:1236) and mode=Outgoing when the bridge creates
         // the session (facetime.rs:607).
         let candidate_group = linked_group
@@ -4186,7 +4111,7 @@ async fn auto_approve_bridge_letmein(
     } else {
         let group = uuid::Uuid::new_v4().to_string().to_uppercase();
         // Cold-start fallback: the tap request doesn't map to any known
-        // session via linked/member/ringing. Call upstream directly — the
+        // session via linked/member/ringing. Call rustpush's handler directly — the
         // strip-own-devices wrapper caused the callee not to ring (see
         // WrappedFaceTimeClient::create_session for the full writeup).
         facetime
@@ -4208,7 +4133,7 @@ async fn auto_approve_bridge_letmein(
     // BEFORE respond_letmein runs. Without this, respond_letmein's needs_prop
     // branch (facetime.rs:1078) gates on `is_ringing_inaccurate && active_count==1`
     // — true on inbound when only the peer is active — so it runs its own
-    // prop_up_conv. Upstream's prop_up_conv leaves our own .active=None
+    // prop_up_conv. The prop_up_conv leaves our own .active=None
     // locally (facetime.rs:820), then the immediate add_members(webview)
     // fans cmd 209 with active_participants=[peer.active] only. By
     // pre-ensuring bridge is propped + stamped active here, needs_prop flips
@@ -4278,7 +4203,7 @@ async fn auto_approve_bridge_letmein(
                 let prop_outcome = async {
                     facetime.ensure_allocations(session, &[]).await?;
                     // Hand-rolled prop with video_enabled=Some(true) instead of
-                    // upstream's hardcoded Some(false). User's empirical recall:
+                    // the hardcoded Some(false). User's empirical recall:
                     // this manual construction was what made inbound classify
                     // as Video on peer's end. Restored from 0f0cd0f3 + 7c41baf2
                     // (XML→binary plist fix), this time with the active-stamping
@@ -4350,7 +4275,7 @@ async fn auto_approve_bridge_letmein(
                     inbound_session,
                 );
                 suppress_own_device_ring(facetime, &approved_group).await;
-                // Match OpenBubbles' answerFtRequest
+                // Match the answerFtRequest
                 // (rustpush_service.dart:3347): approve the letmein and
                 // return. No unprop_conv, no RemoveMember. Previous
                 // attempts to strip the bridge post-letmein all regressed
@@ -4405,7 +4330,7 @@ async fn facetime_event_to_wrapped(
         .sessions
         .get(&guid)
         .map(|session| {
-            // Mirror OpenBubbles' temp-pseud filter
+            // Mirror the temp-pseud filter
             // (intents_service.dart:68): the webview joins under a fresh
             // temp:UUID generated client-side by Apple's main.js. Surfacing
             // those to Matrix creates a ghost-per-call in the user's room.
@@ -4855,7 +4780,7 @@ pub trait StatusCallback: Send + Sync {
     /// Called once per reshare with the `from` handle of the peer device that
     /// sent it. Peer iOS fans reshares to every alias of our account (tel: plus
     /// each mailto:) with the SAME channel id but a DIFFERENT sender handle.
-    /// Upstream state keys by channel, so every reshare overwrites the previous
+    /// The state keys by channel, so every reshare overwrites the previous
     /// sender — only the last one survives in `state.keys`. Without this hook
     /// the Go side only learns ONE alias per peer and cannot resolve presence
     /// updates that arrive on any of the others. Stamping each sender into the
@@ -4887,7 +4812,7 @@ pub trait StatusCallback: Send + Sync {
 pub fn init_logger() {
     if std::env::var("RUST_LOG").is_err() {
         // Default log filter: silence the entire `rustpush` crate at WARN
-        // (upstream OpenBubbles has ~80+ info! sites across mmcs, cloudkit,
+        // (rustpush has ~80+ info! sites across mmcs, cloudkit,
         // keychain, cloud_messages, pcs, aps, util, statuskit, findmy, and
         // more — vastly more chatty than master's vendored tree). Keep our
         // own `rustpushgo` wrapper at INFO so Ford recovery messages,
@@ -4909,7 +4834,7 @@ pub fn init_logger() {
     }
     let _ = pretty_env_logger::try_init();
 
-    // Install a panic hook that silences upstream's `.unwrap()` /
+    // Install a panic hook that silences rustpush's `.unwrap()` /
     // `.expect()` panics inside the CloudKit download path. These panics
     // are intentional — the wrapper's Ford dedup recovery loops wrap
     // each get_assets / download_attachment call in catch_unwind and
@@ -4920,7 +4845,7 @@ pub fn init_logger() {
     //   called `Result::unwrap()` on an `Err` value
     //   thread '<unnamed>' panicked at cloudkit.rs:2075
     //   No bundled asset!
-    // This hook silently drops panics from upstream's MMCS + CloudKit
+    // This hook silently drops panics from rustpush's MMCS + CloudKit
     // download code paths (all caught by the wrapper) and falls through
     // to the default hook for everything else — real panics from other
     // modules still surface normally.
@@ -4948,7 +4873,7 @@ pub fn init_logger() {
     // This must be called before any rustpush operations (APNs connect, login, etc.).
     //
     // The keystore lives alongside session.json in the XDG data directory
-    // (~/.local/share/mautrix-imessage/) so that all session state is in one
+    // (~/.local/share/corten-matrix/) so that all session state is in one
     // place and easy to migrate between machines.
     let xdg_dir = resolve_xdg_data_dir();
     let state_path = format!("{}/keystore.plist", xdg_dir);
@@ -4996,17 +4921,17 @@ pub fn init_logger() {
     });
 }
 
-/// Resolve the XDG data directory for mautrix-imessage session state.
+/// Resolve the XDG data directory for corten-matrix session state.
 /// Uses $XDG_DATA_HOME if set, otherwise ~/.local/share.
-/// Returns the full path: <base>/mautrix-imessage
+/// Returns the full path: <base>/corten-matrix
 fn resolve_xdg_data_dir() -> String {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         if !xdg.is_empty() {
-            return format!("{}/mautrix-imessage", xdg);
+            return format!("{}/corten-matrix", xdg);
         }
     }
     if let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
-        return format!("{}/.local/share/mautrix-imessage", home);
+        return format!("{}/.local/share/corten-matrix", home);
     }
     // Last resort — fall back to old relative path
     warn!("Could not determine HOME or XDG_DATA_HOME, using local state directory");
@@ -5077,9 +5002,6 @@ pub fn create_local_macos_config() -> Result<Arc<WrappedOSConfig>, WrappedError>
             .into_macos_config();
         Ok(Arc::new(WrappedOSConfig {
             config: Arc::new(config),
-            has_nac_relay: false,
-            relay_url: None,
-            relay_token: None,
         }))
     }
     #[cfg(not(target_os = "macos"))]
@@ -5102,9 +5024,6 @@ pub fn create_local_macos_config_with_device_id(device_id: String) -> Result<Arc
             .into_macos_config();
         Ok(Arc::new(WrappedOSConfig {
             config: Arc::new(config),
-            has_nac_relay: false,
-            relay_url: None,
-            relay_token: None,
         }))
     }
     #[cfg(not(target_os = "macos"))]
@@ -5118,11 +5037,13 @@ pub fn create_local_macos_config_with_device_id(device_id: String) -> Result<Arc
 /// Create a cross-platform config from a base64-encoded JSON hardware key.
 ///
 /// The hardware key is a JSON-serialized `HardwareConfig` extracted once from
-/// a real Mac (e.g., via copper's QR code tool). This config uses the
-/// open-absinthe NAC emulator to generate fresh validation data on any platform.
+/// a real Mac (e.g., via copper's QR code tool). With the default
+/// `cleanroom-registration` feature this config uses open-absinthe's pure-Rust
+/// native-nac-rust path to generate fresh validation data on any platform.
 ///
 /// On macOS this is not needed (use `create_local_macos_config` instead).
-/// Building with the `hardware-key` feature links open-absinthe + unicorn.
+/// Building Linux through the Makefile enables this `hardware-key` API while
+/// keeping the clean-room NAC default active.
 #[uniffi::export]
 pub fn create_config_from_hardware_key(base64_key: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
     _create_config_from_hardware_key_inner(base64_key, None)
@@ -5135,18 +5056,75 @@ pub fn create_config_from_hardware_key_with_device_id(base64_key: String, device
     _create_config_from_hardware_key_inner(base64_key, Some(device_id))
 }
 
+/// Regenerate a HardwareConfig into a stable per-install PHANTOM Mac: keep the
+/// non-unique profile (model / board-id / OS build), deterministically randomize
+/// every unique identifier (serial, MLB, ROM, UUIDs, MAC NIC) from `seed_uuid`,
+/// set platform_uuid = seed, and clear the `_enc` fields for re-derivation from
+/// the new plaintext. Same seed -> same phantom across restarts. This is what
+/// keeps the operator's real Mac serial/MLB/UUID from ever reaching Apple.
+#[cfg(feature = "hardware-key")]
+fn generalize_hw_from_seed(
+    mut hw: rustpush::macos::HardwareConfig,
+    seed_uuid: &str,
+) -> rustpush::macos::HardwareConfig {
+    use rand::{Rng, SeedableRng};
+    use sha2::{Digest, Sha256};
+
+    let fin = {
+        let mut h = Sha256::new();
+        h.update(b"cleanroom/phantom-mac/v1");
+        h.update(seed_uuid.as_bytes());
+        h.finalize()
+    };
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&fin);
+    let mut rng = rand::rngs::StdRng::from_seed(seed);
+
+    // Apple serial/MLB charset: uppercase alphanumeric, no ambiguous I/O.
+    fn rstr(rng: &mut rand::rngs::StdRng, len: usize) -> String {
+        const CS: &[u8] = b"0123456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+        (0..len).map(|_| CS[rng.gen_range(0..CS.len())] as char).collect()
+    }
+    fn ruuid(rng: &mut rand::rngs::StdRng) -> String {
+        let mut b = [0u8; 16];
+        rng.fill(&mut b[..]);
+        format!(
+            "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+        )
+    }
+
+    let serial_len = if hw.platform_serial_number.is_empty() { 12 } else { hw.platform_serial_number.len() };
+    let mlb_len = if hw.mlb.is_empty() { 17 } else { hw.mlb.len() };
+
+    hw.platform_serial_number = rstr(&mut rng, serial_len);
+    hw.mlb = rstr(&mut rng, mlb_len);
+    hw.platform_uuid = seed_uuid.to_uppercase();
+    hw.root_disk_uuid = ruuid(&mut rng);
+    let mut rom = [0u8; 6];
+    rng.fill(&mut rom[..]);
+    hw.rom = rom.to_vec();
+    rng.fill(&mut hw.io_mac_address[3..6]); // keep Apple OUI, randomize NIC bytes
+
+    hw.platform_serial_number_enc.clear();
+    hw.platform_uuid_enc.clear();
+    hw.root_disk_uuid_enc.clear();
+    hw.rom_enc.clear();
+    hw.mlb_enc.clear();
+    hw
+}
+
 #[cfg(feature = "hardware-key")]
 fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<String>) -> Result<Arc<WrappedOSConfig>, WrappedError> {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use rustpush::macos::{MacOSConfig, HardwareConfig};
     use serde::Deserialize;
 
-    // Local wire-compatible struct: upstream MacOSConfig only has
+    // Local wire-compatible struct: MacOSConfig only has
     // inner/version/protocol_version/device_id/icloud_ua/aoskit_version/udid.
-    // Our hardware-key JSON contract (shipped to existing users) ALSO carries
-    // nac_relay_url/relay_token/relay_cert_fp for the Apple Silicon relay
-    // path. Parsing into upstream MacOSConfig would drop the relay fields,
-    // so we parse into a local struct that holds everything and then split.
+    // We parse the hardware-key JSON into a local struct that holds everything
+    // and then split. The clean-room native-nac-rust path produces validation
+    // data from these fields on every platform — there is no relay.
     #[derive(Deserialize)]
     struct FullHardwareKey {
         #[serde(default)]
@@ -5163,27 +5141,24 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
         aoskit_version: Option<String>,
         #[serde(default)]
         udid: Option<String>,
-        // NAC relay fields (Apple Silicon hw keys that can't be driven by
-        // the unicorn x86-64 emulator). When set, these are stashed into
-        // wrapper-level static state via register_nac_relay() for the
-        // open-absinthe ValidationCtx Relay variant to consume.
-        #[serde(default)]
-        nac_relay_url: Option<String>,
-        #[serde(default)]
-        relay_token: Option<String>,
-        #[serde(default)]
-        relay_cert_fp: Option<String>,
     }
 
-    // Strip whitespace/newlines that chat clients may insert when pasting
-    let clean_key: String = base64_key.chars().filter(|c| !c.is_whitespace()).collect();
+    // Strip whitespace/newlines AND base64 padding that chat clients and copy-paste
+    // routinely insert or drop, then re-pad to a multiple of 4. A pasted key that
+    // lost its trailing '=' now decodes instead of failing with "Invalid padding".
+    let mut clean_key: String = base64_key
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '=')
+        .collect();
+    while clean_key.len() % 4 != 0 {
+        clean_key.push('=');
+    }
     let json_bytes = STANDARD.decode(&clean_key)
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid base64: {}", e) })?;
 
-    // Try parsing as FullHardwareKey first (extract-key tool output, may be
-    // the full MacOSConfig-shaped blob with relay fields). Fall back to
-    // bare HardwareConfig for legacy keys that are just the hw blob.
-    let (hw, version, protocol_version, icloud_ua, aoskit_version, nac_relay_url, relay_token, relay_cert_fp) =
+    // Try parsing as FullHardwareKey first (extract-key tool output). Fall
+    // back to bare HardwareConfig for legacy keys that are just the hw blob.
+    let (hw, version, protocol_version, icloud_ua, aoskit_version) =
         if let Ok(full) = serde_json::from_slice::<FullHardwareKey>(&json_bytes) {
             if let Some(hw) = full.inner {
                 let version = full.version
@@ -5206,16 +5181,10 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
                     protocol_version,
                     icloud_ua,
                     aoskit_version,
-                    full.nac_relay_url,
-                    full.relay_token,
-                    full.relay_cert_fp,
                 )
             } else {
                 // JSON parsed as FullHardwareKey but has no `inner` field —
-                // retry as bare HardwareConfig.  Preserve any relay fields that
-                // were already parsed into `full` — dropping them here would
-                // silently skip register_nac_relay() for keys that carry relay
-                // info at the top level without a nested `inner` object.
+                // retry as bare HardwareConfig.
                 let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
                     .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
                 let version = full.version
@@ -5236,9 +5205,6 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
                     protocol_version,
                     icloud_ua,
                     aoskit_version,
-                    full.nac_relay_url,
-                    full.relay_token,
-                    full.relay_cert_fp,
                 )
             }
         } else {
@@ -5250,30 +5216,33 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
                 1660,
                 "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/22.5.0".to_string(),
                 "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
-                None,
-                None,
-                None,
             )
         };
 
-    // Always use the real hardware UUID from the extracted key so the bridge
-    // shows up as the original Mac rather than a new phantom device.
-    // Ignore any persisted device ID — it may be a stale random UUID.
-    let hw_uuid = hw.platform_uuid.to_uppercase();
-    if let Some(ref old) = device_id {
-        if old != &hw_uuid {
-            log::warn!(
-                "Ignoring persisted device ID {} — using hardware UUID {} from extracted key",
-                old, hw_uuid
-            );
-        }
+    // Use the extracted key's REAL hardware identity verbatim — exactly like
+    // a native Mac. Apple's GSA validates the device identity at login `init`; a
+    // randomized/synthetic serial is NOT a recognized, activated device, so GSA
+    // rejects it with the generic -22421 ("native" / "Try again"). The phantom was
+    // ALWAYS wrong — a fabricated serial cannot pass GrandSlam. The extracted key is
+    // a real, already-activated Mac, so GSA accepts it (this is exactly why the same
+    // account logs in fine on a native Mac, which sends the real extracted identity).
+    // Multi-tenant per-user identity is a SEPARATE problem: it needs real per-user
+    // extracted keys, never randomization (Apple rejects synthetic devices outright).
+    let mut hw = hw;
+
+    // Apple Silicon keys ship with empty `_enc` fields; re-derive them from the
+    // plaintext on x86_64-linux. For a complete (Intel) key this is a no-op.
+    if let Err(e) = open_absinthe::nac::enrich_missing_enc_fields(&mut hw) {
+        log::warn!("Could not enrich missing _enc fields: {}", e);
     }
-    let device_id = hw_uuid;
 
-    let _ = relay_cert_fp;
+    // device_id / udid announced at GSA login == the extracted key's real device
+    // UUID (stable across restarts — it's the key's own UUID, just like a native Mac).
+    let _ = &device_id;
+    let device_id = hw.platform_uuid.to_uppercase();
 
-    // Build upstream's MacOSConfig with only the fields it has — relay
-    // fields live in wrapper state, not on the OSConfig.
+    // Build the MacOSConfig. The native-nac-rust path in
+    // open-absinthe produces validation data from these fields on any platform.
     let config = Arc::new(MacOSConfig {
         inner: hw,
         version,
@@ -5286,29 +5255,10 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
         udid: Some(device_id),
     });
 
-    // For Apple Silicon keys with a relay, wrap in RelayOSConfig so
-    // generate_validation_data() calls the relay directly — same as master.
-    let os_config: Arc<dyn OSConfig> = if let Some(url) = nac_relay_url {
-        let trimmed = url.trim_end_matches('/');
-        let relay_url = if trimmed.ends_with("/validation-data") {
-            trimmed.to_string()
-        } else {
-            format!("{}/validation-data", trimmed)
-        };
-        Arc::new(RelayOSConfig {
-            inner: config,
-            relay_url,
-            relay_token: relay_token.clone(),
-        })
-    } else {
-        config
-    };
-
+    // Coerce the concrete MacOSConfig into the trait object the wrapper holds.
+    let config: Arc<dyn OSConfig> = config;
     Ok(Arc::new(WrappedOSConfig {
-        config: os_config,
-        has_nac_relay: relay_token.is_some(),
-        relay_url: None,
-        relay_token: None,
+        config,
     }))
 }
 
@@ -5571,6 +5521,78 @@ pub struct LoginSession {
     username: String,
     password_hash: Vec<u8>,
     needs_2fa: bool,
+    // SMS (secondaryAuth) 2FA: the verify body returned by send_sms_2fa_to_devices,
+    // consumed by submit_2fa via verify_sms_2fa. None for trusted-device 2FA.
+    sms_verify_body: std::sync::Mutex<Option<icloud_auth::VerifyBody>>,
+}
+
+/// Run a throwaway GSA `init` purely to capture the native-sync SIM
+/// (`X-Apple-I-MD-DATA`) that the `login_email_pass` call swallows into a bare
+/// `-22421` error. The machine-sync rejection precedes SRP validation, so a random
+/// `A2k` suffices. Returns the base64 SIM string on success.
+#[allow(dead_code)] // retained for diagnostics; phantom-Mac fix removed the -22421 retry that called it
+async fn gsa_init_capture_sim(
+    account: &AppleAccount<BridgeDefaultAnisetteProvider>,
+    username: &str,
+) -> Option<String> {
+    use plist::Value;
+    let anisette = account.get_anisette().await.ok()?;
+    let request_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+    let cpd = anisette.get_cpd_data(&request_id);
+    let a2k: Vec<u8> = (0..256).map(|_| rand::random::<u8>()).collect();
+
+    let mut request = plist::Dictionary::new();
+    request.insert("A2k".into(), Value::Data(a2k));
+    request.insert("cpd".into(), Value::Dictionary(cpd));
+    request.insert("o".into(), Value::String("init".into()));
+    request.insert("ps".into(), Value::Array(vec![
+        Value::String("s2k".into()),
+        Value::String("s2k_fo".into()),
+    ]));
+    request.insert("u".into(), Value::String(username.to_string()));
+    let mut header = plist::Dictionary::new();
+    header.insert("Version".into(), Value::String("1.0.1".into()));
+    let mut top = plist::Dictionary::new();
+    top.insert("Header".into(), Value::Dictionary(header));
+    top.insert("Request".into(), Value::Dictionary(request));
+
+    let mut buf: Vec<u8> = Vec::new();
+    plist::to_writer_xml(&mut buf, &Value::Dictionary(top)).ok()?;
+
+    let mut hmap = reqwest::header::HeaderMap::new();
+    hmap.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("text/x-xml-plist"),
+    );
+    hmap.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static("*/*"),
+    );
+    for (k, v) in anisette.get_gsservice_headers() {
+        if let (Ok(name), Ok(val)) = (
+            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+            reqwest::header::HeaderValue::from_str(&v),
+        ) {
+            hmap.insert(name, val);
+        }
+    }
+
+    let text = reqwest::Client::new()
+        .post("https://gsa.apple.com/grandslam/GsService2")
+        .headers(hmap)
+        .body(buf)
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+
+    let parsed = plist::Value::from_reader(std::io::Cursor::new(text.into_bytes())).ok()?;
+    let status = parsed.as_dictionary()?.get("Status")?.as_dictionary()?;
+    let sim = status.get("X-Apple-I-MD-DATA")?.as_string()?.to_string();
+    info!("login_start: captured native-sync SIM via self-init (len={})", sim.len());
+    Some(sim)
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -5586,13 +5608,24 @@ pub async fn login_start(
 
     let user_trimmed = apple_id.trim().to_string();
     // Apple's GSA SRP expects the password to be pre-hashed with SHA-256.
-    // See upstream test.rs: sha256(password.as_bytes())
+    // See test.rs: sha256(password.as_bytes())
     let pw_bytes = {
         use sha2::{Sha256, Digest};
         let mut hasher = Sha256::new();
         hasher.update(password.trim().as_bytes());
         hasher.finalize().to_vec()
     };
+    {
+        // Diagnostic: confirm the password reaching us is the raw user password and
+        // not HTML/markdown-escaped or truncated by the matrix input layer. Compare
+        // pw_sha256 to `printf %s 'yourpassword' | shasum -a 256` to verify.
+        let tp = password.trim();
+        let html_escaped = tp.contains("&amp;") || tp.contains("&lt;") || tp.contains("&gt;")
+            || tp.contains("&quot;") || tp.contains("&#") || tp.contains("&apos;");
+        let pw_hex: String = pw_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        info!("LOGIN-DEBUG user={:?} user_len={} pw_raw_bytes={} pw_trim_chars={} pw_trim_bytes={} pw_html_escaped={} pw_sha256={}",
+            user_trimmed, user_trimmed.len(), password.len(), tp.chars().count(), tp.len(), html_escaped, pw_hex);
+    }
 
     let client_info = os_config.get_gsa_config(&*conn.state.read().await, false);
     info!("login_start: mme_client_info={}", client_info.mme_client_info);
@@ -5600,21 +5633,33 @@ pub async fn login_start(
     info!("login_start: akd_user_agent={}", client_info.akd_user_agent);
     info!("login_start: hardware_headers={:?}", client_info.hardware_headers);
     info!("login_start: push_token={:?}", client_info.push_token);
-    let anisette_state_path = PathBuf::from_str("state/anisette").unwrap();
+    // Persist the provisioned ADI machine in the absolute XDG data dir (same place
+    // every other subsystem uses), NOT a cwd-relative path. With the relative
+    // "state/anisette" the machine was re-provisioned on every login (state.plist
+    // never found → exists=false → fresh machine + new X-Mme-Device-Id each run),
+    // and Apple rejects the provision-then-complete churn at GSA `complete` (-22406).
+    // A real device provisions once and persists; this matches that.
+    let anisette_state_path = PathBuf::from(subsystem_state_path("anisette"));
     let state_plist = anisette_state_path.join("state.plist");
     info!("login_start: anisette state path={:?} exists={}", state_plist, state_plist.exists());
 
-    let anisette = bridge_default_provider(client_info.clone(), anisette_state_path);
+    let anisette = bridge_default_provider(client_info.clone(), anisette_state_path, os_config.get_device_uuid());
 
     let mut account = AppleAccount::new_with_anisette(client_info, anisette)
         .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create account: {}", e) })?;
 
     info!("login_start: calling login_email_pass for {}", user_trimmed);
+    // The clean-room now registers as a phantom Mac (synthetic identity), so the
+    // GSA init no longer presents a clone of a live Mac and the -22421 native-sync
+    // challenge should not fire. The old capture-SIM + anisette-sync + retry dance
+    // (which only ever produced -29003 and extra GSA requests that fed Apple's
+    // rate-limiter) is removed — a single login attempt.
     let result = account.login_email_pass(&user_trimmed, &pw_bytes).await
         .map_err(|e| WrappedError::GenericError { msg: format!("Login failed: {}", e) })?;
     info!("login_start: login_email_pass returned ok");
 
     info!("login_email_pass returned: {:?}", result);
+    let mut sms_verify_body: Option<icloud_auth::VerifyBody> = None;
     let needs_2fa = match result {
         icloud_auth::LoginState::LoggedIn => {
             info!("Login completed without 2FA");
@@ -5624,16 +5669,32 @@ pub async fn login_start(
             info!("2FA required (Needs2FAVerification — push already sent by Apple)");
             true
         }
-        icloud_auth::LoginState::NeedsDevice2FA | icloud_auth::LoginState::NeedsSMS2FA => {
-            info!("2FA required — sending trusted device push");
+        icloud_auth::LoginState::NeedsDevice2FA => {
+            info!("Trusted-device 2FA — sending device push (verified via verify_2fa)");
             match account.send_2fa_to_devices().await {
                 Ok(_) => info!("send_2fa_to_devices succeeded"),
                 Err(e) => error!("send_2fa_to_devices failed: {}", e),
             }
             true
         }
-        icloud_auth::LoginState::NeedsSMS2FAVerification(_) => {
+        icloud_auth::LoginState::NeedsSMS2FA => {
+            // secondaryAuth account: the trusted-device verify (verify_2fa) accepts the
+            // code but does NOT satisfy secondaryAuth (re-login loops). We must request an
+            // SMS and verify via verify_sms_2fa with the returned body.
+            info!("SMS (secondaryAuth) 2FA — requesting code to trusted phone 1");
+            match account.send_sms_2fa_to_devices(1).await {
+                Ok(icloud_auth::LoginState::NeedsSMS2FAVerification(body)) => {
+                    info!("SMS 2FA code sent; awaiting code");
+                    sms_verify_body = Some(body);
+                }
+                Ok(other) => error!("send_sms_2fa_to_devices: unexpected state {:?}", other),
+                Err(e) => error!("send_sms_2fa_to_devices failed: {}", e),
+            }
+            true
+        }
+        icloud_auth::LoginState::NeedsSMS2FAVerification(body) => {
             info!("2FA required (NeedsSMS2FAVerification — SMS already sent)");
+            sms_verify_body = Some(body);
             true
         }
         icloud_auth::LoginState::NeedsExtraStep(ref step) => {
@@ -5654,6 +5715,7 @@ pub async fn login_start(
         username: user_trimmed,
         password_hash: pw_bytes,
         needs_2fa,
+        sms_verify_body: std::sync::Mutex::new(sms_verify_body),
     }))
 }
 
@@ -5667,17 +5729,42 @@ impl LoginSession {
         let mut guard = self.account.lock().await;
         let account = guard.as_mut().ok_or(WrappedError::GenericError { msg: "No active session".to_string() })?;
 
-        info!("Verifying 2FA code via trusted device endpoint (verify_2fa)");
-        let result = account.verify_2fa(code).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("2FA verification failed: {}", e) })?;
+        // SMS (secondaryAuth) accounts must verify via verify_sms_2fa with the body
+        // captured at login_start; trusted-device accounts use verify_2fa.
+        let sms_body = self.sms_verify_body.lock().unwrap().take();
+        let result = if let Some(body) = sms_body {
+            info!("Verifying 2FA code via SMS securitycode endpoint (verify_sms_2fa)");
+            account.verify_sms_2fa(code, body).await
+                .map_err(|e| WrappedError::GenericError { msg: format!("2FA verification failed: {}", e) })?
+        } else {
+            info!("Verifying 2FA code via trusted device endpoint (verify_2fa)");
+            account.verify_2fa(code).await
+                .map_err(|e| WrappedError::GenericError { msg: format!("2FA verification failed: {}", e) })?
+        };
 
         info!("2FA verification returned: {:?}", result);
         info!("PET token available: {}", account.get_pet().is_some());
 
+        // verify_2fa returns NeedsLogin when Apple accepted the code (ec=0) but the
+        // /validate response carried no X-Apple-PE-Token header — the normal
+        // trusted-device flow. The PET is issued by RE-RUNNING the SRP login now that
+        // the device is 2FA-verified (icloud-auth's own login_with_anisette does this
+        // on NeedsLogin). The hand-rolled flow was mapping NeedsLogin -> Ok(false),
+        // surfacing as "2FA verification failed — invalid code" on a perfectly valid code.
         match result {
             icloud_auth::LoginState::LoggedIn => Ok(true),
             icloud_auth::LoginState::NeedsExtraStep(_) => {
                 Ok(account.get_pet().is_some())
+            }
+            icloud_auth::LoginState::NeedsLogin => {
+                info!("2FA code accepted; re-running login_email_pass to collect the PET");
+                let hashed = account.hashed_password.clone().ok_or(WrappedError::GenericError {
+                    msg: "No hashed password available for post-2FA re-login".to_string(),
+                })?;
+                let relogin = account.login_email_pass(&self.username, &hashed).await
+                    .map_err(|e| WrappedError::GenericError { msg: format!("Post-2FA re-login failed: {}", e) })?;
+                info!("Post-2FA re-login returned: {:?}; PET available: {}", relogin, account.get_pet().is_some());
+                Ok(matches!(relogin, icloud_auth::LoginState::LoggedIn) || account.get_pet().is_some())
             }
             _ => Ok(false),
         }
@@ -5796,7 +5883,7 @@ impl LoginSession {
                         "Existing registration missing required services or expired, must re-register with full 4-service bundle"
                     );
                     let mut users = vec![fresh_user];
-                    // Match OB-Android: single register() call with all four
+                    // Single register() call with all four
                     // services (MADRID, MULTIPLEX, FACETIME, VIDEO). Peer iOS
                     // gates unprompted StatusKit reshare on seeing a 4-service
                     // IDS identity.
@@ -5840,7 +5927,7 @@ impl LoginSession {
         let token_provider = TokenProvider::new(account_arc.clone(), os_config.clone());
 
         // Store the MobileMe delegate in the WrappedTokenProvider as opaque plist
-        // bytes. Upstream `MobileMeDelegateResponse` is not `Serialize`, so we
+        // bytes. The `MobileMeDelegateResponse` type is not `Serialize`, so we
         // manually build a `plist::Value` that matches its serde representation
         // (`{"tokens": {...}, "com.apple.mobileme": {...}}`). We can access the
         // public fields of `delegates.mobileme` via field syntax without naming
@@ -5889,13 +5976,13 @@ impl LoginSession {
 // ============================================================================
 
 /// Fetch an iMessage MMCS `AuthorizeGetResponse` body via the APNs auth
-/// dance, without invoking upstream's `MMCSFile::get_attachment` (which
+/// dance, without invoking the `MMCSFile::get_attachment` (which
 /// calls the panic-prone `get_mmcs`).
 ///
-/// This is the same protocol upstream rustpush uses at
-/// `third_party/rustpush-upstream/src/imessage/messages.rs` in
+/// This is the same protocol rustpush uses at
+/// `third_party/rustpush/src/imessage/messages.rs` in
 /// `MMCSFile::get_attachment` up through line 1381, inlined into the
-/// wrapper so we can stop at the point where upstream would hand off to
+/// wrapper so we can stop at the point where rustpush would hand off to
 /// `get_mmcs` and instead route the bytes through
 /// `manual_ford::manual_ford_download_asset`.
 ///
@@ -5938,7 +6025,7 @@ async fn fetch_imessage_mmcs_authorize_body(
         object: String,
     }
 
-    // User agents / client info strings — must exactly match upstream's
+    // User agents / client info strings — must exactly match rustpush's
     // `MMCSFile::get_attachment` construction so the MMCS server accepts
     // our auth request.
     let mme_client_info = conn
@@ -5947,7 +6034,7 @@ async fn fetch_imessage_mmcs_authorize_body(
     let mini_ua = conn.os_config.get_version_ua();
 
     // Strip the last `/{object}` segment from the URL to produce the
-    // MMCS domain — upstream does this to build the `mR` field.
+    // MMCS domain — rustpush does this to build the `mR` field.
     let domain = mmcs.url.replace(&format!("/{}", &mmcs.object), "");
 
     let msg_id: u32 = rand::thread_rng().gen();
@@ -5975,7 +6062,7 @@ async fn fetch_imessage_mmcs_authorize_body(
     // before the receiver is registered.
     let recv = conn.subscribe().await;
 
-    // Upstream's send_message now takes `impl Serialize` and handles plist
+    // The send_message now takes `impl Serialize` and handles plist
     // encoding internally (was: pre-serialized Vec<u8> + plist_to_bin at the
     // call site). The id parameter is also i32 now, not u32.
     conn.send_message("com.apple.madrid", request_download, Some(msg_id as i32))
@@ -5988,12 +6075,12 @@ async fn fetch_imessage_mmcs_authorize_body(
     // check the parsed payload fields directly and trust APNs routing
     // to only deliver com.apple.madrid messages on this subscription.
     let predicate = move |msg: rustpush::APSMessage| -> Option<Value> {
-        // Upstream APSPackedValue::Into<Value> maps each packed-attribute
+        // The APSPackedValue::Into<Value> maps each packed-attribute
         // kind to its corresponding plist::Value variant (aps.rs:31-42),
         // so MMCS auth responses with a Dict-encoded payload arrive as
         // Value::Dictionary, while Data-encoded payloads arrive as
         // Value::Data carrying raw plist bytes. Accept both — matches
-        // upstream's get_message helper, which doesn't constrain the
+        // the get_message helper, which doesn't constrain the
         // variant.
         let rustpush::APSMessage::Notification { payload, .. } = msg else { return None };
         let parsed = match payload {
@@ -6034,12 +6121,12 @@ async fn fetch_imessage_mmcs_authorize_body(
 /// Download any MMCS (non-inline) attachments from the message and convert them
 /// to inline data in the wrapped message, so the Go side can upload them to Matrix.
 ///
-/// This function reimplements upstream's `MMCSFile::get_attachment` at
+/// This function reimplements the `MMCSFile::get_attachment` at
 /// the wrapper layer so we can use our V1+V2-capable
-/// `manual_ford_download_asset` instead of upstream's panicking
+/// `manual_ford_download_asset` instead of rustpush's panicking
 /// `get_mmcs`. Master worked because Cameron's rustpush fork had the
 /// 94f7b8e Ford fix baked into `get_mmcs`; after the refactor's source
-/// swap to OpenBubbles upstream (which doesn't have the fix), calling
+/// swap to plain rustpush (which doesn't have the fix), calling
 /// `att.get_attachment` on V2-Ford or dedup'd records panics. Routing
 /// the bytes through the manual path gets us back to master's behavior
 /// without patching rustpush.
@@ -6082,7 +6169,7 @@ async fn download_mmcs_attachments(
 /// Download one MMCS attachment via the wrapper-level path, with bounded
 /// retries on transient failures.
 ///
-/// Upstream's `send_message` (aps.rs:1319) schedules a connection reload via
+/// The `send_message` (aps.rs:1319) schedules a connection reload via
 /// `do_reload()` whenever its 15-second ack wait times out (aps.rs:1349). The
 /// caller is expected to retry so the reloaded connection can serve the next
 /// attempt — not retrying is what made the first transient APNs blip fatal.
@@ -6123,7 +6210,7 @@ async fn download_one_mmcs_attachment(
                     attempt, MAX_ATTEMPTS, name, e
                 );
                 last_err = e;
-                // Backoff 500 ms, 1 s, 2 s — gives upstream's do_reload()
+                // Backoff 500 ms, 1 s, 2 s — gives the do_reload()
                 // time to re-establish the APS connection between tries.
                 let backoff_ms = 500u64 * (1u64 << (attempt - 1));
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
@@ -6139,12 +6226,12 @@ async fn download_one_mmcs_attachment(
 /// One attempt of the MMCS download pipeline: APNs auth handshake → manual
 /// V1+V2 Ford-capable chunk decode → iMessage outer AES-256-CTR unwrap.
 ///
-/// Equivalent to upstream's `MMCSFile::get_attachment` but bypasses the
+/// Equivalent to the `MMCSFile::get_attachment` but bypasses the
 /// panicking `get_mmcs` call at its tail.
 ///
 /// iMessage MMCS differs from CloudKit MMCS in one important way: the file
 /// bytes are additionally wrapped in an `IMessageContainer` layer (AES-256-CTR
-/// with `MMCSFile.key` and a zero nonce). Upstream handles this by passing a
+/// with `MMCSFile.key` and a zero nonce). rustpush handles this by passing a
 /// `WriteContainer` impl through to `get_mmcs` that decrypts during chunk
 /// writes. Since our manual path returns the assembled chunk plaintext without
 /// that hook, we apply the outer unwrap here as a post-processing step.
@@ -6172,9 +6259,9 @@ async fn download_one_mmcs_attachment_once(
     .await?;
 
     // Step 3: iMessage outer unwrap — AES-256-CTR(mmcs.key, zero_iv)
-    // over the full assembled plaintext. This mirrors what upstream's
+    // over the full assembled plaintext. This mirrors what the
     // `IMessageContainer` does on the write path during `get_mmcs`.
-    // Matches `third_party/rustpush-upstream/src/imessage/messages.rs`
+    // Matches `third_party/rustpush/src/imessage/messages.rs`
     // `IMessageContainer::new(&self.key, writer, true)` at line 1341.
     if mmcs.key.len() != 32 {
         return Err(format!(
@@ -6303,7 +6390,7 @@ impl WrappedFaceTimeClient {
     }
 
     pub async fn create_session(&self, group_id: String, handle: String, participants: Vec<String>) -> Result<(), WrappedError> {
-        // Call upstream directly. We previously wrapped this with a
+        // Call rustpush directly. We previously wrapped this with a
         // strip-own-from-session.members pattern to stop the wire ring from
         // fanning out to the owner's other Apple devices (Mac, iPad). The
         // motivation was tap-routing fragility: when the Mac auto-answered
@@ -6320,7 +6407,7 @@ impl WrappedFaceTimeClient {
         // Empirically the strip also correlated with the callee not ringing
         // (own was absent from update_context.members and fanout_groupmembers
         // in the Invitation wire, which we suspect Apple's FT routing
-        // rejected). Straight upstream sends a well-formed Invitation. Side
+        // rejected). Straight rustpush sends a well-formed Invitation. Side
         // effect: owner's devices ring too; caller dismisses on the device
         // they don't want. Future: suppress own-device ring via a follow-up
         // RespondedElsewhere once we've confirmed the callee ring is stable.
@@ -6709,7 +6796,7 @@ impl WrappedStatusKitClient {
     /// Holding a key is the correct criterion for both jobs, regardless of
     /// whether that channel has carried a status yet.
     ///
-    /// Since upstream's StatusKitSharedDevice::from is private, this reads the
+    /// Since the StatusKitSharedDevice::from is private, this reads the
     /// plist file directly.
     pub async fn get_known_handles(&self) -> Vec<String> {
         let state_path = subsystem_state_path("statuskit-state.plist");
@@ -6915,7 +7002,7 @@ pub async fn new_client(
     let _ = std::fs::create_dir_all("state");
 
     // FACETIME + VIDEO are in the bundle so the IdentityResource's `services`
-    // slice contains them. Without that, upstream's `get_main_service` (called
+    // slice contains them. Without that, the `get_main_service` (called
     // on every FT `cache_keys`) hits its `expect("Topic {topic} not found!")`
     // and panics out of the FFI. The earlier best-effort separate-register
     // workaround registered FT/Video in the IDSUser but didn't update
@@ -6923,7 +7010,7 @@ pub async fn new_client(
     //
     // Trade-off: `register()` is all-or-nothing, so an Apple non-zero status
     // for any service in this bundle fails the whole call. For status 6005
-    // upstream wraps that in `PushError::DoNotRetry`, and the ResourceManager
+    // rustpush wraps that in `PushError::DoNotRetry`, and the ResourceManager
     // transitions the shared IdentityResource to `Closed` — which would
     // permanently break iMessage send too. We accept this risk because Apple
     // has not been observed to 6005 FT/Video for this account.
@@ -7051,7 +7138,7 @@ pub async fn new_client(
                     // APNs inbound-liveness watchdog (backstop for silent
                     // receive-path stalls). A healthy APS connection delivers a
                     // frame through messages_cont at least every ~60s — at
-                    // minimum the keepalive Pong for upstream's 60s Ping. If we
+                    // minimum the keepalive Pong for rustpush's 60s Ping. If we
                     // see NOTHING for APNS_STALL_TIMEOUT, the receive path has
                     // silently wedged: e.g. a half-open courier socket where
                     // read_exact() blocks forever, and the keepalive's own
@@ -7328,7 +7415,7 @@ pub async fn new_client(
                 // called; otherwise falls through.
                 let sk_opt = sk_for_recv.read().await.clone();
                 if let Some(sk) = sk_opt {
-                    // Wrapper-only workaround for upstream silent-drop.
+                    // Wrapper-only workaround for the silent-drop.
                     // statuskit.rs:719 destructures payload as Value::Data and
                     // returns Ok(None) for keysharing-topic notifications whose
                     // payload arrived as Value::Dictionary — which is the typical
@@ -7342,12 +7429,12 @@ pub async fn new_client(
                     // (which accepts any Value variant via plist::from_value at
                     // identity_manager.rs:771), and construct a
                     // StatusKitSharedDevice via serde with a built Dictionary —
-                    // mirroring the construction at upstream statuskit.rs:776–781
+                    // mirroring the construction at statuskit.rs:776–781
                     // but routed through Deserialize so the private fields stay
                     // private. The device is inserted into the public
                     // sk.state.keys map and persisted via the same code path
-                    // upstream's update_state callback uses.
-                    // Normalize StatusKit payloads: upstream statuskit.rs:719
+                    // the update_state callback uses.
+                    // Normalize StatusKit payloads: statuskit.rs:719
                     // destructures with Value::Data, but aps.rs:880 greedily
                     // decodes plist bytes into Dictionary. The workaround below
                     // handles Dictionary payloads. Conversely, Data payloads
@@ -7356,7 +7443,7 @@ pub async fn new_client(
                     // both directions: decode Data→Dictionary so ALL StatusKit
                     // messages go through the workaround's Dictionary path.
                     // Normalize Data→Dictionary for the keysharing topic only:
-                    // the upstream silent-drop bug at statuskit.rs:719 is specific
+                    // the silent-drop bug at statuskit.rs:719 is specific
                     // to keysharing-payload destructuring. The other three StatusKit
                     // topics (presence.mode.status, presence.channel.management,
                     // status.personal) flow through sk.handle() natively and were
@@ -7412,7 +7499,7 @@ pub async fn new_client(
                                     diag_cmd_workaround.unwrap()
                                 );
                                 // Don't set workaround_consumed — let it fall
-                                // through to upstream handle() which also skips
+                                // through to rustpush's handle() which also skips
                                 // these via its own suppression path.
                             } else {
 
@@ -7443,7 +7530,7 @@ pub async fn new_client(
                                     // Log for future protocol analysis; do NOT fire
                                     // on_keys_received (would cause reciprocate-invite
                                     // storm on every noise packet). Return Ok(false)
-                                    // so upstream handle() still gets a chance.
+                                    // so rustpush's handle() still gets a chance.
                                     if recv.command == 97 {
                                         let raw_keys = if let plist::Value::Dictionary(ref d) = payload {
                                             d.keys().cloned().collect::<Vec<_>>().join(", ")
@@ -7563,7 +7650,7 @@ pub async fn new_client(
                                     // on_keys_received triggers the
                                     // resubscribe. Peer iOS fans reshares to
                                     // every handle alias on the same channel;
-                                    // upstream's HashMap only keeps the last
+                                    // the rustpush HashMap only keeps the last
                                     // `from`, so without this, presence
                                     // updates for overwritten aliases have
                                     // no portal mapping. Channel id is
@@ -7626,7 +7713,7 @@ pub async fn new_client(
                                     return Ok(false);
                                 };
 
-                                // Mirror upstream PrivateStatusMessage structs.
+                                // Mirror the rustpush PrivateStatusMessage structs.
                                 #[derive(serde::Deserialize, Debug)]
                                 struct PTag { #[serde(rename = "a")] bundle: String, #[serde(rename = "b")] id: Option<String> }
                                 #[derive(serde::Deserialize, Debug)]
@@ -7741,17 +7828,14 @@ pub async fn new_client(
                             continue;
                         }
                         Ok(Ok(None)) => {
-                            // A Notification on the PRESENCE topic (Shared Channels
-                            // path) that handle() couldn't turn into a StatusChanged is
-                            // a presence update we failed to decode — almost always a
-                            // peer who rotated their StatusKit channel key, leaving the
-                            // copy we pulled from CloudKit stale. Signal the Go side to
-                            // force a rate-limited CloudKit re-pull for the fresh key.
-                            // (The personal-status path uses IDS keys, not StatusKit
-                            // channel keys, so a re-pull can't help it — only
-                            // presence.mode.status is the stale-key signal. Over-firing
-                            // is bounded by the Go-side cooldown, so a benign undecoded
-                            // notification at worst costs one rate-limited pull.)
+                            // A Notification on the PRESENCE topic (presence.mode.status)
+                            // that handle() couldn't decode — almost always a peer who
+                            // rotated their StatusKit channel key, leaving our pulled copy
+                            // stale. Signal the Go side to force a rate-limited CloudKit
+                            // re-pull for the fresh key. (Personal-status uses IDS keys,
+                            // not channel keys, so a re-pull can't help it — only
+                            // presence.mode.status is the stale-key signal. Over-firing is
+                            // bounded by the Go-side cooldown.)
                             let presence_topic: [u8; 20] = openssl::sha::sha1("com.apple.icloud.presence.mode.status".as_bytes());
                             if msg_topic == Some(presence_topic) {
                                 let df_sender = if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
@@ -7781,9 +7865,9 @@ pub async fn new_client(
                                         // envelope so we can stamp this reshare's sender
                                         // into the Go-side cache. Peer iOS fans each
                                         // reshare to every alias of our account with the
-                                        // SAME channel id but DIFFERENT sP, and upstream
+                                        // SAME channel id but DIFFERENT sP, and rustpush
                                         // state.keys overwrites on each — without stamping
-                                        // here, the aliases processed by upstream handle()
+                                        // here, the aliases processed by rustpush's handle()
                                         // (not the Dictionary-payload workaround) get lost
                                         // the same way the workaround case used to, just
                                         // silently. Mirrors the workaround stamping at the
@@ -7841,7 +7925,7 @@ pub async fn new_client(
                                         // c=97  = unknown command on keysharing topic. Log all
                                         //         plist keys at WARN so we can see whether this is
                                         //         a real iOS keysharing message in a different format
-                                        //         than the OpenBubbles c=227. Other commands also logged.
+                                        //         than the expected c=227. Other commands also logged.
                                         let is_silent = cmd_byte.map(|c| c == 255).unwrap_or(false);
                                         let is_reinvite = cmd_byte.map(|c| c == 227).unwrap_or(false)
                                             && !keys_before.is_empty();
@@ -7898,12 +7982,12 @@ pub async fn new_client(
 
                 // Consume FaceTime APNs events to keep FT state live and
                 // surface incoming-call attempts to Go as synthetic notice
-                // triggers. ft_handle_with_join_recovery wraps upstream's
+                // triggers. ft_handle_with_join_recovery wraps the rustpush
                 // handle() and falls back to local decoding for cmd 207/209
                 // when Apple sends them without the context.message field —
                 // see the helper's docstring for why.
                 //
-                // Retry on SendTimedOut: upstream's handle_letmein sends a
+                // Retry on SendTimedOut: the rustpush handle_letmein sends a
                 // delegation message_session INSIDE handle() — if APNs flaps
                 // at that moment, the entire LetMeIn is dropped before our
                 // auto_approve even runs. A single retry after 2s usually
@@ -8453,7 +8537,7 @@ impl Client {
     }
 }
 
-// Plain (non-FFI) impl for internal helpers that use upstream rustpush types
+// Plain (non-FFI) impl for internal helpers that use rustpush types
 // (MessageInst, SendJob, PushError) not safe to cross the uniffi boundary.
 impl Client {
     /// Force-refresh the MobileMe delegate and clear the cached CloudKit
@@ -8461,7 +8545,7 @@ impl Client {
     ///
     /// Sequence matters here:
     ///
-    ///   1. Refresh the PET first. Upstream's `refresh_mme` (auth.rs:176)
+    ///   1. Refresh the PET first. The `refresh_mme` (auth.rs:176)
     ///      calls `get_gsa_token("com.apple.gs.idms.pet")` on line 179 and
     ///      errors `TokenMissing` if the PET is absent/expired. Apple PETs
     ///      have a ~24h TTL so after an overnight idle + bridge restart the
@@ -9426,11 +9510,11 @@ impl Client {
                 None
             },
         };
-        // Upstream cloudkit.rs `FetchedRecords::get_record` does
+        // The cloudkit.rs `FetchedRecords::get_record` does
         // `.expect("No record found?")` when CloudKit returns a response
         // with no matching record id. That's a normal outcome when the
         // peer rotated/deleted their shared-profile record after we cached
-        // its key, but the upstream panics → crosses the FFI boundary →
+        // its key, but that panic → crosses the FFI boundary →
         // takes the bridge down (and systemd restarts into the same row,
         // crashloop). Wrap in catch_unwind so the panic becomes an error
         // and the Go-side periodic refresh logs+skips the stale row.
@@ -10627,7 +10711,7 @@ impl Client {
         Ok(registered_count)
     }
 
-    /// OpenBubbles' "clear identity cache" operation: drop the bridge's local
+    /// The "clear identity cache" operation: drop the bridge's local
     /// IDS key cache (id_cache.plist), then re-register the identity bundle so
     /// the cache rebuilds against Apple's current state.
     ///
@@ -11369,11 +11453,11 @@ impl Client {
     /// Paginate with continuation_token until done == true.
     ///
     /// Parses records as our local `CloudAttachmentWithAvid` instead of
-    /// upstream's `CloudAttachment` so we get the `avid` field (Live Photo
+    /// the `CloudAttachment` type so we get the `avid` field (Live Photo
     /// MOV companion) without needing a rustpush patch. Same on-the-wire
     /// record type ("attachment"), same PCS-encrypted record fields —
     /// `cm`, `lqa`, and `avid` are decoded by the CloudKit field-name
-    /// matcher on our struct the same way they'd be on upstream's + an
+    /// matcher on our struct the same way they'd be on the base type + an
     /// extra field. Ford key registration uses both `lqa.protection_info`
     /// AND `avid.protection_info`.
     pub async fn cloud_sync_attachments(
@@ -11411,7 +11495,7 @@ impl Client {
         // that declares the avid field) so sync-time has_avid detection
         // AND avid Ford key caching work in one pass.
         // SLEDGEHAMMER: the whole container+zone_key+perform call chain runs
-        // inside a spawned task. Upstream omnisette has an unconditional
+        // inside a spawned task. The omnisette crate has an unconditional
         // `panic!()` on any non-`AnisetteNotProvisioned` error from
         // `get_headers` (remote_anisette_v3.rs:417), and MMCS/PCS paths
         // below it have their own scattered `.expect()` calls. Any of
@@ -11430,7 +11514,7 @@ impl Client {
         let mut cm_handle = cloud_messages;
         // All of these are populated on a successful perform() and consumed
         // after the retry loop. Types are inferred from the first Some(...)
-        // assignment so we don't have to hard-code upstream's crate paths.
+        // assignment so we don't have to hard-code the crate paths.
         let mut perform_result = None;
         let mut last_perform_err: Option<String> = None;
         let mut container_holder = None;
@@ -11603,7 +11687,7 @@ impl Client {
         // drop the record — we still emit the record with a missing Ford key,
         // so Go sees the aguid in attachments_json and the download path can
         // attempt Ford recovery. This is the fix for the 4-record regression:
-        // upstream's `Asset::from_value_encrypted` unwraps `protection_info`
+        // the `Asset::from_value_encrypted` path unwraps `protection_info`
         // twice (cloudkit-proto/src/lib.rs:273), which panics on any record
         // whose lqa has `protection_info=None` or `protection_info.protection_info=None`.
         // The previous catch_unwind(from_record_encrypted) caught that panic
@@ -11652,7 +11736,7 @@ impl Client {
             // Ford keys master would have recovered — producing gaps in
             // the cache that showed up as "all cached keys exhausted"
             // failures during Ford dedup recovery.
-            // Upstream's decode_record_protection uses .unwrap()/.expect() and
+            // The decode_record_protection path uses .unwrap()/.expect() and
             // can panic when zone-key lookup fails. Wrap in catch_unwind so a
             // single bad record skips gracefully instead of aborting the whole
             // page and freezing the continuation token forever.
@@ -11661,7 +11745,7 @@ impl Client {
             }));
             let pcskey_opt = match pcs_result {
                 Err(_panic) => {
-                    // pcs_keys_for_record panicked — upstream's decode_record_protection
+                    // pcs_keys_for_record panicked — the decode_record_protection path
                     // uses byte comparison (key.compress() vs stored pub_key) which
                     // fails when the zone was key-rotated and the old key is missing
                     // from zone_keys but still in the keychain.
@@ -11780,10 +11864,10 @@ impl Client {
 
             // Per-field manual decode.
             //
-            // Previously this call used upstream's derive-generated
+            // Previously this call used the derive-generated
             // `<CloudAttachment as CloudKitRecord>::from_record_encrypted`
             // inside a whole-record `catch_unwind`. That path has two
-            // load-bearing panic sites in upstream's code that silently
+            // load-bearing panic sites in rustpush's code that silently
             // nuked entire records:
             //
             //   1. `Asset::from_value_encrypted`
@@ -12250,7 +12334,7 @@ impl Client {
     ///
     /// # Ford dedup recovery
     ///
-    /// First tries upstream's `download_attachment`. If that path panics
+    /// First tries the `download_attachment` path. If that path panics
     /// (which happens when MMCS serves a deduplicated Ford blob encrypted
     /// with a different record's key — the `.unwrap()` at the top of
     /// `get_mmcs`'s SIV decrypt), the panic is caught here and the wrapper
@@ -12258,7 +12342,7 @@ impl Client {
     /// we fetch the record, mutate `lqa.protection_info.protection_info` to
     /// inject the candidate key, and call `container.get_assets(...)`
     /// directly. This matches the 94f7b8e fix's semantics without touching
-    /// upstream rustpush source.
+    /// rustpush source.
     pub async fn cloud_download_attachment(
         &self,
         record_name: String,
@@ -12269,7 +12353,7 @@ impl Client {
 
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
 
-        // Hand-rolled mirror of upstream's `download_attachment` that
+        // Hand-rolled mirror of the `download_attachment` path that
         // replicates master's Ford-registration-before-get_assets pattern:
         //
         //   1. perform_operations(FetchRecordOperation::many(ALL_ASSETS))
@@ -12373,7 +12457,7 @@ impl Client {
                 });
             }
             Err(panic_payload) => {
-                // Surface what upstream actually panicked on (the catch_unwind
+                // Surface what rustpush actually panicked on (the catch_unwind
                 // payload) — e.g. "No body!!" (Apple no longer serves the asset)
                 // vs "No signature?" (our stored record is missing a field).
                 let payload = panic_payload
@@ -12393,7 +12477,7 @@ impl Client {
                     // give up here — the manual download path below ALSO handles
                     // plain V1 chunks (decrypt_v1_chunk with the per-chunk key
                     // from the authorize response), so it can recover a V1 image
-                    // that upstream's get_mmcs panicked on. If the asset is truly
+                    // that the get_mmcs path panicked on. If the asset is truly
                     // gone (Apple aged out the MMCS blob → no body / no
                     // reference), recovery returns a descriptive, ATTACHMENT_
                     // UNRECOVERABLE-tagged error the bridge can tombstone.
@@ -12409,7 +12493,7 @@ impl Client {
         // Attempt 2 — manual recovery. Handles V1 (per-chunk), V2 Ford, and
         // Ford dedup (cross-batch brute force via the cached key set) in one
         // pure-crypto pass. Reached for BOTH Ford and non-Ford panics: the
-        // manual path is a superset of upstream's get_mmcs.
+        // manual path is a superset of the get_mmcs path.
         self.cloud_download_attachment_ford_recovery_with_record(
             container,
             records,
@@ -12462,7 +12546,7 @@ impl Client {
 
     /// Download the Live Photo video (avid asset) from a CloudKit attachment record.
     ///
-    /// Upstream rustpush's `CloudAttachment` type doesn't have an `avid`
+    /// The rustpush `CloudAttachment` type doesn't have an `avid`
     /// field, so we fetch the record using our local `CloudAttachmentWithAvid`
     /// (which declares the same `attachment` CloudKit record type plus the
     /// extra `avid: Asset` field), register the record's Ford keys into
@@ -12721,10 +12805,6 @@ impl Client {
                     .map(|dr| apple_timestamp_ns_to_unix_ms(dr as i64))
                     .unwrap_or(0);
 
-                let (reply_guid, reply_part) = parse_cloud_reply(
-                    msg.msg_proto_2.as_ref().and_then(|p| p.reply.as_deref()),
-                );
-
                 // Extract attachment GUIDs from attributedBody + messageSummaryInfo
                 let mut attachment_guids: Vec<String> = msg.msg_proto.attributed_body
                     .as_ref()
@@ -12742,6 +12822,10 @@ impl Client {
                         }
                     }
                 }
+
+                let (reply_guid, reply_part) = parse_cloud_reply(
+                    msg.msg_proto_2.as_ref().and_then(|p| p.reply.as_deref()),
+                );
 
                 deduped.insert(
                     guid.clone(),
@@ -12956,12 +13040,12 @@ impl Client {
         base_record: CloudAttachmentWithAvid,
         record_name: &str,
     ) -> Result<Vec<u8>, WrappedError> {
-        // Fully-manual Ford download. Bypasses upstream's V1-only
+        // Fully-manual Ford download. Bypasses the V1-only
         // `get_mmcs` (which panics on V2 Ford records) and handles V1,
         // V2, and dedup (cross-batch brute force via the cached key set)
         // in a single pure-crypto pass.
         //
-        // The outer `cloud_download_attachment` attempted upstream's
+        // The outer `cloud_download_attachment` attempted the
         // happy path first and catch_unwind'd its panic; we're here
         // because that failed. Reached for BOTH Ford and non-Ford
         // (plain V1) panics — the manual path handles all of them.
@@ -12972,9 +13056,9 @@ impl Client {
         // tagged "ATTACHMENT_UNRECOVERABLE:" so the Go side can persist a
         // tombstone and stop re-attempting them on every sync sweep.
         //
-        // What this function does NOT do that upstream does:
+        // What this function does NOT do that the get_mmcs path does:
         //   - getComplete confirmation (CloudKit passes empty url, so
-        //     upstream skips it too — see mmcs.rs:1260-1272)
+        //     get_mmcs skips it too — see mmcs.rs:1260-1272)
         //   - chunk-level HTTP range requests with streaming matcher
         //     (we fetch each container body in full — simpler, same
         //     result for typical attachment sizes)
@@ -13018,7 +13102,7 @@ impl Client {
         })?;
 
         // User agent for MMCS fetches — CloudKit style (matches what
-        // upstream's `get_assets` constructs at cloudkit.rs:2080).
+        // the `get_assets` path constructs at cloudkit.rs:2080).
         let user_agent = container
             .client
             .config
@@ -13069,7 +13153,7 @@ impl Client {
     /// over every cached Ford key, mutate `Asset.protection_info` per attempt,
     /// and retry `container.get_assets(...)` wrapped in `catch_unwind` until
     /// one candidate SIV-decrypts cleanly. Matches the 94f7b8e fix's
-    /// cross-batch recovery semantics without modifying upstream rustpush.
+    /// cross-batch recovery semantics without modifying rustpush.
     #[allow(dead_code)]
     async fn cloud_download_attachment_ford_recovery(
         &self,
@@ -13122,8 +13206,8 @@ impl Client {
             cached_keys.len()
         );
 
-        // Pre-flight: if the record's lqa has no bundled_request_id, upstream's
-        // `get_assets` would panic immediately at cloudkit.rs:2075 with "No
+        // Pre-flight: if the record's lqa has no bundled_request_id, the
+        // `get_assets` path would panic immediately at cloudkit.rs:2075 with "No
         // bundled asset!" — no point iterating 900 keys. Bail out early with
         // a clear error instead.
         if base_record.lqa.bundled_request_id.is_none() {

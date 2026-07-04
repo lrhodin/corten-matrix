@@ -1,9 +1,15 @@
 package rustpushgo
 
+// NOTE: librustpushgo.a vendors OpenSSL statically, so the linux cgo flags below
+// intentionally omit -lssl/-lcrypto. That keeps the binary self-contained and
+// lets it cross-link via zig (no Linux OpenSSL on the build host). Keep this as a
+// normal Go comment ABOVE the cgo preamble — prose inside the preamble is parsed
+// as C source by cgo and breaks the build.
+
 // #include <rustpushgo.h>
-// #cgo LDFLAGS: -L${SRCDIR}/../../ -lrustpushgo -ldl -lm -lz
-// #cgo darwin LDFLAGS: -framework Security -framework SystemConfiguration -framework CoreFoundation -framework Foundation -framework CoreServices -lresolv
-// #cgo linux LDFLAGS: -lpthread -lssl -lcrypto -lresolv
+// #cgo LDFLAGS: -L${SRCDIR}/../../ -lrustpushgo -ldl -lm
+// #cgo darwin LDFLAGS: -lz -framework Security -framework SystemConfiguration -framework CoreFoundation -framework Foundation -framework CoreServices -lresolv
+// #cgo linux LDFLAGS: -lpthread -lresolv -lunwind
 import "C"
 
 import (
@@ -1420,15 +1426,6 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_rustpushgo_checksum_method_wrappedosconfig_requires_nac_relay(uniffiStatus)
-		})
-		if checksum != 13481 {
-			// If this happens try cleaning and rebuilding your project
-			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedosconfig_requires_nac_relay: UniFFI API checksum mismatch")
-		}
-	}
-	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_wrappedpasswordsclient_accept_invite(uniffiStatus)
 		})
 		if checksum != 37840 {
@@ -1893,15 +1890,6 @@ func uniffiCheckChecksums() {
 		if checksum != 1024 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_statuscallback_on_reshare_sender: UniFFI API checksum mismatch")
-		}
-	}
-	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_rustpushgo_checksum_method_statuscallback_on_status_decrypt_failed(uniffiStatus)
-		})
-		if checksum != 56503 {
-			// If this happens try cleaning and rebuilding your project
-			panic("rustpushgo: uniffi_rustpushgo_checksum_method_statuscallback_on_status_decrypt_failed: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -5005,15 +4993,6 @@ func (_self *WrappedOsConfig) GetDeviceId() string {
 	return FfiConverterStringINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
 		return rustBufferFromC(C.uniffi_rustpushgo_fn_method_wrappedosconfig_get_device_id(
 			_pointer, _uniffiStatus))
-	}))
-}
-
-func (_self *WrappedOsConfig) RequiresNacRelay() bool {
-	_pointer := _self.ffiObject.incrementPointer("*WrappedOsConfig")
-	defer _self.ffiObject.decrementPointer()
-	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
-		return C.uniffi_rustpushgo_fn_method_wrappedosconfig_requires_nac_relay(
-			_pointer, _uniffiStatus)
 	}))
 }
 
@@ -8236,8 +8215,6 @@ type StatusCallback interface {
 	OnKeysReceived()
 
 	OnReshareSender(sender string, channelId string)
-
-	OnStatusDecryptFailed(sender *string)
 }
 
 // foreignCallbackCallbackInterfaceStatusCallback cannot be callable be a compiled function at a same time
@@ -8269,11 +8246,6 @@ func rustpushgo_cgo_StatusCallback(handle C.uint64_t, method C.int32_t, argsPtr 
 		args := unsafe.Slice((*byte)(argsPtr), argsLen)
 		result = foreignCallbackCallbackInterfaceStatusCallback{}.InvokeOnReshareSender(cb, args, outBuf)
 		return C.int32_t(result)
-	case 4:
-		var result uniffiCallbackResult
-		args := unsafe.Slice((*byte)(argsPtr), argsLen)
-		result = foreignCallbackCallbackInterfaceStatusCallback{}.InvokeOnStatusDecryptFailed(cb, args, outBuf)
-		return C.int32_t(result)
 
 	default:
 		// This should never happen, because an out of bounds method index won't
@@ -8297,12 +8269,6 @@ func (foreignCallbackCallbackInterfaceStatusCallback) InvokeOnKeysReceived(callb
 func (foreignCallbackCallbackInterfaceStatusCallback) InvokeOnReshareSender(callback StatusCallback, args []byte, outBuf *C.RustBuffer) uniffiCallbackResult {
 	reader := bytes.NewReader(args)
 	callback.OnReshareSender(FfiConverterStringINSTANCE.Read(reader), FfiConverterStringINSTANCE.Read(reader))
-
-	return uniffiCallbackResultSuccess
-}
-func (foreignCallbackCallbackInterfaceStatusCallback) InvokeOnStatusDecryptFailed(callback StatusCallback, args []byte, outBuf *C.RustBuffer) uniffiCallbackResult {
-	reader := bytes.NewReader(args)
-	callback.OnStatusDecryptFailed(FfiConverterOptionalStringINSTANCE.Read(reader))
 
 	return uniffiCallbackResultSuccess
 }

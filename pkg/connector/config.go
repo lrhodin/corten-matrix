@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // This program is free software: you can redistribute it and/or modify
@@ -15,7 +15,7 @@ import (
 	up "go.mau.fi/util/configupgrade"
 	"gopkg.in/yaml.v3"
 
-	"github.com/lrhodin/imessage/pkg/imconfig"
+	"github.com/lrhodin/corten-matrix/pkg/imconfig"
 )
 
 // ExampleConfig is the embedded network config template. It lives in the
@@ -139,7 +139,7 @@ type IMConfig struct {
 	//   2. The periodic body scrubber is disabled — plaintext message
 	//      bodies (text/subject/sender) downloaded into the local
 	//      cloud_message side-cache are NOT cleared after Matrix delivery,
-	//      so they persist in mautrix-imessage.db.
+	//      so they persist in corten-matrix.db.
 	//   3. On the next CloudKit sync the bridge re-fills already-scrubbed
 	//      rows: it clears the body_scrubbed flags and resets the CloudKit
 	//      continuation tokens, forcing a full re-page that re-downloads the

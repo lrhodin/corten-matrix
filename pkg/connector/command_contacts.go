@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // This program is free software: you can redistribute it and/or modify
@@ -33,7 +33,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/commands"
 	"maunium.net/go/mautrix/bridgev2/provisionutil"
 
-	"github.com/lrhodin/imessage/imessage"
+	"github.com/lrhodin/corten-matrix/imessage"
 )
 
 // contactMatch holds one iMessage-reachable identifier for a matching contact.
@@ -134,7 +134,11 @@ func fnContacts(ce *commands.Event) {
 			candidates = append(candidates, candidate{identifier: id, rawLabel: phone, name: name})
 		}
 		for _, email := range contact.Emails {
-			id := "mailto:" + strings.ToLower(email)
+			email = strings.ToLower(strings.TrimSpace(email))
+			if email == "" {
+				continue
+			}
+			id := "mailto:" + email
 			if seen[id] {
 				continue
 			}
@@ -164,20 +168,7 @@ func fnContacts(ce *commands.Event) {
 	for i, c := range candidates {
 		ids[i] = c.identifier
 	}
-	// ValidateTargets crosses into the identity-manager FFI path, which has
-	// reachable panic sites upstream. This is a user-triggered command, so
-	// recover instead of letting a panic crash the bridge.
-	var valid []string
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				client.UserLogin.Log.Error().Interface("panic", r).
-					Msg("contacts command: ValidateTargets panicked in FFI path")
-				valid = nil
-			}
-		}()
-		valid = client.client.ValidateTargets(ids, client.handle)
-	}()
+	valid := client.validateTargetsSafe(ids)
 	validSet := make(map[string]bool, len(valid))
 	for _, v := range valid {
 		validSet[v] = true

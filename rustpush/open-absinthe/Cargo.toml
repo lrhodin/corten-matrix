@@ -5,40 +5,26 @@ edition = "2021"
 
 [dependencies]
 serde = { version = "1.0.219", features = ["derive"] }
-serde_json = { version = "1.0", features = ["preserve_order"] }
-base64 = "0.21"
-unicorn-engine = "2.1.5"
-goblin = "0.10"
-ureq = { version = "2.9", features = ["native-tls", "json"] }
-native-tls = "0.2"
-sha1 = "0.10"
-sha2 = "0.10"
-rand = "0.8"
 log = "0.4"
 
 # Optional: native NAC via AAAbsintheContext (macOS 13+).
 # When the `native-nac` feature is enabled AND the build target is macOS,
-# `ValidationCtx::new()` eagerly computes the validation data via
-# `nac_validation::generate_validation_data()` (AppleAccount.framework's
-# AAAbsintheContext), caches it, and returns it from `sign()` — bypassing
-# the unicorn XNU emulator entirely. `key_establishment()` becomes a no-op.
+# `ValidationCtx` delegates the NAC steps to Apple's AppleAccount.framework
+# (`AAAbsintheContext`) through the `nac-validation` crate.
 #
-# nac-validation is a standalone workspace member (depends on libc + thiserror
-# + cc only — no rustpush, no open-absinthe), so this dep direction does NOT
-# create a cycle. The path reaches the repo-root `nac-validation/` from the
-# built copy of this crate at `third_party/rustpush-upstream/open-absinthe/`.
+# nac-validation is a standalone workspace member (libc + thiserror + cc only —
+# no rustpush, no open-absinthe), so this dep direction does NOT create a cycle.
+# The path reaches the repo-root `nac-validation/` from the built copy of this
+# crate at `third_party/rustpush-upstream/open-absinthe/`.
 [target.'cfg(target_os = "macos")'.dependencies]
 nac-validation = { path = "../../../nac-validation", optional = true }
 
-[dev-dependencies]
-plist = "1.7"
-ureq = { version = "2.9", features = ["native-tls"] }
-native-tls = "0.2"
-
-[[bin]]
-name = "enrich_hw_key"
-path = "src/bin/enrich_hw_key.rs"
-
 [features]
 serde = []
+# Native AAAbsintheContext NAC (real Mac). This is the FOSS macOS path.
 native-nac = ["dep:nac-validation"]
+# Placeholder so the bridge's `rustpushgo` crate — whose `cleanroom-registration`
+# feature references `open-absinthe/native-nac-rust` — still resolves against
+# this open-absinthe. Here it is a no-op; this build never enables it (it does
+# NAC via `native-nac`, i.e. Apple's native AAAbsintheContext on a Mac).
+native-nac-rust = []

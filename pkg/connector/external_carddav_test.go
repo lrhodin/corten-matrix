@@ -3,7 +3,7 @@ package connector
 import (
 	"testing"
 
-	"github.com/lrhodin/imessage/imessage"
+	"github.com/lrhodin/corten-matrix/imessage"
 )
 
 func TestResolveProviderURL(t *testing.T) {

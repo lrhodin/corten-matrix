@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // This program is free software: you can redistribute it and/or modify
@@ -56,8 +56,8 @@ import (
 	"maunium.net/go/mautrix/id"
 	"maunium.net/go/mautrix/pushrules"
 
-	"github.com/lrhodin/imessage/imessage"
-	"github.com/lrhodin/imessage/pkg/rustpushgo"
+	"github.com/lrhodin/corten-matrix/imessage"
+	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
 )
 
 // IMClient implements bridgev2.NetworkAPI using the rustpush iMessage protocol
@@ -390,6 +390,8 @@ type IMClient struct {
 
 	// Background goroutine lifecycle
 	stopChan chan struct{}
+	// Serializes Disconnect — see the comment there.
+	disconnectMu sync.Mutex
 
 	// Unsend re-delivery suppression
 	recentUnsends     map[string]time.Time
@@ -1620,6 +1622,13 @@ Run ` + "`help`" + ` any time for the full command list.
 `
 
 func (c *IMClient) Disconnect() {
+	// bridgev2 serializes its own Disconnect calls (disconnectOnce), but
+	// LogoutRemote invokes this method directly, so two teardowns can run
+	// concurrently: double-close of stopChan, or one frame nil-ing c.client
+	// while the other's Stop() goroutine still reads it. Serialize here; the
+	// second caller then no-ops on the already-nil'd fields.
+	c.disconnectMu.Lock()
+	defer c.disconnectMu.Unlock()
 	if c.msgBuffer != nil {
 		c.msgBuffer.stop()
 	}
@@ -1627,22 +1636,34 @@ func (c *IMClient) Disconnect() {
 		close(c.stopChan)
 		c.stopChan = nil
 	}
-	if c.client != nil {
-		c.client.Stop()
-		c.client.Destroy()
-		c.client = nil
-	}
-	// Tear down the APNs connection too (stop its ResourceManager + free the
-	// courier socket). A reconnect/relogin opens a NEW connection on the SAME
-	// device token; if the old one lingered, Apple drops the duplicate
-	// ("Failed to read message from APS ... early eof") and rustpush's
-	// no-backoff reconnect loop turns that into the self-sustaining
-	// receive-stall storm. Closing here guarantees the next connect starts
-	// clean. Close() only stops the underlying connection — it does NOT destroy
-	// the WrappedApsConnection Go object — so the receive-wedge watchdog
-	// polling it is never left holding a freed handle.
+	// Close the APNs ResourceManager BEFORE stopping the Client: its death
+	// signal (a non-blocking try_send) aborts any in-flight reconnect so
+	// nothing is still generating traffic while the client shuts down.
+	// Don't nil c.connection — the watchdog may still poll it; Close()
+	// signals stop without freeing the Go object.
 	if c.connection != nil {
 		c.connection.Close()
+	}
+	if c.client != nil {
+		// Stop() is an async Rust/UniFFI call; bound it with a timeout as
+		// insurance so a wedge can't hang Disconnect (never observed in
+		// production — the #56 hang was the nil-channel send in
+		// macOSDatabase.Stop(), fixed in imessage/mac). Destroy() runs
+		// regardless — UniFFI refcounting defers the free until any
+		// in-flight Stop() returns, so the leaked goroutine never touches
+		// freed memory.
+		stopDone := make(chan struct{})
+		go func() {
+			c.client.Stop()
+			close(stopDone)
+		}()
+		select {
+		case <-stopDone:
+		case <-time.After(10 * time.Second):
+			c.UserLogin.Log.Warn().Msg("client.Stop() timed out during disconnect; proceeding to destroy")
+		}
+		c.client.Destroy()
+		c.client = nil
 	}
 	if c.chatDB != nil {
 		c.chatDB.Close()
@@ -2519,14 +2540,23 @@ func (c *IMClient) OnKeysReceived() {
 	c.schedulePresenceSubscribe(log)
 }
 
+// OnReshareSender is called once per reshare with the peer handle that sent
+// it. Peer iOS fans a reshare across every alias of our account (tel: + each
+// mailto:) with the same channel id but a different `from` handle on each
+// copy. Upstream state keys by channel, so every reshare overwrites the
+// previous `from` — only the last sender survives in state.keys. Without this
+// hook the bridge learns just one alias per peer and presence updates on the
+// others have no portal mapping. Eagerly resolving the sender's portal here
+// and stamping it into statusKitPortalCache preserves the mapping across
+// overwrites so OnStatusUpdate's cache lookup always hits regardless of which
+// alias Apple routes the next presence message to.
 // OnStatusDecryptFailed is called by StatusKit when a presence update on the
 // presence.mode.status topic could not be decoded — almost always a peer who
 // rotated their StatusKit channel key, leaving the copy we pulled from CloudKit
 // stale. We force a rate-limited CloudKit peer-key re-pull to fetch the fresh key
 // right away (instead of waiting for the steady-state pull floor), which then
 // re-subscribes and lets the peer's real presence flow again — clearing a moon
-// that would otherwise be stuck. sender is best-effort (the peer handle when the
-// envelope exposes it) and used only for logging.
+// that would otherwise be stuck. sender is best-effort and used only for logging.
 func (c *IMClient) OnStatusDecryptFailed(sender *string) {
 	if !c.Main.Config.StatusKitNotifications {
 		return
@@ -2540,16 +2570,6 @@ func (c *IMClient) OnStatusDecryptFailed(sender *string) {
 	c.onPresenceDecryptFailed(log)
 }
 
-// OnReshareSender is called once per reshare with the peer handle that sent
-// it. Peer iOS fans a reshare across every alias of our account (tel: + each
-// mailto:) with the same channel id but a different `from` handle on each
-// copy. Upstream state keys by channel, so every reshare overwrites the
-// previous `from` — only the last sender survives in state.keys. Without this
-// hook the bridge learns just one alias per peer and presence updates on the
-// others have no portal mapping. Eagerly resolving the sender's portal here
-// and stamping it into statusKitPortalCache preserves the mapping across
-// overwrites so OnStatusUpdate's cache lookup always hits regardless of which
-// alias Apple routes the next presence message to.
 func (c *IMClient) OnReshareSender(sender string, channelId string) {
 	if sender == "" {
 		return
@@ -2914,7 +2934,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	// for messages that CloudKit already bridged. Check the Bridge DB for any
 	// message whose UUID is already known to prevent duplicates.
 	if msg.Uuid != "" {
-		portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+		portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 		if dbMsgs, err := c.Main.Bridge.DB.Message.GetAllPartsByID(
 			context.Background(), c.UserLogin.ID, makeMessageID(msg.Uuid),
 		); err == nil && len(dbMsgs) > 0 {
@@ -2962,7 +2982,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	}
 
 	sender := c.makeEventSender(msg.Sender)
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	sender = c.canonicalizeDMSender(portalKey, sender)
 
 	// Keep the stored gid: group roster in sync with the sender's current view
@@ -3335,7 +3355,7 @@ func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	// self-reflections can still have participants=[self, self].
 	portalKey := c.resolvePortalByTargetMessage(log, targetGUID)
 	if portalKey.ID == "" {
-		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	}
 
 	// Persist the tapback UUID so cross-restart APNs re-deliveries are caught
@@ -3420,7 +3440,7 @@ func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage)
 	// determine the correct DM portal.
 	portalKey := c.resolvePortalByTargetMessage(log, targetGUID)
 	if portalKey.ID == "" {
-		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	}
 
 	newText := ptrStringOr(msg.EditNewText, "")
@@ -3470,7 +3490,7 @@ func (c *IMClient) handleUnsend(log zerolog.Logger, msg rustpushgo.WrappedMessag
 	// determine the correct DM portal.
 	portalKey := c.resolvePortalByTargetMessage(log, targetGUID)
 	if portalKey.ID == "" {
-		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	}
 
 	// Scrub-before-emit, fail-closed: same pattern as handleMessageDelete.
@@ -3511,7 +3531,7 @@ func (c *IMClient) handleRename(log zerolog.Logger, msg rustpushgo.WrappedMessag
 		log.Debug().Str("uuid", msg.Uuid).Msg("Skipping stored rename message")
 		return
 	}
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	newName := ptrStringOr(msg.NewChatName, "")
 
 	// Update the cached iMessage group name to the NEW name so outbound
@@ -3571,7 +3591,7 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 		return
 	}
 	// Resolve the existing portal from the OLD participant list.
-	oldPortalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	oldPortalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 
 	if len(msg.NewParticipants) == 0 {
 		// No new participant list — fall back to a resync with current info.
@@ -3621,6 +3641,32 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 			Int("result", int(result)).
 			Msg("ReID portal for participant change")
 		finalPortalKey = newPortalKey
+	}
+
+	// Record the service type on the (possibly re-keyed) portal. Carrier groups
+	// re-key on membership change, and reIDPortalWithCacheUpdate only carries the
+	// SMS flag forward if the old portal already had one in memory — a group whose
+	// flag was never set this session would lose it, sending outbound replies over
+	// iMessage. Set it explicitly from msg.IsSms (this path doesn't go through
+	// handleMessage's updatePortalSMS) and persist on change so it survives a
+	// restart (loadSenderGuidsFromDB only hydrates IsSms=true entries).
+	if c.updatePortalSMS(string(finalPortalKey.ID), msg.IsSms) {
+		ctx := context.Background()
+		if p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, finalPortalKey); err == nil && p != nil {
+			meta, ok := p.Metadata.(*PortalMetadata)
+			if !ok {
+				meta = &PortalMetadata{}
+			}
+			if meta.IsSms != msg.IsSms {
+				meta.IsSms = msg.IsSms
+				p.Metadata = meta
+				if err := p.Save(ctx); err != nil {
+					log.Warn().Err(err).Str("portal_id", string(finalPortalKey.ID)).
+						Bool("is_sms", msg.IsSms).
+						Msg("Failed to persist IsSms after participant change")
+				}
+			}
+		}
 	}
 
 	// Cache sender_guid and group_name under the (possibly new) portal ID.
@@ -3775,7 +3821,7 @@ func (c *IMClient) fetchAndCacheGroupPhoto(ctx context.Context, log zerolog.Logg
 // valid MMCS data, letting us catch up on changes that occurred while offline.
 // If the MMCS URL has expired Rust returns nil bytes and we warn harmlessly.
 func (c *IMClient) handleIconChange(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	portalID := string(portalKey.ID)
 	log = log.With().Str("portal_id", portalID).Bool("stored", msg.IsStoredMessage).Logger()
 
@@ -3879,7 +3925,7 @@ func (c *IMClient) handleNotifyAnyways(log zerolog.Logger, msg rustpushgo.Wrappe
 	}
 
 	ctx := context.Background()
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
 	if err != nil || portal == nil || portal.MXID == "" {
 		log.Debug().Err(err).Msg("NotifyAnyways: no portal found, skipping notice")
@@ -3916,7 +3962,7 @@ func (c *IMClient) handleNotifyAnyways(log zerolog.Logger, msg rustpushgo.Wrappe
 
 func (c *IMClient) handleFaceTimeRingNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage, rawText string) {
 	ctx := context.Background()
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
 
 	senderHandle := ptrStringOr(msg.Sender, "")
@@ -4067,7 +4113,7 @@ func (c *IMClient) handleFaceTimeMissedNotice(log zerolog.Logger, msg rustpushgo
 		}
 	}
 
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
 	sendNotice := func(roomID id.RoomID) error {
 		content := format.RenderMarkdown(noticeMarkdown, true, false)
@@ -4099,7 +4145,7 @@ func (c *IMClient) handleFaceTimeMissedNotice(log zerolog.Logger, msg rustpushgo
 func (c *IMClient) handleFaceTimeAnsweredElsewhereNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
 	ctx := context.Background()
 	notice := "📞 Incoming FaceTime call was answered on another device."
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
 	sendNotice := func(roomID id.RoomID) error {
 		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{
@@ -4225,7 +4271,7 @@ func (c *IMClient) makeDeletePortalKey(log zerolog.Logger, msg rustpushgo.Wrappe
 	}
 
 	log.Warn().Msg("Delete/recover message has no delete-specific fields, falling back to regular makePortalKey")
-	return c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	return c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 }
 
 func (c *IMClient) handleMessageDelete(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
@@ -5573,7 +5619,7 @@ func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedM
 		}
 	}
 
-	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	ctx := context.Background()
 
 	// Try sender_guid lookup — first check gid: portal ID, then cache
@@ -5692,7 +5738,7 @@ func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.Wrap
 	// format churn) silently drops every delivery receipt while read receipts
 	// keep working via their fallback chain — which manifests as "Beeper
 	// shows read but never delivered" with zero log signal.
-	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	resolved := false
 
 	if msg.SenderGuid != nil && *msg.SenderGuid != "" {
@@ -5857,7 +5903,7 @@ func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.Wrap
 }
 
 func (c *IMClient) handleTyping(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 
 	// For group typing indicators, iMessage may only include [sender, target]
 	// without the full participant list. If the portal key resolves to a
@@ -5999,6 +6045,12 @@ func retrySendOnAPNsFlap(op func() error) error {
 func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
 	if c.client == nil {
 		return nil, bridgev2.ErrNotLoggedIn
+	}
+
+	// Verify outbound delivery identity before sending. Placed ahead of the
+	// file branch so it covers both text and attachment messages.
+	if r, err := c.ensureIdentityKeys(ctx, msg); r != nil || err != nil {
+		return r, err
 	}
 
 	conv := c.portalToConversation(msg.Portal)
@@ -7421,9 +7473,29 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		// parse as a phone number, so the contact renders with no number.
 		// contactPortalIDs() already produces clean E.164 tel: / lowercased
 		// mailto: IDs and dedupes them — reuse it instead of re-deriving here.
+		portalIDs := contactPortalIDs(contact)
+		// Default to the phone number when the contact has one. Beeper resolves a
+		// DM's contact card — avatar, and the phone/call button — from this
+		// identifier list, and the framework SORTS it (ghost.go prepareContactInfo),
+		// so "mailto:" sorts ahead of "tel:". Leaking an email alongside the phone
+		// made Beeper treat a phone DM as an email contact: it picked the email as
+		// the primary handle, blanking the generated avatar and dropping the phone
+		// (no call button). So when the contact has any phone, emit ONLY tel: IDs;
+		// fall back to emails only for genuinely phone-less (email-addressed)
+		// contacts. Matches the phone-preference of canonicalContactHandle.
+		hasPhone := strings.HasPrefix(identifier, "tel:")
+		for _, id := range portalIDs {
+			if strings.HasPrefix(id, "tel:") {
+				hasPhone = true
+				break
+			}
+		}
 		seen := map[string]bool{identifier: true}
-		for _, id := range contactPortalIDs(contact) {
+		for _, id := range portalIDs {
 			if seen[id] {
+				continue
+			}
+			if hasPhone && strings.HasPrefix(id, "mailto:") {
 				continue
 			}
 			seen[id] = true
@@ -7436,6 +7508,34 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 				ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", identifier, hex.EncodeToString(avatarHash[:8]))),
 				Get: func(ctx context.Context) ([]byte, error) {
 					return avatarData, nil
+				},
+			}
+		} else if contact.AvatarURL != "" {
+			// The address book knows this contact has a photo, but its bytes
+			// aren't cached yet — still downloading, or its last fetch hit a
+			// transient failure (e.g. an iCloud rate-limit when a restart
+			// re-downloads the whole address book at once). Hand the framework a
+			// NON-nil avatar regardless. A nil avatar takes UpdateInfo's
+			// "not expecting one ever" branch, which latches AvatarSet=true on an
+			// empty MXC permanently: once latched, UpdateInfoIfNecessary
+			// early-returns forever and the photo is never re-fetched, so the DM
+			// shows no picture for good even after the bytes arrive. (This is the
+			// recurring "moon froze the contact photo" report — the moon's
+			// NameIsCustom blocks the ghost->room sync, exposing the blanked
+			// ghost avatar.) Get returns the bytes once a sync fills them in, else
+			// errors so the framework leaves AvatarSet=false and the next contact
+			// reconcile retries. Keyed on the photo URL so it stays idempotent
+			// until the contact actually changes their picture.
+			urlHash := sha256.Sum256([]byte(contact.AvatarURL))
+			ui.Avatar = &bridgev2.Avatar{
+				ID: networkid.AvatarID(fmt.Sprintf("contact:%s:url:%s", identifier, hex.EncodeToString(urlHash[:8]))),
+				Get: func(ctx context.Context) ([]byte, error) {
+					// Re-read under the cache lock for the freshest bytes and to
+					// avoid racing the download goroutines that write Avatar.
+					if fresh, _ := c.contacts.GetContactInfo(localID); fresh != nil && len(fresh.Avatar) > 0 {
+						return fresh.Avatar, nil
+					}
+					return nil, fmt.Errorf("contact photo pending download")
 				},
 			}
 		}
@@ -9385,18 +9485,42 @@ func (c *IMClient) persistState(log zerolog.Logger) {
 			log.Warn().Interface("panic", r).Msg("persistState panicked — skipped this cycle")
 		}
 	}()
-	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+	// Snapshot FFI state into locals before touching Metadata: the final
+	// stopChan-triggered save can stall inside connection.State() on a
+	// wedged runtime, and by the time it returns bridgev2 may have replaced
+	// this client (recreateClient after a wedge rebuild). Metadata is shared
+	// with the successor, so a late write would clobber its fresh state both
+	// in memory and, via Save, in the DB.
+	var apsState, idsUsers, idsIdentity, deviceID string
+	var haveAPS, haveUsers, haveIdentity, haveDevice bool
 	if c.connection != nil {
-		meta.APSState = c.connection.State().ToString()
+		apsState, haveAPS = c.connection.State().ToString(), true
 	}
 	if c.users != nil {
-		meta.IDSUsers = c.users.ToString()
+		idsUsers, haveUsers = c.users.ToString(), true
 	}
 	if c.identity != nil {
-		meta.IDSIdentity = c.identity.ToString()
+		idsIdentity, haveIdentity = c.identity.ToString(), true
 	}
 	if c.config != nil {
-		meta.DeviceID = c.config.GetDeviceId()
+		deviceID, haveDevice = c.config.GetDeviceId(), true
+	}
+	if cur, _ := c.UserLogin.Client.(*IMClient); cur != c {
+		log.Debug().Msg("Dropping state save from a replaced client")
+		return
+	}
+	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+	if haveAPS {
+		meta.APSState = apsState
+	}
+	if haveUsers {
+		meta.IDSUsers = idsUsers
+	}
+	if haveIdentity {
+		meta.IDSIdentity = idsIdentity
+	}
+	if haveDevice {
+		meta.DeviceID = deviceID
 	}
 	if err := c.UserLogin.Save(context.Background()); err != nil {
 		log.Err(err).Msg("Failed to persist state")
@@ -9984,6 +10108,9 @@ func (c *IMClient) indexGroupPortalLocked(portalID string) {
 	if c.groupPortalIndex == nil {
 		return
 	}
+	if !strings.Contains(portalID, ",") {
+		return // gid:/DM portals are not member-indexed (see ensureGroupPortalIndex)
+	}
 	for _, member := range strings.Split(portalID, ",") {
 		if c.groupPortalIndex[member] == nil {
 			c.groupPortalIndex[member] = make(map[string]bool)
@@ -10507,16 +10634,25 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 	return networkid.PortalID(gidPortalID)
 }
 
-func (c *IMClient) makePortalKey(participants []string, groupName *string, sender *string, senderGuid *string) networkid.PortalKey {
-	isGroup := c.getUniqueParticipantCount(participants) > 2 || (groupName != nil && *groupName != "")
+func (c *IMClient) makePortalKey(participants []string, groupName *string, sender *string, senderGuid *string, isSms bool) networkid.PortalKey {
+	// Group = >=2 members besides us. Relayed carrier groups omit self, so a
+	// 3-person group arrives with 2 participants; count non-self members across
+	// participants AND sender so such a reply isn't mis-routed into a 1:1 DM.
+	isGroup := c.countNonSelfMembers(participants, sender) >= 2 || (groupName != nil && *groupName != "")
 
 	if isGroup {
 		// When a persistent group UUID (sender_guid / gid) is available,
 		// use "gid:<UUID>" as the stable portal ID. This avoids the
 		// fragility of participant-based IDs that break when membership
 		// changes or participants normalize differently.
+		//
+		// Carrier groups (SMS/RCS/MMS) are the exception: their group_id is
+		// unstable (CloudKit hands the same group back under several encodings),
+		// so we ignore senderGuid and key them purely by participant set — the
+		// same key resolvePortalIDForCloudChat uses — so the live and backfill
+		// paths converge on one room instead of splitting into a gid: room here.
 		var portalID networkid.PortalID
-		if senderGuid != nil && *senderGuid != "" {
+		if senderGuid != nil && *senderGuid != "" && !isSms {
 			gidID := "gid:" + strings.ToLower(*senderGuid)
 
 			// Fast path: check if we've previously resolved this gid to
@@ -10570,10 +10706,16 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 				}
 			}
 		} else {
-			// Fallback: build a participant-based ID for groups without a UUID.
+			// Fallback: build a participant-based ID for groups without a usable
+			// UUID. Carrier groups reach here even with senderGuid set; pass nil
+			// so their unstable guid is never associated with the portal.
 			deduped := c.buildCanonicalParticipantList(participants)
 			computedID := strings.Join(deduped, ",")
-			portalID = c.resolveExistingGroupPortalID(computedID, senderGuid)
+			sg := senderGuid
+			if isSms {
+				sg = nil
+			}
+			portalID = c.resolveExistingGroupPortalID(computedID, sg)
 		}
 		// Cache the actual iMessage group name (cv_name) so outbound
 		// messages can route to the correct conversation. Also push a
@@ -10765,9 +10907,9 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 // makeReceiptPortalKey handles receipt messages where participants may be empty.
 // When participants is empty (rustpush sets conversation: None for receipts),
 // use the sender field to identify the DM portal.
-func (c *IMClient) makeReceiptPortalKey(participants []string, groupName *string, sender *string, senderGuid *string) networkid.PortalKey {
+func (c *IMClient) makeReceiptPortalKey(participants []string, groupName *string, sender *string, senderGuid *string, isSms bool) networkid.PortalKey {
 	if len(participants) > 0 {
-		return c.makePortalKey(participants, groupName, sender, senderGuid)
+		return c.makePortalKey(participants, groupName, sender, senderGuid, isSms)
 	}
 	if sender != nil && *sender != "" {
 		// Resolve to existing portal for contacts with multiple numbers

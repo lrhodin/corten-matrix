@@ -1,5 +1,8 @@
 # Open Absinthe
 
-Cross-platform NAC (Network Attestation Check) validation using x86_64 emulation. Runs Apple's `IMDAppleServices` binary inside [unicorn-engine](https://www.unicorn-engine.org/), hooking CoreFoundation, IOKit, and DiskArbitration calls and feeding them hardware data extracted from a real Mac. This lets the iMessage bridge generate valid Apple validation data on Linux without a macOS runtime.
+Native NAC (Network Attestation Check) validation for the corten-matrix bridge.
 
-Based on the approach from [nacserver](https://github.com/JJTech0130/nacserver), ported to Rust.
+This crate generates Apple validation data using Apple's own `AAAbsintheContext`
+framework (macOS 13+), via the `nac-validation` crate, when built with the
+`native-nac` feature. There is no emulator and no relay: the bridge does NAC by
+running on a real Mac.

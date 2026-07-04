@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // This program is free software: you can redistribute it and/or modify
@@ -63,7 +63,7 @@ func isPermissionError(err error) bool {
 
 func showDialogAndOpenFDA(log zerolog.Logger) {
 	log.Warn().Msg("Full Disk Access not granted — prompting user")
-	script := `display dialog "mautrix-imessage needs Full Disk Access to read your iMessage history for backfill.\n\nClick OK to open System Settings, then enable the toggle for mautrix-imessage." with title "iMessage Bridge" buttons {"OK"} default button "OK"`
+	script := `display dialog "corten-matrix needs Full Disk Access to read your iMessage history for backfill.\n\nClick OK to open System Settings, then enable the toggle for corten-matrix." with title "iMessage Bridge" buttons {"OK"} default button "OK"`
 	exec.Command("osascript", "-e", script).Run()
 	exec.Command("open", "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles").Run()
 }

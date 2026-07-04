@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // This program is free software: you can redistribute it and/or modify
@@ -15,8 +15,8 @@ import (
 	"github.com/rs/zerolog"
 	log "maunium.net/go/maulogger/v2"
 
-	"github.com/lrhodin/imessage/imessage"
-	"github.com/lrhodin/imessage/ipc"
+	"github.com/lrhodin/corten-matrix/imessage"
+	"github.com/lrhodin/corten-matrix/ipc"
 )
 
 // bridgeAdapter satisfies the legacy imessage.Bridge interface so the

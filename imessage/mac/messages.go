@@ -1,6 +1,6 @@
 //go:build darwin
 
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2022 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -32,7 +32,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	_ "github.com/mattn/go-sqlite3"
 
-	"github.com/lrhodin/imessage/imessage"
+	"github.com/lrhodin/corten-matrix/imessage"
 )
 
 const baseMessagesQuery = `
@@ -531,8 +531,16 @@ func (mac *macOSDatabase) GetGroupAvatar(chatID string) (*imessage.Attachment, e
 }
 
 func (mac *macOSDatabase) Stop() {
-	mac.stopWatching <- struct{}{}
-	mac.stopWakeupDetecting <- struct{}{}
+	// The stop channels are only created by Start() / ListenWakeup(). The
+	// connector opens chat.db for queries only and never calls Start(), so
+	// without these guards the sends below block forever on nil channels,
+	// hanging IMClient.Disconnect() indefinitely (#56).
+	if mac.stopWatching != nil {
+		mac.stopWatching <- struct{}{}
+	}
+	if mac.stopWakeupDetecting != nil {
+		mac.stopWakeupDetecting <- struct{}{}
+	}
 	mac.stopWait.Wait()
 }
 

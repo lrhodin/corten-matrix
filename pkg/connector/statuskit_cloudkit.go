@@ -11,7 +11,7 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"github.com/lrhodin/imessage/pkg/rustpushgo"
+	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
 )
 
 // StatusKit-CloudKit pull (bridge-side orchestration).

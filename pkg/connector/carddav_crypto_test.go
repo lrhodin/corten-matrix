@@ -61,7 +61,7 @@ func TestDecryptWithWrongKey(t *testing.T) {
 	}
 
 	// Overwrite key file with different key
-	keyPath := filepath.Join(tmpDir, "mautrix-imessage", cardDAVKeyFileName)
+	keyPath := filepath.Join(tmpDir, "corten-matrix", cardDAVKeyFileName)
 	newKey := make([]byte, 32)
 	for i := range newKey {
 		newKey[i] = byte(i)
@@ -110,7 +110,7 @@ func TestLoadCardDAVKey_WrongSize(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", tmpDir)
 
-	dir := filepath.Join(tmpDir, "mautrix-imessage")
+	dir := filepath.Join(tmpDir, "corten-matrix")
 	os.MkdirAll(dir, 0700)
 	os.WriteFile(filepath.Join(dir, cardDAVKeyFileName), []byte("too-short"), 0600)
 
@@ -133,7 +133,7 @@ func TestLoadCardDAVKey_Missing(t *testing.T) {
 func TestCardDAVKeyDir_XDGSet(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", "/tmp/test-xdg")
 	got := cardDAVKeyDir()
-	want := "/tmp/test-xdg/mautrix-imessage"
+	want := "/tmp/test-xdg/corten-matrix"
 	if got != want {
 		t.Errorf("cardDAVKeyDir() = %q, want %q", got, want)
 	}
@@ -143,7 +143,7 @@ func TestCardDAVKeyDir_XDGUnset(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", "")
 	got := cardDAVKeyDir()
 	home, _ := os.UserHomeDir()
-	want := filepath.Join(home, ".local", "share", "mautrix-imessage")
+	want := filepath.Join(home, ".local", "share", "corten-matrix")
 	if got != want {
 		t.Errorf("cardDAVKeyDir() = %q, want %q", got, want)
 	}
@@ -162,7 +162,7 @@ func TestGenerateCardDAVKey(t *testing.T) {
 	}
 
 	// Verify file was written
-	keyPath := filepath.Join(tmpDir, "mautrix-imessage", cardDAVKeyFileName)
+	keyPath := filepath.Join(tmpDir, "corten-matrix", cardDAVKeyFileName)
 	fileKey, err := os.ReadFile(keyPath)
 	if err != nil {
 		t.Fatalf("key file read error: %v", err)

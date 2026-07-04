@@ -850,11 +850,6 @@ RustBuffer uniffi_rustpushgo_fn_method_wrappedosconfig_get_device_id(
 	RustCallStatus* out_status
 );
 
-int8_t uniffi_rustpushgo_fn_method_wrappedosconfig_requires_nac_relay(
-	void* ptr,
-	RustCallStatus* out_status
-);
-
 void uniffi_rustpushgo_fn_free_wrappedpasswordsclient(
 	void* ptr,
 	RustCallStatus* out_status
@@ -1989,10 +1984,6 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedosconfig_get_device_id(
 	RustCallStatus* out_status
 );
 
-uint16_t uniffi_rustpushgo_checksum_method_wrappedosconfig_requires_nac_relay(
-	RustCallStatus* out_status
-);
-
 uint16_t uniffi_rustpushgo_checksum_method_wrappedpasswordsclient_accept_invite(
 	RustCallStatus* out_status
 );
@@ -2198,10 +2189,6 @@ uint16_t uniffi_rustpushgo_checksum_method_statuscallback_on_keys_received(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_statuscallback_on_reshare_sender(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_statuscallback_on_status_decrypt_failed(
 	RustCallStatus* out_status
 );
 

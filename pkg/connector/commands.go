@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // This program is free software: you can redistribute it and/or modify
@@ -34,7 +34,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/id"
 
-	"github.com/lrhodin/imessage/imessage"
+	"github.com/lrhodin/corten-matrix/imessage"
 )
 
 // Help sections for Apple-service commands added by this bridge. Orders slot
@@ -736,7 +736,7 @@ func fnRestoreChatFromCloudKit(ce *commands.Event, login *bridgev2.UserLogin, cl
 		recoverableChats, err := client.client.ListRecoverableChats()
 		if err == nil {
 			for _, chat := range recoverableChats {
-				portalID := client.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style)
+				portalID := client.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style, chat.Service)
 				if portalID == "" || seenPortalIDs[portalID] {
 					continue
 				}
@@ -1231,7 +1231,7 @@ func fnRestoreDebug(ce *commands.Event) {
 				photo = " photo=" + g + "…"
 			}
 
-			portalID := client.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style)
+			portalID := client.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style, chat.Service)
 			cacheBackfillable := "?"
 			cacheContentful := "?"
 			if portalID != "" {
@@ -1387,7 +1387,7 @@ func fnMsgDebug(ce *commands.Event) {
 				idsTargets = append(idsTargets, altID)
 			}
 		}
-		valid := client.client.ValidateTargets(idsTargets, client.handle)
+		valid := client.validateTargetsSafe(idsTargets)
 		validSet := make(map[string]bool, len(valid))
 		for _, v := range valid {
 			validSet[v] = true

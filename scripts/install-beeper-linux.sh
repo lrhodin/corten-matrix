@@ -3,17 +3,27 @@ set -euo pipefail
 
 BINARY="$1"
 DATA_DIR="$2"
-PREBUILT_BBCTL="${3:-}"
 
 BRIDGE_NAME="${BRIDGE_NAME:-sh-imessage}"
+# Per-account systemd unit name. The first account uses the bare name; a second
+# account passes a suffixed value so the two services never collide.
+SERVICE_NAME="${SERVICE_NAME:-corten-matrix}"
+# Session/login dir root for this account. The bridge reads session.json from
+# $XDG_DATA_HOME/corten-matrix, so a second account points this at its own dir
+# and gets a fully separate login (no shared state with the first account).
+ACCOUNT_XDG="${XDG_DATA_HOME:-$HOME/.local/share}"
 
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
 
+# sudo prefix for SYSTEM-mode systemd calls. Root (e.g. LXC, where sudo often
+# isn't even installed) drives the system manager directly; a non-root sudo user
+# needs sudo to touch root-owned /etc/systemd/system and the system manager bus.
+# Mirrors the Go linuxSystemctl(): empty when uid 0, else "sudo". User-mode
+# (`systemctl --user`) calls never use this — they run as the logged-in user.
+if [ "$(id -u)" = "0" ]; then SUDO=""; else SUDO="sudo"; fi
+
 # Where we build/cache bbctl (sparse clone — only cmd/bbctl/)
-BBCTL_DIR="${BBCTL_DIR:-$HOME/.local/share/mautrix-imessage/bbctl}"
-BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/imessage.git}"
-BBCTL_BRANCH="${BBCTL_BRANCH:-master}"
 
 echo ""
 echo "═══════════════════════════════════════════════"
@@ -25,11 +35,11 @@ echo ""
 # systemctl stop prevents Restart=always from kicking in (systemd only
 # auto-restarts after process exits, not after admin stop). No need to
 # mask — masking fails when the unit file already exists on disk.
-if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
-    systemctl --user stop mautrix-imessage
+if systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+    systemctl --user stop "$SERVICE_NAME"
     echo "✓ Stopped running bridge"
-elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
-    sudo systemctl stop mautrix-imessage
+elif systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+    $SUDO systemctl stop "$SERVICE_NAME"
     echo "✓ Stopped running bridge"
 fi
 
@@ -82,77 +92,23 @@ config_token_rejected() {
     esac
 }
 
-# ── Build bbctl from source ───────────────────────────────────
-BBCTL="$BBCTL_DIR/bbctl"
-
-# Warn about old full-repo clone and offer to remove it
-OLD_BBCTL_DIR="$HOME/.local/share/mautrix-imessage/bridge-manager"
-if [ -d "$OLD_BBCTL_DIR/.git" ] && [ "$BBCTL_DIR" != "$OLD_BBCTL_DIR" ]; then
-    echo "⚠  Found old full-repo clone at $OLD_BBCTL_DIR"
-    echo "   This is no longer needed (bbctl now uses a sparse checkout)."
-    if [ -t 0 ]; then
-        read -p "   Delete it to free disk space? [Y/n]: " DEL_OLD
-        case "$DEL_OLD" in
-            [nN]*) ;;
-            *)     rm -rf "$OLD_BBCTL_DIR"
-                   echo "   ✓ Removed $OLD_BBCTL_DIR" ;;
-        esac
-    else
-        echo "   You can safely delete it: rm -rf $OLD_BBCTL_DIR"
-    fi
-fi
-
-build_bbctl() {
-    echo "Building bbctl..."
-    mkdir -p "$(dirname "$BBCTL_DIR")"
-    if [ -d "$BBCTL_DIR/.git" ]; then
-        cd "$BBCTL_DIR"
-        git fetch --quiet origin
-        git reset --hard --quiet "origin/$BBCTL_BRANCH"
-    else
-        rm -rf "$BBCTL_DIR"
-        git clone --filter=blob:none --no-checkout --quiet \
-            --branch "$BBCTL_BRANCH" "$BBCTL_REPO" "$BBCTL_DIR"
-        cd "$BBCTL_DIR"
-        git sparse-checkout init --cone
-        git checkout --quiet "$BBCTL_BRANCH"
-    fi
-    # bbctl imports pkg/imconfig, so the sparse checkout must include it too.
-    # Applied unconditionally (outside the clone branch) so existing checkouts
-    # pick it up when they update, not just fresh clones.
-    git sparse-checkout set cmd/bbctl pkg/imconfig
-    go build -o bbctl ./cmd/bbctl/ 2>&1
-    cd - >/dev/null
-    echo "✓ Built bbctl"
-}
-
-if [ -n "$PREBUILT_BBCTL" ] && [ -x "$PREBUILT_BBCTL" ]; then
-    # Install the bbctl built by `make build` into BBCTL_DIR
-    mkdir -p "$BBCTL_DIR"
-    cp "$PREBUILT_BBCTL" "$BBCTL"
-    echo "✓ Installed bbctl to $BBCTL_DIR/"
-elif [ ! -x "$BBCTL" ]; then
-    build_bbctl
-else
-    echo "✓ Found bbctl: $BBCTL"
-fi
 
 # ── Check bbctl login ────────────────────────────────────────
-WHOAMI_CHECK=$("$BBCTL" whoami 2>&1 || true)
+WHOAMI_CHECK=$("$BINARY" bbctl whoami 2>&1 || true)
 if echo "$WHOAMI_CHECK" | grep -qi "not logged in" || [ -z "$WHOAMI_CHECK" ]; then
     echo ""
     echo "Not logged into Beeper. Running bbctl login..."
     echo ""
-    "$BBCTL" login
+    "$BINARY" bbctl login
 fi
 # Capture username (discard stderr so "Fetching whoami..." doesn't contaminate)
-WHOAMI=$("$BBCTL" whoami 2>/dev/null | head -1 || true)
+WHOAMI=$("$BINARY" bbctl whoami 2>/dev/null | head -1 || true)
 # On slow machines the Beeper API may not have the username ready yet — retry
 if [ -z "$WHOAMI" ] || [ "$WHOAMI" = "null" ]; then
     for i in 1 2 3 4 5; do
         echo "  Waiting for username from Beeper API (attempt $i/5)..."
         sleep 3
-        WHOAMI=$("$BBCTL" whoami 2>/dev/null | head -1 || true)
+        WHOAMI=$("$BINARY" bbctl whoami 2>/dev/null | head -1 || true)
         [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ] && break
     done
 fi
@@ -169,7 +125,7 @@ echo "✓ Logged in: $WHOAMI"
 # If the bridge is already registered on the server but we're about to
 # generate a fresh config (no local config file), the old registration's
 # rooms would be orphaned.  Delete it first so the server cleans up rooms.
-EXISTING_BRIDGE=$("$BBCTL" whoami 2>&1 | grep "^\s*$BRIDGE_NAME " || true)
+EXISTING_BRIDGE=$("$BINARY" bbctl whoami 2>&1 | grep "^\s*$BRIDGE_NAME " || true)
 if [ -n "$EXISTING_BRIDGE" ] && [ ! -f "$CONFIG" ]; then
     echo ""
     echo "⚠  Found existing '$BRIDGE_NAME' registration on server but no local config."
@@ -180,7 +136,7 @@ if [ -n "$EXISTING_BRIDGE" ] && [ ! -f "$CONFIG" ]; then
     # a 404 means it's already deleted, and any other error is non-fatal
     # because config regeneration re-registers anyway (worst case: a few
     # orphaned rooms, far better than a failed setup).
-    if DELETE_OUT=$("$BBCTL" delete "$BRIDGE_NAME" 2>&1); then
+    if DELETE_OUT=$("$BINARY" bbctl delete "$BRIDGE_NAME" 2>&1); then
         echo "✓ Old registration cleaned up"
         echo "   Waiting for server-side deletion to complete..."
         sleep 5
@@ -204,12 +160,12 @@ if [ -f "$CONFIG" ] && [ -z "$EXISTING_BRIDGE" ]; then
     # the registration is fine.
     echo "⚠  Bridge not found in bbctl whoami — retrying in 3s to rule out transient error..."
     sleep 3
-    EXISTING_BRIDGE=$("$BBCTL" whoami 2>&1 | grep "^\s*$BRIDGE_NAME " || true)
+    EXISTING_BRIDGE=$("$BINARY" bbctl whoami 2>&1 | grep "^\s*$BRIDGE_NAME " || true)
     if [ -z "$EXISTING_BRIDGE" ]; then
         echo "⚠  Local config exists but bridge is not registered on server."
         echo "   Removing stale config and database to re-register..."
         rm -f "$CONFIG"
-        rm -f "$DATA_DIR"/mautrix-imessage.db*
+        rm -f "$DATA_DIR"/corten-matrix.db*
     else
         echo "✓ Bridge found on retry — keeping existing config and database"
     fi
@@ -223,23 +179,23 @@ fi
 # directly; if it rejects the token, drop the registration + config + DB so a
 # fresh, matching config is generated below. A still-accepted token is kept, so
 # re-running setup to change knobs leaves the working config in place.
-# (Bare metal never hits this: `make reset` wipes the whole state dir first.)
+# (Bare metal never hits this: `corten-matrix reset` wipes the whole state dir first.)
 if [ -n "${IN_DOCKER:-}" ] && [ -f "$CONFIG" ] && config_token_rejected "$CONFIG"; then
     echo "⚠  Existing config's appservice token is no longer accepted by the homeserver (M_UNKNOWN_TOKEN)."
     echo "   Regenerating config to match the current registration..."
     if [ -n "$EXISTING_BRIDGE" ]; then
-        "$BBCTL" delete "$BRIDGE_NAME" >/dev/null 2>&1 || true
+        "$BINARY" bbctl delete "$BRIDGE_NAME" >/dev/null 2>&1 || true
         sleep 3
     fi
     rm -f "$CONFIG"
-    rm -f "$DATA_DIR"/mautrix-imessage.db*
+    rm -f "$DATA_DIR"/corten-matrix.db*
 fi
 if [ -f "$CONFIG" ]; then
     echo "✓ Config already exists at $CONFIG"
 else
     echo "Generating Beeper config..."
     for attempt in 1 2 3 4 5; do
-        if "$BBCTL" config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME" 2>&1; then
+        if "$BINARY" bbctl config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME" 2>&1; then
             break
         fi
         if [ "$attempt" -eq 5 ]; then
@@ -249,10 +205,10 @@ else
         echo "  Retrying in 5s... (attempt $attempt/5)"
         sleep 5
     done
-    # Make DB path absolute — everything lives in DATA_DIR
-    sed -i "s|uri: file:mautrix-imessage.db|uri: file:$DATA_DIR/mautrix-imessage.db|" "$CONFIG"
-    # Also catch sqlite:// URIs from newer bbctl versions
-    sed -i "s|uri: sqlite:mautrix-imessage.db|uri: sqlite:$DATA_DIR/mautrix-imessage.db|" "$CONFIG"
+    # Make the DB path absolute for ANY relative filename (file: or sqlite:, any name).
+    # A relative uri makes the service crash-loop — it can't create the DB from the
+    # service working dir. Idempotent: already-absolute (leading /) uris are left alone.
+    sed -i -E "s#^([[:space:]]*uri:[[:space:]]*).*\.db.*\$#\1file:$DATA_DIR/corten-matrix.db?_txlock=immediate#" "$CONFIG"
     # iMessage CloudKit chats can have tens of thousands of messages.
     # Deliver all history in one forward batch to avoid DAG fragmentation.
     sed -i 's/max_initial_messages: [0-9]*/max_initial_messages: 2147483647/' "$CONFIG"
@@ -277,7 +233,7 @@ else
     if grep -q '"@:\|"@":\|@.*example\.com' "$CONFIG" 2>/dev/null; then
         echo ""
         echo "ERROR: Config has broken permissions and cannot determine your username."
-        echo "  Try: $BBCTL login && rm $CONFIG && re-run make install-beeper"
+        echo "  Try: $BINARY bbctl login && rm $CONFIG && re-run corten-matrix setup-beeper"
         echo ""
         exit 1
     fi
@@ -313,7 +269,7 @@ fi
 if ! grep -q "beeper" "$CONFIG" 2>/dev/null; then
     echo ""
     echo "WARNING: Config doesn't appear to contain Beeper details."
-    echo "  Try: rm $CONFIG && re-run make install-beeper"
+    echo "  Try: rm $CONFIG && re-run corten-matrix setup-beeper"
     echo ""
     exit 1
 fi
@@ -642,7 +598,7 @@ fi
 # We kill it immediately — all config questions (video, HEIC, handle) and
 # the iCloud sync gate are answered next, THEN Apple login (APNs) happens
 # at the very end so no messages are buffered before the bridge is ready.
-_SESSION_FILE_CHECK="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage/session.json"
+_SESSION_FILE_CHECK="${XDG_DATA_HOME:-$HOME/.local/share}/corten-matrix/session.json"
 if [ "$IS_FRESH_DB" = "true" ]; then
     echo ""
     echo "Initializing bridge database..."
@@ -657,17 +613,17 @@ fi
 # bbctl config posts StateStarting which makes Beeper show "Running".
 # Stopping the systemd service disconnects the websocket, which makes
 # Beeper detect it as unreachable and overrides the stale state.
-if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
-    systemctl --user stop mautrix-imessage
-elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
-    sudo systemctl stop mautrix-imessage
+if systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+    systemctl --user stop "$SERVICE_NAME"
+elif systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+    $SUDO systemctl stop "$SERVICE_NAME"
 fi
 
 # ── Check for existing login / prompt if needed ──────────────
 DB_URI=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
 NEEDS_LOGIN=false
 
-SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
+SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/corten-matrix"
 SESSION_FILE="$SESSION_DIR/session.json"
 if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
     # DB missing — check if session.json can auto-restore (has hardware_key)
@@ -988,13 +944,10 @@ fi
 # ── Write auto-update wrapper ─────────────────────────────────
 cat > "$DATA_DIR/start.sh" << HEADER_EOF
 #!/bin/bash
-BBCTL_DIR="$BBCTL_DIR"
-BBCTL_BRANCH="$BBCTL_BRANCH"
 BINARY="$BINARY"
 CONFIG="$CONFIG"
 HEADER_EOF
 cat >> "$DATA_DIR/start.sh" << 'BODY_EOF'
-BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/imessage.git}"
 
 # Extend PATH to find go
 export PATH="$PATH:/usr/local/go/bin:/opt/homebrew/bin:$HOME/go/bin"
@@ -1014,50 +967,12 @@ warn() { printf "${DIM}$(ts)${RESET}  ${YELLOW}⚠${RESET}  %s\n" "$*"; }
 
 printf "\n  ${BOLD}iMessage Bridge${RESET}\n\n"
 
-# Bootstrap sparse clone if it doesn't exist yet
-if [ ! -d "$BBCTL_DIR/.git" ] && command -v go >/dev/null 2>&1; then
-    step "Setting up bbctl sparse checkout..."
-    EXISTING_BBCTL=""
-    [ -x "$BBCTL_DIR/bbctl" ] && EXISTING_BBCTL=$(mktemp) && cp "$BBCTL_DIR/bbctl" "$EXISTING_BBCTL"
-    rm -rf "$BBCTL_DIR"
-    mkdir -p "$(dirname "$BBCTL_DIR")"
-    git clone --filter=blob:none --no-checkout --quiet \
-        --branch "$BBCTL_BRANCH" "$BBCTL_REPO" "$BBCTL_DIR"
-    git -C "$BBCTL_DIR" sparse-checkout init --cone
-    git -C "$BBCTL_DIR" sparse-checkout set cmd/bbctl pkg/imconfig
-    git -C "$BBCTL_DIR" checkout --quiet "$BBCTL_BRANCH"
-    (cd "$BBCTL_DIR" && go build -o bbctl ./cmd/bbctl/ 2>&1) | sed 's/^/  /'
-    [ -n "$EXISTING_BBCTL" ] && rm -f "$EXISTING_BBCTL"
-    ok "bbctl ready"
-fi
-
-if [ -d "$BBCTL_DIR/.git" ] && command -v go >/dev/null 2>&1; then
-    git -C "$BBCTL_DIR" fetch origin --quiet 2>/dev/null || true
-    LOCAL=$(git -C "$BBCTL_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
-    REMOTE=$(git -C "$BBCTL_DIR" rev-parse --short "origin/$BBCTL_BRANCH" 2>/dev/null || echo "unknown")
-    if [ "$LOCAL" != "$REMOTE" ] && [ "$LOCAL" != "unknown" ] && [ "$REMOTE" != "unknown" ]; then
-        step "Updating bbctl  $LOCAL → $REMOTE"
-        T0=$(date +%s)
-        git -C "$BBCTL_DIR" reset --hard "origin/$BBCTL_BRANCH" --quiet
-        git -C "$BBCTL_DIR" sparse-checkout set cmd/bbctl pkg/imconfig
-        step "Building bbctl..."
-        (cd "$BBCTL_DIR" && go build -o bbctl ./cmd/bbctl/ 2>&1) | sed 's/^/  /'
-        T1=$(date +%s)
-        ok "bbctl updated  ($(( T1 - T0 ))s)"
-    else
-        ok "bbctl $LOCAL"
-    fi
-elif [ -d "$BBCTL_DIR/.git" ]; then
-    warn "go not found — skipping bbctl update"
-fi
-
 # Fix permissions before starting — the config upgrader may have replaced
 # the user's permissions with example.com defaults on a previous run.
 # Detects: empty username (@:, @":), example.com defaults, wildcard relay.
 if grep -q '"@:\|"@":\|@.*example\.com\|"\*":.*relay' "$CONFIG" 2>/dev/null; then
-    BBCTL_BIN="$BBCTL_DIR/bbctl"
-    if [ -x "$BBCTL_BIN" ]; then
-        FIX_USER=$("$BBCTL_BIN" whoami 2>/dev/null | head -1 || true)
+    if command -v "$BINARY" >/dev/null 2>&1; then
+        FIX_USER=$("$BINARY" bbctl whoami 2>/dev/null | head -1 || true)
         if [ -n "$FIX_USER" ] && [ "$FIX_USER" != "null" ]; then
             FIX_MXID="@${FIX_USER}:beeper.com"
             sed -i '/permissions:/,/^[^ ]/{
@@ -1099,7 +1014,7 @@ if [ "$IS_FRESH_DB" = "true" ] && [ "$_ck_backfill" = "true" ] && [ "$_ck_source
         [yY]*) echo "✓ Starting bridge" ;;
         *)
             echo ""
-            echo "Re-run 'make install-beeper' after syncing iCloud Messages."
+            echo "Re-run 'corten-matrix setup-beeper' after syncing iCloud Messages."
             exit 0
             ;;
     esac
@@ -1114,10 +1029,10 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     echo "└─────────────────────────────────────────────────┘"
     echo ""
     # Stop the bridge if running (otherwise it holds the DB lock)
-    if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
-        systemctl --user stop mautrix-imessage
-    elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
-        sudo systemctl stop mautrix-imessage
+    if systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+        systemctl --user stop "$SERVICE_NAME"
+    elif systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+        $SUDO systemctl stop "$SERVICE_NAME"
     fi
 
     if [ "${FORCE_CLEAR_STATE:-false}" = "true" ]; then
@@ -1143,10 +1058,10 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
 fi
 
 # ── Stop bridge before applying config changes ────────────────
-if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
-    systemctl --user stop mautrix-imessage
-elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
-    sudo systemctl stop mautrix-imessage
+if systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+    systemctl --user stop "$SERVICE_NAME"
+elif systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+    $SUDO systemctl stop "$SERVICE_NAME"
 fi
 
 if [ -z "${IN_DOCKER:-}" ]; then
@@ -1157,74 +1072,20 @@ if [ -z "${IN_DOCKER:-}" ]; then
 # default to --user (the common path for non-root installs).
 _SHORTCUT_SYSCTL=""
 _SHORTCUT_JCTL=""
-if systemctl --user list-unit-files mautrix-imessage.service 2>/dev/null | grep -q mautrix-imessage; then
+if systemctl --user list-unit-files "$SERVICE_NAME.service" 2>/dev/null | grep -q "$SERVICE_NAME"; then
     _SHORTCUT_SYSCTL="systemctl --user"
     _SHORTCUT_JCTL="journalctl --user"
-elif systemctl list-unit-files mautrix-imessage.service 2>/dev/null | grep -q mautrix-imessage; then
-    _SHORTCUT_SYSCTL="sudo systemctl"
-    _SHORTCUT_JCTL="sudo journalctl"
+elif systemctl list-unit-files "$SERVICE_NAME.service" 2>/dev/null | grep -q "$SERVICE_NAME"; then
+    _SHORTCUT_SYSCTL="${SUDO:+$SUDO }systemctl"
+    _SHORTCUT_JCTL="${SUDO:+$SUDO }journalctl"
 else
     _SHORTCUT_SYSCTL="systemctl --user"
     _SHORTCUT_JCTL="journalctl --user"
 fi
 
 echo ""
-echo "Want easy commands you can type from any terminal to control the bridge?"
-echo "  start-imessage     stop-imessage     restart-imessage     imessage-log"
-read -r -p "Add them? [y/N]: " _shortcut_ans
-case "$_shortcut_ans" in
-    [yY]|[yY][eE][sS])
-        case "$SHELL" in
-            */zsh)  RC_FILE="$HOME/.zshrc" ;;
-            */bash) RC_FILE="$HOME/.bashrc" ;;
-            *)      RC_FILE="" ;;
-        esac
-        if [ -z "$RC_FILE" ]; then
-            echo "  Couldn't detect your shell from \$SHELL ($SHELL) — skipping. (Bash and Zsh are supported.)"
-        else
-            MARKER_START="# >>> mautrix-imessage shortcuts (managed) >>>"
-            MARKER_END="# <<< mautrix-imessage shortcuts (managed) <<<"
-            if [ -f "$RC_FILE" ] && grep -qF "$MARKER_START" "$RC_FILE"; then
-                awk -v s="$MARKER_START" -v e="$MARKER_END" '
-                    $0 == s { skip = 1; next }
-                    $0 == e { skip = 0; next }
-                    !skip   { print }
-                ' "$RC_FILE" > "$RC_FILE.tmp" && mv "$RC_FILE.tmp" "$RC_FILE"
-            fi
-            cat >> "$RC_FILE" <<EOF
-$MARKER_START
-alias start-imessage='$_SHORTCUT_SYSCTL start mautrix-imessage'
-alias stop-imessage='$_SHORTCUT_SYSCTL stop mautrix-imessage'
-alias restart-imessage='$_SHORTCUT_SYSCTL restart mautrix-imessage'
-alias imessage-log='$_SHORTCUT_JCTL -u mautrix-imessage -f'
-$MARKER_END
-EOF
-            echo "  ✓ Shortcuts added. Open a new terminal (or run \`source $RC_FILE\` here) and you can type:"
-            echo "      start-imessage   stop-imessage   restart-imessage   imessage-log"
-        fi
-        ;;
-    *)
-        # User declined. If a previous run installed shortcuts, treat the
-        # decline as "remove them" so the rc file matches the user's choice.
-        case "$SHELL" in
-            */zsh)  RC_FILE="$HOME/.zshrc" ;;
-            */bash) RC_FILE="$HOME/.bashrc" ;;
-            *)      RC_FILE="" ;;
-        esac
-        MARKER_START="# >>> mautrix-imessage shortcuts (managed) >>>"
-        MARKER_END="# <<< mautrix-imessage shortcuts (managed) <<<"
-        if [ -n "$RC_FILE" ] && [ -f "$RC_FILE" ] && grep -qF "$MARKER_START" "$RC_FILE"; then
-            awk -v s="$MARKER_START" -v e="$MARKER_END" '
-                $0 == s { skip = 1; next }
-                $0 == e { skip = 0; next }
-                !skip   { print }
-            ' "$RC_FILE" > "$RC_FILE.tmp" && mv "$RC_FILE.tmp" "$RC_FILE"
-            echo "  Removed previously-installed shortcuts from $RC_FILE."
-        else
-            echo "  Skipped — re-run this installer to add them later."
-        fi
-        ;;
-esac
+echo ""
+echo "Tip: control the bridge with:  corten-matrix start | stop | restart | logs"
 echo ""
 fi  # IN_DOCKER gate — shortcuts block
 
@@ -1311,8 +1172,8 @@ if [ -z "${IN_DOCKER:-}" ]; then
 # Detect whether systemd user sessions work. In containers (LXC) or when
 # running as root, the user instance is often unavailable — fall back to a
 # system-level service in that case.
-USER_SERVICE_FILE="$HOME/.config/systemd/user/mautrix-imessage.service"
-SYSTEM_SERVICE_FILE="/etc/systemd/system/mautrix-imessage.service"
+USER_SERVICE_FILE="$HOME/.config/systemd/user/$SERVICE_NAME.service"
+SYSTEM_SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
 
 if command -v systemctl >/dev/null 2>&1; then
     if systemctl --user status >/dev/null 2>&1; then
@@ -1335,13 +1196,14 @@ install_systemd_user() {
     mkdir -p "$(dirname "$USER_SERVICE_FILE")"
     cat > "$USER_SERVICE_FILE" << EOF
 [Unit]
-Description=mautrix-imessage bridge (Beeper)
+Description=corten-matrix bridge (Beeper)
 After=network.target
 
 [Service]
 Type=simple
 WorkingDirectory=$DATA_DIR
-ExecStart=/bin/bash $DATA_DIR/start.sh
+Environment=XDG_DATA_HOME=$ACCOUNT_XDG
+ExecStart=$BINARY bridge-all
 Restart=always
 RestartSec=5
 # Headroom for busy/heavy-message bridges; the binary also raises this at
@@ -1352,20 +1214,24 @@ LimitNOFILE=65536
 WantedBy=default.target
 EOF
     systemctl --user daemon-reload
-    systemctl --user enable mautrix-imessage
+    systemctl --user enable "$SERVICE_NAME"
 }
 
 install_systemd_system() {
-    cat > "$SYSTEM_SERVICE_FILE" << EOF
+    # $SUDO (defined near the top) is empty for root/LXC, "sudo" otherwise. This
+    # is the path that failed for a non-root sudo user with "Permission denied"
+    # on the heredoc redirect into root-owned /etc/systemd/system.
+    $SUDO tee "$SYSTEM_SERVICE_FILE" >/dev/null << EOF
 [Unit]
-Description=mautrix-imessage bridge (Beeper)
+Description=corten-matrix bridge (Beeper)
 After=network.target
 
 [Service]
 Type=simple
 User=$USER
 WorkingDirectory=$DATA_DIR
-ExecStart=/bin/bash $DATA_DIR/start.sh
+Environment=XDG_DATA_HOME=$ACCOUNT_XDG
+ExecStart=$BINARY bridge-all
 Restart=always
 RestartSec=5
 # Headroom for busy/heavy-message bridges; the binary also raises this at
@@ -1375,14 +1241,24 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable mautrix-imessage
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable "$SERVICE_NAME"
 }
 
-if [ "$SYSTEMD_MODE" = "user" ]; then
+if [ -n "${CORTEN_SKIP_SERVICE:-}" ]; then
+    # Second account: ONE shared corten-matrix service runs BOTH bridges
+    # (ExecStart=corten-matrix bridge-all), so don't install a separate unit for it.
+    echo "✓ Second account configured — runs under the shared corten-matrix service"
+elif [ -n "${CORTEN_DEFER_START:-}" ]; then
+    # Orchestrator-driven (pkg/cli): install/enable the unit (hard dep) but don't
+    # start — the Go CLI starts every account together after the 2nd-account prompt.
+    [ "$SYSTEMD_MODE" = "user" ] && install_systemd_user
+    [ "$SYSTEMD_MODE" = "system" ] && install_systemd_system
+    echo "✓ Account configured (service installed)"
+elif [ "$SYSTEMD_MODE" = "user" ]; then
     if [ -f "$USER_SERVICE_FILE" ]; then
         install_systemd_user
-        systemctl --user restart mautrix-imessage
+        systemctl --user restart "$SERVICE_NAME"
         echo "✓ Bridge restarted"
     else
         echo ""
@@ -1390,14 +1266,14 @@ if [ "$SYSTEMD_MODE" = "user" ]; then
         case "$answer" in
             [nN]*) ;;
             *)     install_systemd_user
-                   systemctl --user start mautrix-imessage
+                   systemctl --user start "$SERVICE_NAME"
                    echo "✓ Bridge started (systemd user service installed)" ;;
         esac
     fi
 elif [ "$SYSTEMD_MODE" = "system" ]; then
     if [ -f "$SYSTEM_SERVICE_FILE" ]; then
         install_systemd_system
-        systemctl restart mautrix-imessage
+        $SUDO systemctl restart "$SERVICE_NAME"
         echo "✓ Bridge restarted"
     else
         echo ""
@@ -1406,7 +1282,7 @@ elif [ "$SYSTEMD_MODE" = "system" ]; then
         case "$answer" in
             [nN]*) ;;
             *)     install_systemd_system
-                   systemctl start mautrix-imessage
+                   $SUDO systemctl start "$SERVICE_NAME"
                    echo "✓ Bridge started (system service installed)" ;;
         esac
     fi
@@ -1423,18 +1299,30 @@ echo "  Binary: $BINARY"
 echo "  Config: $CONFIG"
 echo ""
 if [ "${SYSTEMD_MODE:-none}" = "user" ] && [ -f "${USER_SERVICE_FILE:-}" ]; then
-    echo "  Status:  systemctl --user status mautrix-imessage"
-    echo "  Logs:    journalctl --user -u mautrix-imessage -f"
-    echo "  Stop:    systemctl --user stop mautrix-imessage"
-    echo "  Restart: systemctl --user restart mautrix-imessage"
+    echo "  Status:  systemctl --user status $SERVICE_NAME"
+    echo "  Logs:    journalctl --user -u $SERVICE_NAME -f"
+    echo "  Stop:    systemctl --user stop $SERVICE_NAME"
+    echo "  Restart: systemctl --user restart $SERVICE_NAME"
 elif [ "${SYSTEMD_MODE:-none}" = "system" ] && [ -f "${SYSTEM_SERVICE_FILE:-}" ]; then
-    echo "  Status:  systemctl status mautrix-imessage"
-    echo "  Logs:    journalctl -u mautrix-imessage -f"
-    echo "  Stop:    systemctl stop mautrix-imessage"
-    echo "  Restart: systemctl restart mautrix-imessage"
+    echo "  Status:  systemctl status $SERVICE_NAME"
+    echo "  Logs:    journalctl -u $SERVICE_NAME -f"
+    echo "  Stop:    systemctl stop $SERVICE_NAME"
+    echo "  Restart: systemctl restart $SERVICE_NAME"
 else
     echo "  Run manually:"
     echo "    cd $(dirname "$CONFIG") && $BINARY -c $CONFIG"
 fi
 echo ""
 
+
+# ── Add to PATH (optional; symlink only, no shell-rc edits) ────
+if [ -t 0 ] && ! command -v corten-matrix >/dev/null 2>&1; then
+    printf "\nAdd 'corten-matrix' to your PATH (symlink in /usr/local/bin)? [Y/n]: "
+    read ADD_PATH
+    case "$ADD_PATH" in
+        [nN]*) ;;
+        *) sudo ln -sf "$BINARY" /usr/local/bin/corten-matrix 2>/dev/null \
+             && echo "OK - corten-matrix added to PATH" \
+             || echo "  Couldn't symlink. Run: sudo ln -sf $BINARY /usr/local/bin/corten-matrix" ;;
+    esac
+fi

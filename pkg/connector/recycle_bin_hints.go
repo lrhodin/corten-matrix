@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/lrhodin/imessage/pkg/rustpushgo"
+	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
 )
 
 type recoverableMessageMetadata struct {

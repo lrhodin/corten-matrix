@@ -3,11 +3,11 @@
 # Full bridge reset: delete Beeper registration, wipe ALL local state.
 # You will need to re-login (2FA) after reset.
 #
-# Usage: make reset   (run interactively — prompts for confirmation)
+# Usage: corten-matrix reset   (run interactively — prompts for confirmation)
 #
 set -euo pipefail
 
-STATE_DIR="$HOME/.local/share/mautrix-imessage"
+STATE_DIR="$HOME/.local/share/corten-matrix"
 BRIDGE_NAME="sh-imessage"
 UNAME_S=$(uname -s)
 BBCTL="$STATE_DIR/bridge-manager/bbctl"
@@ -21,14 +21,14 @@ fi
 # ── Stop the bridge ──────────────────────────────────────────
 echo "Stopping bridge..."
 if [ "$UNAME_S" = "Darwin" ]; then
-    BUNDLE_ID="${1:-com.lrhodin.mautrix-imessage}"
+    BUNDLE_ID="${1:-com.lrhodin.corten-matrix}"
     launchctl unload "$HOME/Library/LaunchAgents/$BUNDLE_ID.plist" 2>/dev/null || true
 else
-    systemctl --user stop mautrix-imessage 2>/dev/null || true
+    systemctl --user stop corten-matrix 2>/dev/null || true
 fi
 
 sleep 1
-if pgrep -f mautrix-imessage-v2 >/dev/null 2>&1; then
+if pgrep -f corten-matrix >/dev/null 2>&1; then
     echo "ERROR: bridge process still running after stop"
     exit 1
 fi
@@ -54,8 +54,8 @@ fi
 echo ""
 echo "Clearing bridge journal logs..."
 if [ "$UNAME_S" != "Darwin" ]; then
-    journalctl --user --unit=mautrix-imessage --rotate 2>/dev/null || true
-    journalctl --user --unit=mautrix-imessage --vacuum-time=1s 2>/dev/null || true
+    journalctl --user --unit=corten-matrix --rotate 2>/dev/null || true
+    journalctl --user --unit=corten-matrix --vacuum-time=1s 2>/dev/null || true
     echo "✓ Logs cleared"
 else
     echo "  (macOS — logs managed by launchd, skipping)"
@@ -78,4 +78,4 @@ echo ""
 echo "✓ Bridge fully reset."
 echo "  All state wiped — you will need to re-login (2FA)."
 echo ""
-echo "  Run 'make install-beeper' to re-register, login, and start the bridge."
+echo "  Run 'corten-matrix setup-beeper' to re-register, login, and start the bridge."

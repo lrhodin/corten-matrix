@@ -1,4 +1,4 @@
-// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,15 +13,16 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/rs/zerolog"
 
-	"github.com/lrhodin/imessage/pkg/rustpushgo"
+	"github.com/lrhodin/corten-matrix/pkg/rustpushgo"
 )
 
 // PersistedSessionState holds all the session data that needs to survive
 // database resets (DB deletion, config wipes, etc.). Persisted to a JSON file
-// at ~/.local/share/mautrix-imessage/session.json.
+// at ~/.local/share/corten-matrix/session.json.
 //
 // On re-authentication, the bridge reads this file to reuse:
 //   - IDSIdentity: cryptographic device keys (avoids new key generation)
@@ -51,10 +52,14 @@ type PersistedSessionState struct {
 
 	// Cached MobileMe delegate for seeding on restore
 	MmeDelegateJSON string `json:"mme_delegate_json,omitempty"`
+
+	// Opaque IDS delivery-key cache (base64). Bookkeeping that rides alongside
+	// the registration data and is preserved across saves (see saveSessionState).
+	IDSKeyCache string `json:"ids_key_cache,omitempty"`
 }
 
 // sessionFilePath returns the path to the persisted session state file:
-// ~/.local/share/mautrix-imessage/session.json
+// ~/.local/share/corten-matrix/session.json
 func sessionFilePath() (string, error) {
 	dataDir := os.Getenv("XDG_DATA_HOME")
 	if dataDir == "" {
@@ -64,11 +69,11 @@ func sessionFilePath() (string, error) {
 		}
 		dataDir = filepath.Join(home, ".local", "share")
 	}
-	return filepath.Join(dataDir, "mautrix-imessage", "session.json"), nil
+	return filepath.Join(dataDir, "corten-matrix", "session.json"), nil
 }
 
 // legacyIdentityFilePath returns the old v1 identity file path for migration:
-// ~/.local/share/mautrix-imessage/identity.plist
+// ~/.local/share/corten-matrix/identity.plist
 func legacyIdentityFilePath() (string, error) {
 	dataDir := os.Getenv("XDG_DATA_HOME")
 	if dataDir == "" {
@@ -78,11 +83,11 @@ func legacyIdentityFilePath() (string, error) {
 		}
 		dataDir = filepath.Join(home, ".local", "share")
 	}
-	return filepath.Join(dataDir, "mautrix-imessage", "identity.plist"), nil
+	return filepath.Join(dataDir, "corten-matrix", "identity.plist"), nil
 }
 
 // trustedPeersFilePath returns the keychain trust state path:
-// ~/.local/share/mautrix-imessage/trustedpeers.plist
+// ~/.local/share/corten-matrix/trustedpeers.plist
 func trustedPeersFilePath() (string, error) {
 	dataDir := os.Getenv("XDG_DATA_HOME")
 	if dataDir == "" {
@@ -92,7 +97,7 @@ func trustedPeersFilePath() (string, error) {
 		}
 		dataDir = filepath.Join(home, ".local", "share")
 	}
-	return filepath.Join(dataDir, "mautrix-imessage", "trustedpeers.plist"), nil
+	return filepath.Join(dataDir, "corten-matrix", "trustedpeers.plist"), nil
 }
 
 // hasKeychainCliqueState returns true if trustedpeers.plist appears to contain
@@ -116,9 +121,22 @@ func hasKeychainCliqueState(log zerolog.Logger) bool {
 	return false
 }
 
-// saveSessionState writes the full session state to the JSON file.
-// Creates parent directories if needed. Errors are logged but not fatal.
+// sessionStateMu serializes read-modify-write of session.json across the bridge.
+// Several code paths persist it (login, registration/auth events, periodic state
+// updates). os.WriteFile is not atomic across concurrent writers, so without this
+// two saves could interleave into corrupt JSON or clobber each other's fields.
+var sessionStateMu sync.Mutex
+
+// saveSessionState writes the full session state to the JSON file (locked).
 func saveSessionState(log zerolog.Logger, state PersistedSessionState) {
+	sessionStateMu.Lock()
+	defer sessionStateMu.Unlock()
+	saveSessionStateLocked(log, state)
+}
+
+// saveSessionStateLocked is saveSessionState without the lock; callers must hold
+// sessionStateMu. Creates parent directories if needed. Errors are logged, not fatal.
+func saveSessionStateLocked(log zerolog.Logger, state PersistedSessionState) {
 	path, err := sessionFilePath()
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to determine session file path, skipping save")
@@ -127,6 +145,18 @@ func saveSessionState(log zerolog.Logger, state PersistedSessionState) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		log.Warn().Err(err).Str("path", path).Msg("Failed to create session file directory")
 		return
+	}
+	// Preserve the opaque IDS key cache across saves. Callers that rebuild the
+	// struct from login metadata don't carry it, so re-read it from the existing
+	// file when the incoming state doesn't set it — otherwise every metadata-
+	// driven save would drop the cached blob.
+	if state.IDSKeyCache == "" {
+		if existing, rerr := os.ReadFile(path); rerr == nil && len(existing) > 0 {
+			var prev PersistedSessionState
+			if json.Unmarshal(existing, &prev) == nil {
+				state.IDSKeyCache = prev.IDSKeyCache
+			}
+		}
 	}
 	data, err := json.Marshal(state)
 	if err != nil {
@@ -148,6 +178,14 @@ func saveSessionState(log zerolog.Logger, state PersistedSessionState) {
 // Falls back to the legacy identity.plist file (v1 format) if the new file
 // doesn't exist. Returns a zero-value struct if nothing is found.
 func loadSessionState(log zerolog.Logger) PersistedSessionState {
+	sessionStateMu.Lock()
+	defer sessionStateMu.Unlock()
+	return loadSessionStateLocked(log)
+}
+
+// loadSessionStateLocked is loadSessionState without the lock; callers must hold
+// sessionStateMu.
+func loadSessionStateLocked(log zerolog.Logger) PersistedSessionState {
 	// Try new JSON format first
 	path, err := sessionFilePath()
 	if err != nil {
@@ -182,8 +220,8 @@ func loadSessionState(log zerolog.Logger) PersistedSessionState {
 	state := PersistedSessionState{
 		IDSIdentity: string(legacyData),
 	}
-	// Migrate: save in new format and remove old file
-	saveSessionState(log, state)
+	// Migrate: save in new format and remove old file (already under the lock)
+	saveSessionStateLocked(log, state)
 	_ = os.Remove(legacyPath)
 	return state
 }

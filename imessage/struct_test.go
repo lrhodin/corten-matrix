@@ -10,7 +10,7 @@ import (
 	"github.com/rs/zerolog"
 	log "maunium.net/go/maulogger/v2"
 
-	"github.com/lrhodin/imessage/ipc"
+	"github.com/lrhodin/corten-matrix/ipc"
 )
 
 type testBridge struct {
