@@ -1926,12 +1926,42 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		//   (3) mailto: portal itself as absolute last resort
 		var portal *bridgev2.Portal
 
+		// Self-presence first: Apple publishes the account's own Focus changes
+		// on the account's own StatusKit channel, and the sender alias attached
+		// can be ANY registered handle of the account — including "reachable
+		// at" aliases that never appear in any chat (observed live: a
+		// registered number the user didn't recognize). The peer-resolution
+		// chain below can only ever land on a peer DM, so a self alias that
+		// doesn't match the self-chat portal's key was dropped as "no DM
+		// portal" — making the self-chat moon silently depend on WHICH alias
+		// Apple picked after each restart. Route every self handle straight to
+		// the self-chat portal instead.
+		isSelf := c.isMyHandle(user)
+		if isSelf {
+			for _, h := range c.allHandles {
+				pid := c.resolveExistingDMPortalID(normalizeIdentifierForPortalID(h))
+				if p := findPortal(pid); p != nil {
+					portal = p
+					log.Info().Str("portal_id", logSafeHandle(string(p.ID))).
+						Msg("StatusKit: self presence — routed to self-chat portal")
+					break
+				}
+			}
+			if portal == nil {
+				log.Debug().Msg("StatusKit: self presence but no self-chat portal exists — dropping")
+				return
+			}
+		}
+
 		// (0) Fast path: check the learned sender→portal cache first. This
 		// is populated from every inbound message, so any peer who has
 		// messaged bridge has a direct mapping here that doesn't depend on
 		// iCloud CardDAV contact completeness (the common failure mode for
 		// reshare correlation).
 		for _, key := range [2]string{user, normalizedUser} {
+			if portal != nil {
+				break
+			}
 			if key == "" {
 				continue
 			}
@@ -2026,7 +2056,7 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 
 		if portal == nil || portal.MXID == "" {
 			log.Warn().
-				Str("user", normalizedUser).
+				Str("user", logSafeHandle(normalizedUser)).
 				Msg("StatusKit: no DM portal found for presence notice")
 			return
 		}
@@ -2076,22 +2106,33 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			// Fallback: try the original mailto: ghost.
 			ghost, err = c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(user))
 			if err != nil || ghost == nil || ghost.Intent == nil {
-				log.Warn().Err(err).Str("portal_handle", ghostHandle).Str("mailto_handle", user).
-					Msg("StatusKit: no usable ghost found — skipping notice")
-				return
+				// The self-chat has no peer, so the account's own ghost may
+				// legitimately never have materialized. The moon rides the room
+				// TITLE, which needs no ghost — skip only the Matrix presence
+				// set and fall through to the title stamp.
+				if !isSelf {
+					log.Warn().Err(err).Str("portal_handle", logSafeHandle(ghostHandle)).Str("mailto_handle", logSafeHandle(user)).
+						Msg("StatusKit: no usable ghost found — skipping notice")
+					return
+				}
+				ghost = nil
+			} else {
+				log.Debug().Str("ghost", user).Msg("StatusKit: using mailto: ghost as fallback")
 			}
-			log.Debug().Str("ghost", user).Msg("StatusKit: using mailto: ghost as fallback")
 		} else {
 			log.Debug().Str("ghost", ghostHandle).Msg("StatusKit: using portal ghost (tel:)")
 		}
 
-		// Set Matrix presence using whichever ghost we resolved.
-		if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
-			if err := asIntent.Matrix.SetPresence(ctx, mautrix.ReqPresence{
-				Presence:  presence,
-				StatusMsg: statusMsg,
-			}); err != nil {
-				log.Warn().Err(err).Msg("StatusKit: failed to set Matrix presence for ghost")
+		// Set Matrix presence using whichever ghost we resolved (nil only on
+		// the self path, where the title stamp below is all that matters).
+		if ghost != nil {
+			if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
+				if err := asIntent.Matrix.SetPresence(ctx, mautrix.ReqPresence{
+					Presence:  presence,
+					StatusMsg: statusMsg,
+				}); err != nil {
+					log.Warn().Err(err).Msg("StatusKit: failed to set Matrix presence for ghost")
+				}
 			}
 		}
 
