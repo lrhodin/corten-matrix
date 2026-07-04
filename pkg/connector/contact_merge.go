@@ -74,7 +74,8 @@ func (c *IMClient) resolveSendTarget(portalID string) (target string) {
 	}
 
 	contact := c.lookupContact(portalID)
-	if contact == nil || len(contactPortalIDs(contact)) <= 1 {
+	altIDs := contactPortalIDs(contact)
+	if contact == nil || len(altIDs) <= 1 {
 		return portalID
 	}
 	// ValidateTargets crosses into the identity-manager FFI path. Upstream
@@ -89,33 +90,70 @@ func (c *IMClient) resolveSendTarget(portalID string) (target string) {
 		}
 	}()
 
-	valid := c.client.ValidateTargets([]string{portalID}, c.handle)
-	if len(valid) > 0 {
-		return portalID
+	candidates := make([]string, 0, len(altIDs)+1)
+	seen := make(map[string]struct{}, len(altIDs)+1)
+	addCandidate := func(id string) {
+		if id == "" {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		candidates = append(candidates, id)
+	}
+	addCandidate(portalID)
+	for _, altID := range altIDs {
+		addCandidate(altID)
 	}
 
+	valid := c.client.ValidateTargets(candidates, c.handle)
+	validSet := make(map[string]struct{}, len(valid))
+	for _, id := range valid {
+		validSet[id] = struct{}{}
+	}
+	if picked, ok := pickSendTarget(portalID, altIDs, validSet); ok {
+		if picked == portalID {
+			return portalID
+		}
+		c.UserLogin.Log.Info().
+			Str("portal_id", portalID).
+			Str("send_target", picked).
+			Int("candidates", len(candidates)).
+			Int("valid", len(valid)).
+			Msg("Resolved send target to alternate contact number")
+		return picked
+	}
+
+	if len(valid) == 0 {
+		c.UserLogin.Log.Warn().
+			Str("portal_id", portalID).
+			Int("candidates", len(candidates)).
+			Int("valid", len(valid)).
+			Msg("Contact send-target IDS lookup returned no valid handles; falling back to original portal ID")
+		return portalID
+	}
 	c.UserLogin.Log.Info().
 		Str("portal_id", portalID).
-		Msg("Portal ID not reachable on iMessage, trying alternate contact numbers")
+		Int("candidates", len(candidates)).
+		Int("valid", len(valid)).
+		Msg("No reachable contact alias matched send target candidates; falling back to original portal ID")
+	return portalID
+}
 
-	for _, altID := range contactPortalIDs(contact) {
+func pickSendTarget(portalID string, altIDs []string, validSet map[string]struct{}) (string, bool) {
+	if _, ok := validSet[portalID]; ok {
+		return portalID, true
+	}
+	for _, altID := range altIDs {
 		if altID == portalID {
 			continue
 		}
-		valid := c.client.ValidateTargets([]string{altID}, c.handle)
-		if len(valid) > 0 {
-			c.UserLogin.Log.Info().
-				Str("portal_id", portalID).
-				Str("send_target", altID).
-				Msg("Resolved send target to alternate contact number")
-			return altID
+		if _, ok := validSet[altID]; ok {
+			return altID, true
 		}
 	}
-
-	c.UserLogin.Log.Warn().
-		Str("portal_id", portalID).
-		Msg("No reachable number found for contact")
-	return portalID
+	return portalID, false
 }
 
 // lookupContact resolves a portal/identifier string to a Contact using
@@ -233,7 +271,11 @@ func contactPortalIDs(contact *imessage.Contact) []string {
 	}
 
 	for _, email := range contact.Emails {
-		pid := "mailto:" + strings.ToLower(email)
+		email = strings.ToLower(strings.TrimSpace(email))
+		if email == "" {
+			continue
+		}
+		pid := "mailto:" + email
 		if !seen[pid] {
 			seen[pid] = true
 			ids = append(ids, pid)
