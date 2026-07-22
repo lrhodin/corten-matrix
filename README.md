@@ -128,7 +128,7 @@ The `corten-matrix` binary is both the bridge and its management CLI — it repl
 | `corten-matrix logs 1` | Tail the live bridge log; `1` = second account. |
 | `corten-matrix login` | Re-run the interactive iMessage login (Apple ID + password + 2FA, or hardware key on Linux). |
 | `corten-matrix install-service` / `uninstall-service` | Install or remove the background service without re-running full setup (`corten-matrix uninstall` is an alias of `uninstall-service`). |
-| `corten-matrix reset` | Reset bridge state (with prompts) — see the warning under [Configuration](#configuration). |
+| `corten-matrix reset` | Reset bridge state — prompts for confirmation (`--yes` to skip); see the warning under [Configuration](#configuration). |
 | `corten-matrix update` | **Official binary releases only.** Update in place to the latest release and restart — see [Updating](#updating). |
 | `corten-matrix update check` / `update force` | `check` previews the latest version + release notes without installing; `force` re-downloads and reinstalls the current release. |
 | `corten-matrix bbctl <args>` | Beeper bridge-manager CLI (register / auth / stop / delete the bridge in Beeper infra). |

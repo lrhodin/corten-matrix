@@ -715,10 +715,17 @@ func RunManagement(cmd string, args []string) {
 		}
 		runSetup(true)
 	case "reset":
+		// The script needs this binary's path: bbctl lives inside it
+		// (pkg/bbctl, run as `corten-matrix bbctl ...`), so deregistration
+		// goes through us rather than a standalone bbctl. The bundle ID is
+		// only meaningful on darwin, where the script unloads the LaunchAgent.
+		// User args (e.g. --yes) follow.
+		bundleID := ""
 		if runtime.GOOS == "darwin" {
-			runEmbeddedScript("reset-bridge.sh", cortenBundleID)
+			bundleID = cortenBundleID
 		}
-		runEmbeddedScript("reset-bridge.sh")
+		runEmbeddedScript("reset-bridge.sh",
+			append([]string{selfPath(), bundleID}, args...)...)
 	case "install-service":
 		serviceInstall()
 	case "uninstall-service", "uninstall":
