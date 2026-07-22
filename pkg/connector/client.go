@@ -1884,6 +1884,24 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	// fallback, and Matrix send — to a goroutine so this callback returns
 	// to Rust immediately and does not block the APNs receive loop.
 	go func() {
+		// This goroutine calls into the IDS FFI (ResolveHandleCached /
+		// ResolveHandle) to map a presence update onto a portal. A Rust panic
+		// surfaced by uniffi re-panics in the generated binding, and this
+		// goroutine is spawned per presence update — dropping one notice is
+		// the correct degradation, crashing the bridge is not.
+		defer func() {
+			if r := recover(); r != nil {
+				// Roll back the optimistic dedup stored above. Without this,
+				// the mode key is already committed, so a re-delivery of the
+				// same state is suppressed and this user's presence stays
+				// stale until it changes again — a panic would silently cost
+				// the update rather than just this attempt.
+				c.statusKitPresence.Delete(user)
+				c.Main.Bridge.DB.KV.Set(context.Background(), kvKeyFor(user), "")
+				log.Error().Interface("panic", r).
+					Msg("StatusKit presence handler panicked — dropping this update and clearing dedup so a re-delivery retries")
+			}
+		}()
 		ctx := context.Background()
 
 		// Apple sends available=true for both DND-on and DND-off; the mode
@@ -2526,12 +2544,34 @@ func (c *IMClient) resolveStatusPortalViaIDS(ctx context.Context, log zerolog.Lo
 
 	// Slow path: validate_targets queries Apple IDS. Can block or hang;
 	// caller is responsible for applying a timeout.
-	aliases, err := c.client.ResolveHandle(user, knownHandles)
+	aliases, err := c.resolveHandleSafe(user, knownHandles)
 	if err != nil {
 		log.Warn().Err(err).Str("user", logSafeHandle(user)).Msg("StatusKit IDS fallback: ResolveHandle failed")
 		return nil
 	}
 	return c.findPortalForAliases(ctx, log, user, aliases)
+}
+
+// resolveHandleSafe wraps Client.ResolveHandle with a recover guard, mirroring
+// validateTargetsSafe. Rust-side ids_guard isolates lookup panics before they
+// reach uniffi; this is the backstop, because a panic surfaced through the
+// generated Go binding would otherwise take the bridge down from a presence
+// update.
+func (c *IMClient) resolveHandleSafe(user string, knownHandles []string) (aliases []string, err error) {
+	if c.client == nil {
+		return nil, nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			c.UserLogin.Log.Error().Interface("panic", r).
+				Str("user", logSafeHandle(user)).
+				Int("known_handles", len(knownHandles)).
+				Msg("ResolveHandle panicked in FFI path")
+			aliases = nil
+			err = fmt.Errorf("ResolveHandle panicked: %v", r)
+		}
+	}()
+	return c.client.ResolveHandle(user, knownHandles)
 }
 
 // findPortalForAliases iterates aliases returned by IDS correlation and

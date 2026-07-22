@@ -1925,10 +1925,50 @@ func (c *IMClient) runBodyScrubLoop(log zerolog.Logger, stopChan <-chan struct{}
 }
 
 func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
-	// NOTE: no defer recover() here intentionally. A panic in this goroutine
-	// must crash the process so the bridge restarts and re-runs CloudKit sync.
-	// Swallowing the panic would leave setCloudSyncDone() uncalled, permanently
-	// blocking the APNs message buffer and dropping all incoming messages.
+	// This goroutine used to run without a recover on purpose: a panic here
+	// leaves setCloudSyncDone() uncalled, which permanently blocks the APNs
+	// message buffer and silently drops every incoming message — worse than
+	// crashing, since a crash at least restarts into a working bridge.
+	//
+	// That reasoning holds only while the crash is rare. It is not: a single
+	// unanswerable IDS handle in the alias-link pass (statuskit_cloudkit.go
+	// calls batchLinkStatusKitAliases at the end of every StatusKit-CloudKit
+	// pass) took this goroutine down ~3m30s into every boot on an affected
+	// install — six consecutive runs, none longer than 3m34s.
+	//
+	// Precisely, per those logs: bootstrap DID complete (~80s in, gate open,
+	// messages flowing) and the panic landed ~2 minutes later in the
+	// delayed-resync loop. So the cost of the old behavior was not "no
+	// messages" — it was killing a working bridge over a best-effort
+	// background pass, and losing every subsequent resync until a human
+	// restarted it (observed gaps between runs: 10-73 minutes, with no
+	// supervisor to restart after the last crash).
+	//
+	// So recover — but ONLY after the gate is already open. There is a second
+	// invariant (see the bootstrap note below, ~line 2010): cloudSyncDone must
+	// NOT be set on failure, because opening the gate before tombstones are
+	// loaded lets APNs echoes resurrect portals for deleted chats. A panic
+	// during bootstrap therefore keeps the old behavior — re-panic, crash,
+	// restart into a clean bootstrap, which is strictly better for that class.
+	//
+	// The crash this was written for lands in the delayed-resync loop, which
+	// runs after setCloudSyncDone(), so it takes the recover path: the gate is
+	// already open, messages keep flowing, and the incomplete resync is picked
+	// up on the next cycle. The Rust side (ids_guard) contains lookup panics
+	// before they reach here; this is the backstop for everything else.
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		if !c.isCloudSyncDone() {
+			log.Error().Interface("panic", r).
+				Msg("CloudKit sync controller panicked before sync completed — re-panicking so the bridge restarts into a clean bootstrap (opening the APNs gate here would resurrect deleted portals)")
+			panic(r)
+		}
+		log.Error().Interface("panic", r).
+			Msg("CloudKit sync controller panicked after sync completed — bridge stays up, resync resumes on the next cycle")
+	}()
 
 	// Derive a cancellable context from stopChan so that preUploadCloudAttachments
 	// and other long-running operations can be interrupted promptly on shutdown

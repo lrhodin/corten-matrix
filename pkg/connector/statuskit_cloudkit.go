@@ -370,7 +370,20 @@ func (c *IMClient) onPresenceDecryptFailed(log zerolog.Logger) {
 // the invite-sweep deferral, and the backfill-settle window. Forced callers are
 // responsible for their own cooldown so they can't defeat the clique-kick rate
 // limit (see onPresenceDecryptFailed).
-func (c *IMClient) syncCloudStatusKitPeersForce(ctx context.Context, log zerolog.Logger, force bool) error {
+func (c *IMClient) syncCloudStatusKitPeersForce(ctx context.Context, log zerolog.Logger, force bool) (err error) {
+	// This pass pulls peer keys from CloudKit and ends by running the
+	// alias-link pass, which queries Apple IDS. Several callers run it in a
+	// bare goroutine (onPresenceDecryptFailed, the sync controller), so a
+	// panic anywhere below would take the bridge down rather than failing one
+	// pass. Convert it to an error at the single chokepoint every caller
+	// shares; the next pass retries from the persisted continuation token.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error().Interface("panic", r).
+				Msg("StatusKit-CloudKit pass panicked — failing this pass, bridge stays up")
+			err = fmt.Errorf("StatusKit-CloudKit pass panicked: %v", r)
+		}
+	}()
 	if c.client == nil {
 		log.Info().Msg("StatusKit-CloudKit pass: skipped (rust client not ready)")
 		return nil

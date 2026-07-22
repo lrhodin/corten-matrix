@@ -3,6 +3,7 @@ pub mod util;
 pub mod local_config;
 #[cfg(all(not(target_os = "macos"), feature = "anisette-remote-v3"))]
 pub mod anisette;
+mod ids_guard;
 mod statuskitgo;
 mod statuskit_cloudkit;
 #[cfg(test)]
@@ -8026,7 +8027,37 @@ pub async fn new_client(
                 let mut backoff = INITIAL_BACKOFF;
 
                 loop {
-                    match client_for_recv.handle(msg.clone()).await {
+                    // handle() decrypts inbound messages, which routes through
+                    // IdentityManager::get_key_for_sender — a lookup for a
+                    // SINGLE sender URI (identity_manager.rs:834). That is the
+                    // shape that trips the upstream chunks(0) panic in
+                    // ids/user.rs:984, and unlike the bridge's own lookup call
+                    // sites this one is internal to rustpush, so ids_guard
+                    // cannot wrap it — meaning no bisection and no quarantine
+                    // here, just the catch. Matches how the StatusKit path is
+                    // protected (spawn → JoinError, above).
+                    //
+                    // Tradeoff, stated honestly: the bridge survives, but the
+                    // frame is dropped, and a sender that panics the lookup
+                    // will do so on every message it sends. Whether those
+                    // messages resurface depends on CloudKit backfill picking
+                    // them up, which is not guaranteed. Staying up and losing
+                    // one sender's messages beats losing every sender's.
+                    use futures::FutureExt;
+                    let handled = std::panic::AssertUnwindSafe(
+                        client_for_recv.handle(msg.clone())
+                    ).catch_unwind().await;
+                    let handled = match handled {
+                        Ok(res) => res,
+                        Err(_) => {
+                            error!(
+                                "iMessage handle() panicked (likely an IDS key lookup for the sender) \
+                                 — dropping this frame to keep the receive loop alive"
+                            );
+                            break;
+                        }
+                    };
+                    match handled {
                         Ok(Some(msg_inst)) => {
                             // Certify delivery back to the sender when the
                             // incoming message carries a certified context.
@@ -9183,19 +9214,39 @@ impl Client {
             // empty for is filtered out of the HTTP fetch and never re-queried.
             // refresh=true drops the cutoff to REFRESH_MIN (60s). The resolver's
             // rate gate caps how often this runs, so we don't pound Apple.
-            match tokio::time::timeout(
-                Duration::from_secs(timeout_secs),
-                self.client.identity.cache_keys(
-                    service,
-                    &targets,
-                    &my_handle,
-                    true,
-                    &QueryOptions::default(),
-                ),
-            ).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => info!("resolve_handle: cache_keys({}, n={}) failed: {:?}", service, targets.len(), e),
-                Err(_) => info!("resolve_handle: cache_keys({}, n={}) timed out after {}s", service, targets.len(), timeout_secs),
+            //
+            // Routed through ids_guard: for services after Madrid this queries a
+            // single URI, which is one of the two shapes that trips the upstream
+            // chunks(0) panic (ids/user.rs:984).
+            //
+            // Quarantine ENFORCED, and it matters most here. The madrid pass
+            // above is not a single-URI lookup: it is this handle plus every
+            // ghost in the bridge DB (client.go's `SELECT id FROM ghost`), so
+            // ONE poison handle anywhere in that set rides along in every
+            // resolution. A poison handle also never reaches put_keys, so it
+            // never gets a cache entry, so `does_not_need_refresh` never
+            // filters it out — without the quarantine it would trigger a full
+            // bisection on every presence update, forever. The per-handle rate
+            // gate (statusKitIDSAttemptCooldown) does not help: it paces calls
+            // between handles, not the attempts inside one bisection.
+            //
+            // Cost of enforcing: a contact whose lookup is quarantined has
+            // presence resolution suppressed until the TTL expires. That TTL
+            // (6h) matches the gate's own attempt cooldown (6h), so in the
+            // common case the negative-attempt stamp already suppresses a
+            // re-query for the same window and enforcing costs nothing extra.
+            let report = ids_guard::guarded_cache_keys(
+                &self.client.identity,
+                service,
+                &targets,
+                &my_handle,
+                true,
+                &QueryOptions::default(),
+                timeout_secs,
+                ids_guard::QuarantinePolicy::Enforce,
+            ).await;
+            if let Some(err) = &report.error {
+                info!("resolve_handle: cache_keys({}, n={}) failed: {}", service, targets.len(), err);
             }
 
             let cache = self.client.identity.cache.lock().await;
@@ -9351,25 +9402,33 @@ impl Client {
             // 1. Force-fresh fetch for the unknowns. refresh=true bypasses the
             //    EMPTY_REFRESH cache filter so Apple is re-queried even if a
             //    prior empty result is cached within the 1h window.
-            match tokio::time::timeout(
-                Duration::from_secs(unknown_timeout),
-                self.client.identity.cache_keys(
-                    service,
-                    &unknown_targets,
-                    &my_handle,
-                    true,
-                    &QueryOptions::default(),
-                ),
-            ).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    info!("batch_resolve_handles: cache_keys(unknowns, {}, n={}) failed: {:?}", service, unknown_targets.len(), e);
+            //
+            //    Routed through ids_guard so one unanswerable handle can no
+            //    longer take down the process (or, once caught, abort the rest
+            //    of the pass): it is isolated by bisection, quarantined, and
+            //    every other handle in the list still resolves.
+            let report = ids_guard::guarded_cache_keys(
+                &self.client.identity,
+                service,
+                &unknown_targets,
+                &my_handle,
+                true,
+                &QueryOptions::default(),
+                unknown_timeout,
+                ids_guard::QuarantinePolicy::Enforce,
+            ).await;
+            if let Some(err) = &report.error {
+                info!("batch_resolve_handles: cache_keys(unknowns, {}, n={}) failed: {}", service, unknown_targets.len(), err);
+                if !report.systemic {
+                    // Ordinary failure: skip this service entirely, exactly as
+                    // this loop did before the guard existed.
                     continue;
                 }
-                Err(_) => {
-                    info!("batch_resolve_handles: cache_keys(unknowns, {}, n={}) timed out after {}s", service, unknown_targets.len(), unknown_timeout);
-                    continue;
-                }
+                // Systemic panic (broken registration, bad cache state). Skip
+                // the sibling query — it would walk into the same instant
+                // panic — but still run the correlation scan below: it is
+                // in-memory, issues no queries, and can only add results from
+                // entries earlier passes already cached.
             }
 
             // 2. Cache-only top-up for known siblings. refresh=false means each
@@ -9377,24 +9436,19 @@ impl Client {
             //    case is cache hit for everyone (siblings have been queried
             //    during normal message traffic). Only siblings with truly
             //    missing/stale entries hit Apple.
-            if !sibling_targets.is_empty() {
-                match tokio::time::timeout(
-                    Duration::from_secs(sibling_timeout),
-                    self.client.identity.cache_keys(
-                        service,
-                        &sibling_targets,
-                        &my_handle,
-                        false,
-                        &QueryOptions::default(),
-                    ),
-                ).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
-                        info!("batch_resolve_handles: cache_keys(siblings, {}, n={}) failed (continuing with cached entries): {:?}", service, sibling_targets.len(), e);
-                    }
-                    Err(_) => {
-                        info!("batch_resolve_handles: cache_keys(siblings, {}, n={}) timed out after {}s (continuing with cached entries)", service, sibling_targets.len(), sibling_timeout);
-                    }
+            if report.error.is_none() && !sibling_targets.is_empty() {
+                let sib = ids_guard::guarded_cache_keys(
+                    &self.client.identity,
+                    service,
+                    &sibling_targets,
+                    &my_handle,
+                    false,
+                    &QueryOptions::default(),
+                    sibling_timeout,
+                    ids_guard::QuarantinePolicy::Enforce,
+                ).await;
+                if let Some(err) = &sib.error {
+                    info!("batch_resolve_handles: cache_keys(siblings, {}, n={}) failed (continuing with cached entries): {}", service, sibling_targets.len(), err);
                 }
             }
 
@@ -9613,11 +9667,47 @@ impl Client {
         targets: Vec<String>,
         handle: String,
     ) -> Vec<String> {
-        self.client
-            .identity
-            .validate_targets(&targets, "com.apple.madrid", &handle)
-            .await
-            .unwrap_or_default()
+        // Callers pass a single identifier here (contact_merge.go:86), which is
+        // one of the shapes that trips the upstream chunks(0) panic. Prime the
+        // cache through the guarded seam first, then read it back with the same
+        // filter upstream applies (identity_manager.rs:866-870).
+        //
+        // Two deliberate deltas from the old `identity.validate_targets(..)
+        // .unwrap_or_default()` call, both safer at this call site:
+        //   * On a failed lookup this returns whatever is already cached
+        //     instead of empty. Empty means "not reachable on iMessage" to
+        //     resolveSendTarget (contact_merge.go:108), which reroutes the
+        //     message to an alternate number — a worse outcome during a
+        //     transient IDS outage than answering from cache.
+        //   * A 30s per-attempt timeout where there was none. The old call
+        //     could block the send path indefinitely.
+        //
+        // Quarantine BYPASSED here on purpose. This backs resolveSendTarget on
+        // the outbound path (contact_merge.go:108): a suppressed handle reads
+        // as "not reachable on iMessage" and silently reroutes the message to
+        // an alternate number for the quarantine window. The quarantine buys
+        // no safety at this call site anyway — a single-target lookup that
+        // panics is caught, returns empty, and costs exactly one attempt with
+        // or without an entry.
+        let report = ids_guard::guarded_cache_keys(
+            &self.client.identity,
+            "com.apple.madrid",
+            &targets,
+            &handle,
+            false,
+            &rustpush::ids::user::QueryOptions::default(),
+            30,
+            ids_guard::QuarantinePolicy::Bypass,
+        ).await;
+        if let Some(err) = &report.error {
+            info!("validate_targets: cache_keys(n={}) failed: {}", targets.len(), err);
+        }
+        let cache = self.client.identity.cache.lock().await;
+        targets
+            .iter()
+            .filter(|t| !cache.get_keys("com.apple.madrid", &handle, t).is_empty())
+            .cloned()
+            .collect()
     }
 
     pub async fn send_message(

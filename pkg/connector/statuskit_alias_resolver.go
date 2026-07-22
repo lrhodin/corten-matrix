@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -562,6 +563,29 @@ func (c *IMClient) resolveStatusPortalViaIDSCached(ctx context.Context, log zero
 // each pass confirms link state and picks up aliases that became resolvable
 // (new ghosts, new cluster observations, Apple finally returning a correlation)
 // since the prior pass. Also runs once at bridge start so a restart resyncs.
+//
+// batchResolveHandlesSafe wraps Client.BatchResolveHandles with a recover
+// guard, mirroring validateTargetsSafe. The Rust side isolates lookup panics
+// through ids_guard, so this should never fire — it is the backstop for panic
+// sites that seam does not cover, since uniffi's Go binding re-panics and this
+// call site is on the CloudKit sync path (statuskit_cloudkit.go:807).
+func (c *IMClient) batchResolveHandlesSafe(unknowns, knownHandles []string) (results map[string][]string, err error) {
+	if c.client == nil || len(unknowns) == 0 {
+		return nil, nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			c.UserLogin.Log.Error().Interface("panic", r).
+				Int("unknowns", len(unknowns)).
+				Int("known_siblings", len(knownHandles)).
+				Msg("BatchResolveHandles panicked in FFI path")
+			results = nil
+			err = fmt.Errorf("BatchResolveHandles panicked: %v", r)
+		}
+	}()
+	return c.client.BatchResolveHandles(unknowns, knownHandles)
+}
+
 func (c *IMClient) batchLinkStatusKitAliases(ctx context.Context, log zerolog.Logger) {
 	if c.client == nil {
 		return
@@ -639,7 +663,7 @@ func (c *IMClient) batchLinkStatusKitAliases(ctx context.Context, log zerolog.Lo
 		}
 	}
 
-	results, err := c.client.BatchResolveHandles(unknowns, knownHandles)
+	results, err := c.batchResolveHandlesSafe(unknowns, knownHandles)
 	if err != nil {
 		log.Warn().Err(err).
 			Int("unknowns", len(unknowns)).
