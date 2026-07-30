@@ -690,6 +690,10 @@ scripts/                                    # Setup scripts, embedded into the b
 
 **Chat with us on Matrix**: [Join our Room Here](https://matrix.to/#/#corten-matrix:beeper.com)
 
+## Contributing
+
+**Pull requests are closed for now** and issues carry no expectation of a reply — this is a hobby project without the capacity to review patches. Forking is encouraged; see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 MPL 2.0 — see [LICENSE](LICENSE).
