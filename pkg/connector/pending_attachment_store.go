@@ -100,7 +100,7 @@ func (s *pendingAttachmentStore) Insert(ctx context.Context, row *pendingAttachm
 			sender, timestamp_ms,
 			filename, mime_type, uti_type, size_bytes, mmcs_descriptor,
 			created_at, last_attempt_at, attempt_count, next_attempt_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		ON CONFLICT (login_id, message_guid, att_index) DO NOTHING`,
 		s.loginID, row.MessageGUID, row.AttIndex, row.AttID, row.PortalID,
 		row.Sender, row.TimestampMs,
@@ -119,9 +119,9 @@ func (s *pendingAttachmentStore) GetDue(ctx context.Context, now time.Time, limi
 		       filename, mime_type, uti_type, size_bytes, mmcs_descriptor,
 		       created_at, last_attempt_at, attempt_count, next_attempt_at
 		FROM pending_attachment_retry
-		WHERE login_id = ? AND next_attempt_at <= ?
+		WHERE login_id = $1 AND next_attempt_at <= $2
 		ORDER BY next_attempt_at ASC
-		LIMIT ?`,
+		LIMIT $3`,
 		s.loginID, now.UnixMilli(), limit,
 	)
 	if err != nil {
@@ -143,8 +143,8 @@ func (s *pendingAttachmentStore) GetDue(ctx context.Context, now time.Time, limi
 func (s *pendingAttachmentStore) UpdateSchedule(ctx context.Context, row *pendingAttachmentRow) error {
 	_, err := s.db.Exec(ctx, `
 		UPDATE pending_attachment_retry
-		SET attempt_count = ?, last_attempt_at = ?, next_attempt_at = ?
-		WHERE login_id = ? AND message_guid = ? AND att_index = ?`,
+		SET attempt_count = $1, last_attempt_at = $2, next_attempt_at = $3
+		WHERE login_id = $4 AND message_guid = $5 AND att_index = $6`,
 		row.AttemptCount, row.LastAttemptAt.UnixMilli(), row.NextAttemptAt.UnixMilli(),
 		s.loginID, row.MessageGUID, row.AttIndex,
 	)
@@ -155,7 +155,7 @@ func (s *pendingAttachmentStore) UpdateSchedule(ctx context.Context, row *pendin
 func (s *pendingAttachmentStore) Delete(ctx context.Context, row *pendingAttachmentRow) error {
 	_, err := s.db.Exec(ctx, `
 		DELETE FROM pending_attachment_retry
-		WHERE login_id = ? AND message_guid = ? AND att_index = ?`,
+		WHERE login_id = $1 AND message_guid = $2 AND att_index = $3`,
 		s.loginID, row.MessageGUID, row.AttIndex,
 	)
 	return err
@@ -169,7 +169,7 @@ func (s *pendingAttachmentStore) GetOne(ctx context.Context, msgGUID string, att
 		       filename, mime_type, uti_type, size_bytes, mmcs_descriptor,
 		       created_at, last_attempt_at, attempt_count, next_attempt_at
 		FROM pending_attachment_retry
-		WHERE login_id = ? AND message_guid = ? AND att_index = ?`,
+		WHERE login_id = $1 AND message_guid = $2 AND att_index = $3`,
 		s.loginID, msgGUID, attIndex,
 	)
 	r, err := scanPendingAttachmentRow(row)
