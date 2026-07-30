@@ -1,0 +1,52 @@
+name: Close external PRs
+
+# Corten-Matrix is not accepting pull requests right now (see CONTRIBUTING.md).
+# Rather than leave patches open indefinitely, close them with an explanation.
+#
+# Uses pull_request_target, not pull_request: fork PRs under `pull_request` get a
+# read-only GITHUB_TOKEN, so `gh pr close` would 403. This job never checks out
+# the PR head, which is what makes pull_request_target safe here.
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    runs-on: ubuntu-latest
+    # Only the owner and invited collaborators are exempt. COLLABORATOR is the
+    # association GitHub reports for anyone with write access, so this tracks the
+    # repo's collaborator list automatically -- no usernames to keep in sync.
+    # Past contributors are deliberately NOT exempt; a closed PR keeps its diff
+    # and can be reopened by hand if a patch turns out to be wanted.
+    if: >
+      github.event.pull_request.author_association != 'OWNER' &&
+      github.event.pull_request.author_association != 'COLLABORATOR'
+    steps:
+      - name: Comment and close
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr comment "$PR" --repo "$REPO" --body \
+          'Thanks for taking the time to write this — and sorry for the automated reply.
+
+          Corten-Matrix is a hobby project, and there is not enough review capacity
+          to take pull requests at the moment, so incoming PRs are closed
+          automatically. This is not a judgement on your patch; an unreviewed PR
+          left open is worse for you than a closed one.
+
+          Nothing is lost: the diff stays on this PR, and it can be reopened if it
+          turns out to be something the project wants. Please do not count on that.
+          The project is MPL-2.0, so the better option is to fork it and carry the
+          change there — you do not need permission, and `AGENTS.md` has the
+          developer notes.
+
+          See [CONTRIBUTING.md](https://github.com/lrhodin/corten-matrix/blob/master/CONTRIBUTING.md)
+          for the details, including what to expect from the issue tracker.'
+
+          gh pr close "$PR" --repo "$REPO"
