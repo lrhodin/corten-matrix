@@ -76,9 +76,9 @@ func (s *sharedProfileStore) ensureSchema(ctx context.Context) error {
 		display_name   TEXT    NOT NULL DEFAULT '',
 		first_name     TEXT    NOT NULL DEFAULT '',
 		last_name      TEXT    NOT NULL DEFAULT '',
-		avatar         BLOB,
+		avatar         BYTEA,
 		record_key     TEXT    NOT NULL,
-		decryption_key BLOB    NOT NULL,
+		decryption_key BYTEA   NOT NULL,
 		has_poster     BOOLEAN NOT NULL DEFAULT FALSE,
 		updated_ts     BIGINT  NOT NULL,
 		PRIMARY KEY (login_id, identifier)

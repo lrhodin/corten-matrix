@@ -84,6 +84,46 @@ func newCloudBackfillStore(db *dbutil.Database, loginID networkid.UserLoginID) *
 	return &cloudBackfillStore{db: db, loginID: loginID}
 }
 
+// columnExists reports whether tableName has a column named columnName.
+// SQLite exposes this via the pragma_table_info() table-valued function;
+// Postgres has no such function, so it's queried through information_schema
+// instead. Getting this wrong (e.g. always assuming the column is missing)
+// makes every ALTER TABLE ADD COLUMN migration below fail with "column
+// already exists" on the second and subsequent runs once a column has been
+// added once, which aborts ensureSchema and leaves the whole CloudKit
+// backfill store uninitialized.
+func columnExists(ctx context.Context, db *dbutil.Database, tableName, columnName string) (bool, error) {
+	var count int
+	var err error
+	switch db.Dialect {
+	case dbutil.Postgres:
+		err = db.QueryRow(ctx,
+			`SELECT COUNT(*) FROM information_schema.columns WHERE table_name=$1 AND column_name=$2`,
+			tableName, columnName,
+		).Scan(&count)
+	default:
+		err = db.QueryRow(ctx,
+			fmt.Sprintf(`SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name=$1`, tableName),
+			columnName,
+		).Scan(&count)
+	}
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// sqlInstrFunc returns the name of the "find substring position" function for
+// the store's dialect: SQLite only has instr(str, substr), Postgres only has
+// strpos(str, substr). Both are 1-based with 0 meaning "not found," so a
+// caller can substitute the name straight into a query template.
+func sqlInstrFunc(db *dbutil.Database) string {
+	if db.Dialect == dbutil.Postgres {
+		return "strpos"
+	}
+	return "instr"
+}
+
 func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	// Privacy: secure_delete forces SQLite to zero out freed pages during
 	// DELETE/UPDATE so NULLing text/subject/sender in scrubBridgedBodies does
@@ -146,7 +186,7 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			login_id TEXT NOT NULL,
 			portal_id TEXT NOT NULL,
 			ts BIGINT NOT NULL,
-			data BLOB NOT NULL,
+			data BYTEA NOT NULL,
 			PRIMARY KEY (login_id, portal_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS restore_override (
@@ -183,9 +223,11 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		{"is_filtered", "INTEGER NOT NULL DEFAULT 0"},
 		{"fwd_backfill_done", "BOOLEAN NOT NULL DEFAULT 0"},
 	} {
-		var exists int
-		_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_chat') WHERE name=$1`, col.name).Scan(&exists)
-		if exists == 0 {
+		exists, err := columnExists(ctx, s.db, "cloud_chat", col.name)
+		if err != nil {
+			return fmt.Errorf("failed to check for %s column on cloud_chat: %w", col.name, err)
+		}
+		if !exists {
 			if _, err := s.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE cloud_chat ADD COLUMN %s %s`, col.name, col.def)); err != nil {
 				return fmt.Errorf("failed to add %s column to cloud_chat: %w", col.name, err)
 			}
@@ -211,9 +253,11 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		{"reply_to_guid", "TEXT"},
 		{"reply_to_part", "TEXT"},
 	} {
-		var exists int
-		_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_message') WHERE name=$1`, col.name).Scan(&exists)
-		if exists == 0 {
+		exists, err := columnExists(ctx, s.db, "cloud_message", col.name)
+		if err != nil {
+			return fmt.Errorf("failed to check for %s column on cloud_message: %w", col.name, err)
+		}
+		if !exists {
 			if _, err := s.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE cloud_message ADD COLUMN %s %s`, col.name, col.def)); err != nil {
 				return fmt.Errorf("failed to add %s column to cloud_message: %w", col.name, err)
 			}
@@ -278,7 +322,7 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	if _, err := s.db.Exec(ctx, `CREATE TABLE IF NOT EXISTS cloud_attachment_cache (
 		login_id    TEXT    NOT NULL,
 		record_name TEXT    NOT NULL,
-		content_json BLOB   NOT NULL,
+		content_json BYTEA  NOT NULL,
 		created_ts  BIGINT  NOT NULL,
 		PRIMARY KEY (login_id, record_name)
 	)`); err != nil {
@@ -564,7 +608,7 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			attachments_json, date_read_ms, has_body,
 			reply_to_guid, reply_to_part,
 			created_ts, updated_ts
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
 		ON CONFLICT (login_id, guid) DO UPDATE SET
 			record_name=excluded.record_name,
 			chat_id=excluded.chat_id,
@@ -847,7 +891,7 @@ func (s *cloudBackfillStore) upsertChatBatch(ctx context.Context, chats []cloudC
 		INSERT INTO cloud_chat (
 			login_id, cloud_chat_id, record_name, group_id, portal_id, service, display_name,
 			group_photo_guid, participants_json, updated_ts, created_ts, is_filtered
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (login_id, cloud_chat_id) DO UPDATE SET
 			record_name=excluded.record_name,
 			group_id=excluded.group_id,
@@ -1157,7 +1201,7 @@ func (s *cloudBackfillStore) insertDeletedChatTombstone(
 		INSERT INTO cloud_chat (
 			login_id, cloud_chat_id, record_name, group_id, portal_id, service,
 			display_name, participants_json, updated_ts, created_ts, deleted
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE)
 		ON CONFLICT (login_id, cloud_chat_id) DO NOTHING
 	`, s.loginID, cloudChatID, recordName, groupID, portalID, service, nullableString(displayName), participantsJSON, nowMS, nowMS)
 	return err
@@ -1911,8 +1955,8 @@ func (s *cloudBackfillStore) getRecordNameByGUID(ctx context.Context, guid strin
 // be re-bridged on backfill, while preserving the UUID for echo detection.
 func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid string) error {
 	// UPDATE-then-stub-INSERT must be atomic: between the UPDATE reporting
-	// 0 rows and the INSERT OR IGNORE running, a concurrent CloudKit upsert
-	// could land a live (deleted=FALSE) row for this guid. INSERT OR IGNORE
+	// 0 rows and the stub INSERT running, a concurrent CloudKit upsert
+	// could land a live (deleted=FALSE) row for this guid. ON CONFLICT DO NOTHING
 	// would then no-op against it and the body would bridge undeleted. Wrap
 	// both in a single txn so the upsert serializes either fully before
 	// (UPDATE scrubs it) or fully after (its ON CONFLICT CASE preserves the
@@ -1949,9 +1993,10 @@ func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid s
 		// Apple already deleted on the user's devices.
 		nowMS := time.Now().UnixMilli()
 		_, err = s.db.Exec(ctx,
-			`INSERT OR IGNORE INTO cloud_message
+			`INSERT INTO cloud_message
 				(login_id, guid, timestamp_ms, is_from_me, deleted, body_scrubbed, created_ts, updated_ts)
-			 VALUES ($1, $2, $3, FALSE, TRUE, TRUE, $4, $4)`,
+			 VALUES ($1, $2, $3, FALSE, TRUE, TRUE, $4, $4)
+			 ON CONFLICT (login_id, guid) DO NOTHING`,
 			s.loginID, guid, nowMS, nowMS,
 		)
 		if err != nil {
@@ -2245,12 +2290,13 @@ func (s *cloudBackfillStore) reKeyPortalID(ctx context.Context, oldPortalID, new
 // persistMessageUUID inserts a minimal cloud_message record for a realtime
 // APNs message so the UUID survives restarts. CloudKit-synced messages are
 // already stored via upsertMessageBatch; this covers the realtime path.
-// Uses INSERT OR IGNORE so it's safe to call even if the message already exists.
+// Uses ON CONFLICT DO NOTHING so it's safe to call even if the message already exists.
 func (s *cloudBackfillStore) persistMessageUUID(ctx context.Context, uuid, portalID string, timestampMS int64, isFromMe bool) error {
 	nowMS := time.Now().UnixMilli()
 	_, err := s.db.Exec(ctx, `
-		INSERT OR IGNORE INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, created_ts, updated_ts)
+		INSERT INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, created_ts, updated_ts)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (login_id, guid) DO NOTHING
 	`, s.loginID, uuid, portalID, timestampMS, isFromMe, nowMS, nowMS)
 	return err
 }
@@ -2263,8 +2309,9 @@ func (s *cloudBackfillStore) persistMessageUUID(ctx context.Context, uuid, porta
 func (s *cloudBackfillStore) persistTapbackUUID(ctx context.Context, uuid, portalID string, timestampMS int64, isFromMe bool, tapbackType uint32) error {
 	nowMS := time.Now().UnixMilli()
 	_, err := s.db.Exec(ctx, `
-		INSERT OR IGNORE INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, tapback_type, created_ts, updated_ts)
+		INSERT INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, tapback_type, created_ts, updated_ts)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (login_id, guid) DO NOTHING
 	`, s.loginID, uuid, portalID, timestampMS, isFromMe, tapbackType, nowMS, nowMS)
 	return err
 }
@@ -2532,7 +2579,8 @@ func (s *cloudBackfillStore) getNewestBackfillableMessageTimestamp(ctx context.C
 // Returns the number of rows fixed.
 func (s *cloudBackfillStore) healMisroutedGroupMessages(ctx context.Context) (int, error) {
 	now := time.Now().UnixMilli()
-	result, err := s.db.Exec(ctx, `
+	instr := sqlInstrFunc(s.db)
+	query := strings.ReplaceAll(`
 		UPDATE cloud_message AS m
 		SET portal_id = cc.portal_id,
 		    updated_ts = $2
@@ -2543,16 +2591,16 @@ func (s *cloudBackfillStore) healMisroutedGroupMessages(ctx context.Context) (in
 		  AND (
 		    -- Strategy 1: cloud_chat_id matches the hex suffix after ";+;"
 		    (cc.cloud_chat_id <> '' AND
-		     LOWER(cc.cloud_chat_id) = LOWER(SUBSTR(m.chat_id, INSTR(m.chat_id, ';+;') + 3)))
+		     LOWER(cc.cloud_chat_id) = LOWER(SUBSTR(m.chat_id, {{INSTR}}(m.chat_id, ';+;') + 3)))
 		    OR
 		    -- Strategy 2: portal_id is "gid:<uuid>" and uuid matches hex suffix
 		    (cc.portal_id LIKE 'gid:%' AND
-		     LOWER(SUBSTR(cc.portal_id, 5)) = LOWER(SUBSTR(m.chat_id, INSTR(m.chat_id, ';+;') + 3)))
+		     LOWER(SUBSTR(cc.portal_id, 5)) = LOWER(SUBSTR(m.chat_id, {{INSTR}}(m.chat_id, ';+;') + 3)))
 		  )
 		  AND m.portal_id <> cc.portal_id
 		  AND cc.portal_id IS NOT NULL
-		  AND cc.portal_id <> ''
-	`, s.loginID, now)
+		  AND cc.portal_id <> ''`, "{{INSTR}}", instr)
+	result, err := s.db.Exec(ctx, query, s.loginID, now)
 	if err != nil {
 		return 0, err
 	}
@@ -3379,8 +3427,9 @@ func (s *cloudBackfillStore) markForwardBackfillDone(ctx context.Context, portal
 	}
 	if needsInsert {
 		_, _ = s.db.Exec(context.Background(), `
-			INSERT OR IGNORE INTO cloud_chat (login_id, cloud_chat_id, portal_id, created_ts, fwd_backfill_done)
-			VALUES ($1, $2, $3, $4, 1)`,
+			INSERT INTO cloud_chat (login_id, cloud_chat_id, portal_id, created_ts, fwd_backfill_done)
+			VALUES ($1, $2, $3, $4, 1)
+			ON CONFLICT (login_id, cloud_chat_id) DO NOTHING`,
 			s.loginID, "synthetic:"+portalID, portalID, time.Now().UnixMilli(),
 		)
 	}
@@ -3485,7 +3534,7 @@ func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portal
 		SELECT is_from_me FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
 		  AND tapback_type IS NULL
-		ORDER BY timestamp_ms DESC, rowid DESC
+		ORDER BY timestamp_ms DESC, created_ts DESC
 		LIMIT 1
 	`, s.loginID, portalID).Scan(&isFromMe)
 	if err == nil {
@@ -3617,7 +3666,8 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	// back to the base guid via substr-to-first-underscore (guids are UUIDs, no
 	// underscores). UPPER() on both sides preserves the APNs-uppercase vs
 	// CloudKit-mixed-case matching the EXISTS form had.
-	query := `
+	instr := sqlInstrFunc(s.db)
+	query := strings.ReplaceAll(`
 		UPDATE cloud_message
 		SET text=NULL,
 		    subject=NULL,
@@ -3639,14 +3689,14 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		          SELECT UPPER(id) FROM message
 		          WHERE bridge_id=$3 AND (room_receiver=$1 OR room_receiver='')
 		          UNION
-		          SELECT UPPER(substr(id, 1, instr(id, '_') - 1)) FROM message
-		          WHERE bridge_id=$3 AND instr(id, '_') > 0
+		          SELECT UPPER(substr(id, 1, {{INSTR}}(id, '_') - 1)) FROM message
+		          WHERE bridge_id=$3 AND {{INSTR}}(id, '_') > 0
 		            AND (room_receiver=$1 OR room_receiver='')
 		        )
 		      )` + exclusionSQL + `
 		    LIMIT ` + limitPlaceholder + `
 		  )
-	`
+	`, "{{INSTR}}", instr)
 	for {
 		result, err := s.db.Exec(ctx, query, args...)
 		if err != nil {
