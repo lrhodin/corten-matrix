@@ -24,7 +24,7 @@ func fields(t *testing.T, body string) map[string]string {
 	section := ""
 	for _, line := range strings.Split(body, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" {
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
 		if strings.HasPrefix(line, "[") {
@@ -152,7 +152,7 @@ func TestSystemdUnitBodyIsWellFormed(t *testing.T) {
 			for _, line := range strings.Split(body, "\n") {
 				line = strings.TrimSpace(line)
 				switch {
-				case line == "":
+				case line == "", strings.HasPrefix(line, "#"), strings.HasPrefix(line, ";"):
 				case strings.HasPrefix(line, "["):
 					seen = append(seen, strings.Trim(line, "[]"))
 				case !strings.Contains(line, "="):
@@ -271,8 +271,11 @@ func TestResolveUnitIdentity(t *testing.T) {
 	const fallback = "/home/david/.local/share"
 
 	t.Run("preserves an existing unit's identity", func(t *testing.T) {
-		owner, xdg, data := resolveUnitIdentity(true, "corten", "/home/corten/.local/share", true,
+		owner, xdg, data, err := resolveUnitIdentity(true, true, true, "corten", "/home/corten/.local/share",
 			"david", "david", fallback)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if owner != "corten" {
 			t.Errorf("owner = %q, want corten (preserved, not the caller)", owner)
 		}
@@ -288,8 +291,11 @@ func TestResolveUnitIdentity(t *testing.T) {
 	// the unit belongs to david. Deriving would repoint it; worse, deriving
 	// only the data dir would leave User=david chdir'ing into /root.
 	t.Run("su - does not repoint an existing unit", func(t *testing.T) {
-		owner, xdg, data := resolveUnitIdentity(true, "david", fallback, true,
+		owner, xdg, data, err := resolveUnitIdentity(true, true, true, "david", fallback,
 			"", "root", "/root/.local/share")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if owner != "david" || xdg != fallback {
 			t.Fatalf("got (%q, %q), want (david, %q)", owner, xdg, fallback)
 		}
@@ -302,14 +308,20 @@ func TestResolveUnitIdentity(t *testing.T) {
 	// decides preserve-vs-derive; keying on "owner is empty" would silently
 	// hand the service to whoever ran install-service.
 	t.Run("absent User= is preserved, not derived", func(t *testing.T) {
-		owner, _, _ := resolveUnitIdentity(true, "", "/var/lib/corten", true, "david", "david", fallback)
+		owner, _, _, err := resolveUnitIdentity(true, true, true, "", "/var/lib/corten", "david", "david", fallback)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if owner != "" {
 			t.Errorf("owner = %q, want empty — the unit deliberately has no User=", owner)
 		}
 	})
 
 	t.Run("fresh install derives from sudo caller", func(t *testing.T) {
-		owner, xdg, data := resolveUnitIdentity(true, "", "", false, "david", "root", fallback)
+		owner, xdg, data, err := resolveUnitIdentity(true, false, false, "", "", "david", "root", fallback)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if owner != "david" {
 			t.Errorf("owner = %q, want the sudo caller", owner)
 		}
@@ -322,8 +334,38 @@ func TestResolveUnitIdentity(t *testing.T) {
 	// at all is not the same as root: per systemd.exec's SetLoginEnvironment=,
 	// $HOME is then unset.
 	t.Run("system fresh install never yields an empty owner", func(t *testing.T) {
-		if owner, _, _ := resolveUnitIdentity(true, "", "", false, "", "", fallback); owner != "root" {
+		if owner, _, _, _ := resolveUnitIdentity(true, false, false, "", "", "", "", fallback); owner != "root" {
 			t.Errorf("owner = %q, want an explicit root", owner)
+		}
+	})
+
+	// Every refusal below used to be an os.Exit deep inside serviceInstall,
+	// which is why rounds 3-6 each shipped a defect in one: nothing could
+	// assert them. They return errors now, so these are the assertions.
+	t.Run("refuses a unit it did not author", func(t *testing.T) {
+		_, _, _, err := resolveUnitIdentity(true, true, false, "corten", "/srv/corten", "david", "david", fallback)
+		if err == nil {
+			t.Error("no error for an unmanaged existing unit — install-service would overwrite " +
+				"the installer's unit, which is how a working bridge got killed twice")
+		}
+	})
+
+	// Round 6's finding: preserving User=corten while filling the data dir from
+	// the CALLER puts WorkingDirectory inside another user's home — a fatal
+	// 200/CHDIR. An owner with no directory is half an identity; refuse it.
+	t.Run("refuses an owner with no data directory", func(t *testing.T) {
+		_, _, _, err := resolveUnitIdentity(true, true, true, "corten", "", "david", "david", fallback)
+		if err == nil {
+			t.Error("no error for User= with no XDG_DATA_HOME — the caller's data dir would be " +
+				"pinned into a unit running as someone else")
+		}
+	})
+
+	t.Run("refuses a relative data directory", func(t *testing.T) {
+		_, _, _, err := resolveUnitIdentity(true, false, false, "", "", "david", "david", ".local/share")
+		if err == nil {
+			t.Error("no error for a relative XDG_DATA_HOME — systemd ignores a non-absolute " +
+				"WorkingDirectory but still applies the relative pin, so the bridge looks under /")
 		}
 	})
 
@@ -331,18 +373,22 @@ func TestResolveUnitIdentity(t *testing.T) {
 	t.Run("data dir is always inside xdg", func(t *testing.T) {
 		for _, tc := range []struct {
 			system                        bool
+			exists, managed               bool
 			pOwner, pXDG                  string
-			found                         bool
 			sudoUser, current, fallbackIn string
 		}{
-			{true, "corten", "/srv/corten", true, "david", "david", fallback},
-			{true, "", "", true, "david", "david", fallback},
-			{false, "", "/data/xdg", true, "", "david", fallback},
-			{true, "", "", false, "", "", fallback},
-			{false, "", "", false, "david", "david", fallback},
+			{true, true, true, "corten", "/srv/corten", "david", "david", fallback},
+			{true, true, true, "", "", "david", "david", fallback},
+			{false, true, true, "", "/data/xdg", "", "david", fallback},
+			{true, false, false, "", "", "", "", fallback},
+			{false, false, false, "", "", "david", "david", fallback},
 		} {
-			_, xdg, data := resolveUnitIdentity(tc.system, tc.pOwner, tc.pXDG, tc.found,
+			_, xdg, data, err := resolveUnitIdentity(tc.system, tc.exists, tc.managed, tc.pOwner, tc.pXDG,
 				tc.sudoUser, tc.current, tc.fallbackIn)
+			if err != nil {
+				t.Errorf("unexpected error (case %+v): %v", tc, err)
+				continue
+			}
 			if filepath.Dir(data) != xdg {
 				t.Errorf("data %q is not inside xdg %q (case %+v)", data, xdg, tc)
 			}
@@ -353,21 +399,23 @@ func TestResolveUnitIdentity(t *testing.T) {
 	})
 }
 
-// TestScriptWrittenUnitSurvivesAnOverwrite is the end-to-end property: take the
-// unit an install script actually writes, run it through preserve-then-render
-// the way serviceInstall does, and confirm nothing the script pinned is lost or
-// changed. This is the check that would have caught every unit-body defect so
-// far — dropped Environment=, omitted User=root, missing LimitNOFILE, and a
-// WorkingDirectory that disagreed with the preserved identity.
+// TestUnitOwnershipGatesOverwriting is the containment property that replaced
+// preserve-by-parsing.
 //
-// The previous version of this test round-tripped the Go renderer through the
-// Go parser and asserted a pure function returns the same thing twice, which is
-// true by construction and constrained nothing.
-func TestScriptWrittenUnitSurvivesAnOverwrite(t *testing.T) {
-	// Verbatim shape of install_systemd_system in scripts/install-linux.sh,
-	// for a box whose bridge runs as a dedicated account.
-	const scriptUnit = `[Unit]
-Description=corten-matrix iMessage bridge
+// Five rounds went into safely carrying identity fields out of an ARBITRARY
+// existing unit. Each round closed one spelling systemd accepts and exposed
+// another — multi-assignment Environment=, continuations, EnvironmentFile=,
+// drop-ins, truncated files. The surface is unbounded, so parsing is now
+// confined to units this command wrote itself, and everything else is refused.
+// These assertions are what make that boundary real.
+func TestUnitOwnershipGatesOverwriting(t *testing.T) {
+	dir := t.TempDir()
+
+	// The shape install_systemd_system writes. Must be recognised as NOT ours,
+	// so serviceInstall refuses instead of rewriting it.
+	scriptUnit := filepath.Join(dir, "script.service")
+	if err := os.WriteFile(scriptUnit, []byte(`[Unit]
+Description=corten-matrix bridge
 After=network.target
 
 [Service]
@@ -377,45 +425,77 @@ WorkingDirectory=/opt/corten
 Environment=XDG_DATA_HOME=/home/corten/.local/share
 ExecStart=/opt/corten/corten-matrix bridge-all
 Restart=always
-RestartSec=5
 LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
-`
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if exists, managed := unitState(scriptUnit); !exists || managed {
+		t.Errorf("script-written unit: (exists=%v, managed=%v), want (true, false) — "+
+			"a true here means install-service would overwrite the installer's unit", exists, managed)
+	}
+
+	// Our own output must be recognised as ours, or install-service could never
+	// update anything it wrote.
+	ourUnit := filepath.Join(dir, "ours.service")
+	body := systemdUnitBody(true, "david", "/home/david/.local/share",
+		"/opt/corten/corten-matrix", "/home/david/.local/share/corten-matrix", "multi-user.target")
+	if err := os.WriteFile(ourUnit, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if exists, managed := unitState(ourUnit); !exists || !managed {
+		t.Errorf("our own unit: (exists=%v, managed=%v), want (true, true)", exists, managed)
+	}
+
+	// A truncated or empty file lacks the marker, so it is refused rather than
+	// treated as ours. Previously this returned found=true with an empty owner,
+	// which emitted no User= and silently promoted the service to root.
+	for name, content := range map[string]string{
+		"empty.service":     "",
+		"truncated.service": "[Unit]\nDescription=corten",
+		"garbage.service":   "\x00\x01\x02",
+	} {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if exists, managed := unitState(p); !exists || managed {
+			t.Errorf("%s: (exists=%v, managed=%v), want (true, false)", name, exists, managed)
+		}
+	}
+
+	// Absent file: nothing to refuse, fresh install proceeds.
+	if exists, managed := unitState(filepath.Join(dir, "nope.service")); exists || managed {
+		t.Errorf("absent unit: (exists=%v, managed=%v), want (false, false)", exists, managed)
+	}
+}
+
+// TestOurOwnUnitRoundTrips is what preserve-by-parsing is now scoped to: this
+// code's own canonical output, which is the only input the parser ever sees.
+func TestOurOwnUnitRoundTrips(t *testing.T) {
+	const owner, xdg = "corten", "/home/corten/.local/share"
 	path := filepath.Join(t.TempDir(), "corten-matrix.service")
-	if err := os.WriteFile(path, []byte(scriptUnit), 0o644); err != nil {
+	body := systemdUnitBody(true, owner, xdg, "/opt/corten/corten-matrix",
+		filepath.Join(xdg, "corten-matrix"), "multi-user.target")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	owner, xdg, found := existingUnitIdentity(path)
-	if !found {
-		t.Fatal("script-written unit not detected; the overwrite would derive and repoint it")
+	gotOwner, gotXDG, found := existingUnitIdentity(path)
+	if !found || gotOwner != owner || gotXDG != xdg {
+		t.Fatalf("round trip = (%q, %q, found=%v), want (%q, %q, true)", gotOwner, gotXDG, found, owner, xdg)
 	}
-	// serviceInstall derives the data dir from the resolved xdg precisely so it
-	// cannot disagree with the preserved User=.
-	data := filepath.Join(xdg, "corten-matrix")
-	got := fields(t, systemdUnitBody(true, owner, xdg, "/opt/corten/corten-matrix", data, "multi-user.target"))
-	want := fields(t, scriptUnit)
-
-	for _, k := range []string{
-		"Service/User",
-		"Service/Environment:XDG_DATA_HOME",
-		"Service/ExecStart",
-		"Service/Restart",
-		"Service/RestartSec",
-		"Service/LimitNOFILE",
-		"Install/WantedBy",
-	} {
-		if got[k] != want[k] {
-			t.Errorf("overwrite changed %s: %q -> %q", k, want[k], got[k])
-		}
+	// And the re-render keeps the identity coupled to the directory.
+	_, rXDG, rData, rErr := resolveUnitIdentity(true, true, true, gotOwner, gotXDG, "david", "david", "/home/david/.local/share")
+	if rErr != nil {
+		t.Fatalf("re-resolve failed: %v", rErr)
 	}
-	// WorkingDirectory legitimately differs (the script pins the binary dir,
-	// this pins the data dir) — but it must remain traversable by the preserved
-	// user, i.e. inside their XDG_DATA_HOME.
-	if filepath.Dir(got["Service/WorkingDirectory"]) != got["Service/Environment:XDG_DATA_HOME"] {
-		t.Errorf("WorkingDirectory %q is outside the preserved XDG_DATA_HOME %q — user %q cannot chdir there",
-			got["Service/WorkingDirectory"], got["Service/Environment:XDG_DATA_HOME"], got["Service/User"])
+	if rXDG != xdg {
+		t.Errorf("re-resolve xdg = %q, want the preserved %q, not the caller's", rXDG, xdg)
+	}
+	if filepath.Dir(rData) != xdg {
+		t.Errorf("re-resolve data = %q, which is outside %q — user %q could not chdir there", rData, xdg, owner)
 	}
 }

@@ -573,7 +573,8 @@ func systemdUnitBody(system bool, owner, xdgDataHome, self, data, wantedBy strin
 	if xdgDataHome != "" {
 		identity += "Environment=XDG_DATA_HOME=" + xdgDataHome + "\n"
 	}
-	return fmt.Sprintf(`[Unit]
+	return fmt.Sprintf(`%s
+[Unit]
 Description=corten-matrix iMessage bridge
 After=network-online.target
 Wants=network-online.target
@@ -587,7 +588,32 @@ LimitNOFILE=65536
 
 [Install]
 WantedBy=%s
-`, identity, self, data, wantedBy)
+`, managedUnitMarker, identity, self, data, wantedBy)
+}
+
+// managedUnitMarker is written as the first line of every unit this command
+// authors, and is the ONLY thing that licenses overwriting one.
+//
+// Five review rounds went into preserving identity fields out of an arbitrary
+// existing unit, and each round closed one spelling and exposed another —
+// multi-assignment `Environment=A=1 B=2`, line continuations, EnvironmentFile=,
+// `systemctl edit` drop-ins, truncated files. That surface is unbounded, so the
+// strategy was wrong rather than the implementation. Parsing is now confined to
+// units this code wrote itself, which are always in the single canonical form
+// below, and anything else is refused rather than rewritten.
+const managedUnitMarker = "# Managed by corten-matrix install-service. Do not hand-edit; this file is overwritten."
+
+// unitState reports whether a unit file exists and whether this command wrote
+// it. A file that exists without the marker was authored by the install
+// scripts, an admin, or a config-management tool, and must not be overwritten.
+// A truncated or empty file also lacks the marker, so a half-written unit is
+// refused rather than treated as ours.
+func unitState(path string) (exists, managed bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false, false
+	}
+	return true, strings.Contains(string(b), managedUnitMarker)
 }
 
 // existingUnitIdentity reads User= and Environment=XDG_DATA_HOME= out of an
@@ -651,13 +677,32 @@ func existingUnitIdentity(path string) (owner, xdgDataHome string, found bool) {
 // credentials, and the preserved user usually cannot traverse the caller's home
 // (0750 on Debian/Ubuntu, 0700 on RHEL), which is a fatal 200/CHDIR that
 // Restart=always then loops to the start limit.
-func resolveUnitIdentity(system bool, preservedOwner, preservedXDG string, found bool,
-	sudoUser, currentUser, fallbackXDG string) (owner, xdg, data string) {
-	if found {
+// Every refusal returns an error rather than exiting, so all three decisions are
+// testable. Rounds 3-6 each shipped a defect in a decision that could only be
+// reached through a code path ending in os.Exit.
+func resolveUnitIdentity(system bool, exists, managed bool, preservedOwner, preservedXDG string,
+	sudoUser, currentUser, fallbackXDG string) (owner, xdg, data string, err error) {
+	// Refuse to touch a unit this command did not author. The install scripts
+	// write a richer unit than this does, and admins and config management
+	// write their own; five rounds of trying to preserve arbitrary spellings
+	// safely produced a defect every time.
+	if exists && !managed {
+		return "", "", "", fmt.Errorf("not created by this command")
+	}
+	if exists {
 		owner, xdg = preservedOwner, preservedXDG
 		if xdg == "" {
-			// The unit exists but pins no data dir; it is running off the
-			// default, so keep it there rather than inventing one.
+			// Only reachable for a unit THIS code wrote, and every such unit
+			// pins XDG_DATA_HOME — so this is a corrupted-own-unit path.
+			//
+			// Substituting the CALLER's fallback here is what round 6 caught:
+			// keeping a preserved User=corten while pinning david's data dir
+			// gives the unit a WorkingDirectory inside another user's home,
+			// which is a fatal 200/CHDIR. An owner with no directory to go
+			// with it is not an identity — refuse rather than invent half.
+			if owner != "" {
+				return "", "", "", fmt.Errorf("it sets User=%s but no XDG_DATA_HOME, so the data directory cannot be determined", owner)
+			}
 			xdg = fallbackXDG
 		}
 	} else {
@@ -673,7 +718,15 @@ func resolveUnitIdentity(system bool, preservedOwner, preservedXDG string, found
 		}
 		xdg = fallbackXDG
 	}
-	return owner, xdg, filepath.Join(xdg, "corten-matrix")
+	// A relative XDG_DATA_HOME reaches here when HOME and XDG_DATA_HOME are
+	// both unset — cortenDataDir() then yields ".local/share/corten-matrix".
+	// systemd ignores a non-absolute WorkingDirectory= (starting the service in
+	// /) but still applies the relative Environment= pin, so the bridge looks
+	// for its config under /. Refuse rather than write that.
+	if !filepath.IsAbs(xdg) {
+		return "", "", "", fmt.Errorf("cannot determine an absolute data directory (%q): set HOME or XDG_DATA_HOME", xdg)
+	}
+	return owner, xdg, filepath.Join(xdg, "corten-matrix"), nil
 }
 
 // serviceInstall installs (and starts) the bridge as a user service pointing at
@@ -762,14 +815,24 @@ func serviceInstall() {
 	// the field is empty. A system unit with no User= deliberately runs as
 	// root; treating that absence as "derive one" would silently re-point it at
 	// whoever ran install-service.
-	preservedOwner, preservedXDG, found := existingUnitIdentity(unit)
+	exists, managed := unitState(unit)
+	preservedOwner, preservedXDG, _ := existingUnitIdentity(unit)
 	currentUser := ""
 	if u, err := user.Current(); err == nil {
 		currentUser = u.Username
 	}
-	owner, xdg, data := resolveUnitIdentity(system, preservedOwner, preservedXDG, found,
+	owner, xdg, data, err := resolveUnitIdentity(system, exists, managed, preservedOwner, preservedXDG,
 		os.Getenv("SUDO_USER"), currentUser, filepath.Dir(data))
-	if !found {
+	if err != nil {
+		fmt.Printf("%s!%s Not writing %s: %v.\n", cRed, cReset, unit, err)
+		fmt.Println("  Replacing a unit this command did not author has broken working installs before,")
+		fmt.Println("  so it refuses rather than guess.")
+		fmt.Println()
+		fmt.Println("  To manage the existing service: corten-matrix start | stop | restart | status")
+		fmt.Println("  To replace it deliberately:      corten-matrix uninstall-service && corten-matrix install-service")
+		os.Exit(1)
+	}
+	if !exists {
 		// Only create the tree when we derived it: on the preserve path it
 		// already exists, and MkdirAll as root inside another user's home would
 		// leave root-owned directories the service then cannot write.
