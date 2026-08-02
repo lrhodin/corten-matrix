@@ -593,21 +593,87 @@ WantedBy=%s
 // existingUnitIdentity reads User= and Environment=XDG_DATA_HOME= out of an
 // already-installed unit file so an overwrite can carry them forward instead of
 // re-deriving them from whatever environment happens to be running the command.
-// Returns empty strings when the file is absent or does not set them.
-func existingUnitIdentity(path string) (owner, xdgDataHome string) {
+//
+// `found` distinguishes "there is no unit to preserve" from "there is a unit and
+// it does not set this field". They are NOT the same: a system unit with no
+// User= deliberately runs as root, so deriving one would silently re-point it at
+// whoever happened to run install-service. Callers must only derive when
+// `found` is false.
+//
+// Key matching tolerates space around `=` because systemd strips both sides
+// (its config parser strstrip()s key and value), and strips one layer of quotes
+// from the value for the same reason. It does not attempt full systemd
+// semantics — multi-assignment Environment= lines, continuations, and
+// EnvironmentFile= all yield "" here, which is safe: with `found` true the
+// caller preserves the absence rather than inventing a value.
+func existingUnitIdentity(path string) (owner, xdgDataHome string, found bool) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return "", ""
+		return "", "", false
 	}
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
-		if v, ok := strings.CutPrefix(line, "User="); ok {
-			owner = strings.TrimSpace(v)
-		} else if v, ok := strings.CutPrefix(line, "Environment=XDG_DATA_HOME="); ok {
-			xdgDataHome = strings.TrimSpace(v)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		val = strings.Trim(strings.TrimSpace(val), `"'`)
+		switch key {
+		case "User":
+			// Last one wins, matching systemd.
+			owner = val
+		case "Environment":
+			if v, ok := strings.CutPrefix(val, "XDG_DATA_HOME="); ok {
+				xdgDataHome = strings.Trim(strings.TrimSpace(v), `"'`)
+			}
 		}
 	}
-	return owner, xdgDataHome
+	return owner, xdgDataHome, true
+}
+
+// resolveUnitIdentity decides the three coupled fields of a unit write: who it
+// runs as, which XDG_DATA_HOME it pins, and which directory it chdirs into.
+// Pure, so the decision itself is testable — the previous versions of this were
+// inline in serviceInstall, which shells out and os.Exit()s, and every defect
+// so far has been in this decision rather than in the rendering.
+//
+// Preserve-or-derive turns on whether a unit EXISTS (`found`), not on whether a
+// field is empty: a system unit with no User= runs as root deliberately, and
+// deriving one would silently re-point the service at whoever ran the command.
+//
+// The returned data dir is ALWAYS derived from the resolved xdg. Preserving the
+// identity while deriving the working directory from the calling process is how
+// a re-install kills a working unit — systemd chdir()s after switching
+// credentials, and the preserved user usually cannot traverse the caller's home
+// (0750 on Debian/Ubuntu, 0700 on RHEL), which is a fatal 200/CHDIR that
+// Restart=always then loops to the start limit.
+func resolveUnitIdentity(system bool, preservedOwner, preservedXDG string, found bool,
+	sudoUser, currentUser, fallbackXDG string) (owner, xdg, data string) {
+	if found {
+		owner, xdg = preservedOwner, preservedXDG
+		if xdg == "" {
+			// The unit exists but pins no data dir; it is running off the
+			// default, so keep it there rather than inventing one.
+			xdg = fallbackXDG
+		}
+	} else {
+		owner = sudoUser
+		if owner == "" {
+			owner = currentUser
+		}
+		if system && owner == "" {
+			// user.Current() fails for a uid with no passwd entry (a container
+			// run as --user 12345). An empty owner emits no User= at all, which
+			// is NOT the same as root — see systemdUnitBody.
+			owner = "root"
+		}
+		xdg = fallbackXDG
+	}
+	return owner, xdg, filepath.Join(xdg, "corten-matrix")
 }
 
 // serviceInstall installs (and starts) the bridge as a user service pointing at
@@ -616,8 +682,8 @@ func serviceInstall() {
 	self := selfPath()
 	offerAddToPath(self)
 	data := cortenDataDir()
-	_ = os.MkdirAll(filepath.Join(data, "logs"), 0o755)
 	if runtime.GOOS == "darwin" {
+		_ = os.MkdirAll(filepath.Join(data, "logs"), 0o755)
 		dir := filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents")
 		_ = os.MkdirAll(dir, 0o755)
 		plist := filepath.Join(dir, cortenBundleID+".plist")
@@ -691,19 +757,23 @@ func serviceInstall() {
 	//   config.yaml does not exist and the bridge exits 1 on every start.
 	//
 	// User= is still system-scope only — it is not valid in a user unit.
-	owner, xdg := existingUnitIdentity(unit)
-	if owner == "" {
-		owner = os.Getenv("SUDO_USER")
-		if owner == "" {
-			if u, err := user.Current(); err == nil {
-				owner = u.Username
-			}
-		}
+	//
+	// Preserve-or-derive is decided by whether a unit EXISTS, not by whether
+	// the field is empty. A system unit with no User= deliberately runs as
+	// root; treating that absence as "derive one" would silently re-point it at
+	// whoever ran install-service.
+	preservedOwner, preservedXDG, found := existingUnitIdentity(unit)
+	currentUser := ""
+	if u, err := user.Current(); err == nil {
+		currentUser = u.Username
 	}
-	if xdg == "" {
-		// cortenDataDir() is "<XDG_DATA_HOME>/corten-matrix", so the parent is
-		// the value XDG_DATA_HOME has to carry.
-		xdg = filepath.Dir(data)
+	owner, xdg, data := resolveUnitIdentity(system, preservedOwner, preservedXDG, found,
+		os.Getenv("SUDO_USER"), currentUser, filepath.Dir(data))
+	if !found {
+		// Only create the tree when we derived it: on the preserve path it
+		// already exists, and MkdirAll as root inside another user's home would
+		// leave root-owned directories the service then cannot write.
+		_ = os.MkdirAll(filepath.Join(data, "logs"), 0o755)
 	}
 	body := systemdUnitBody(system, owner, xdg, self, data, wantedBy)
 	if system && os.Geteuid() != 0 {
@@ -818,12 +888,6 @@ func serviceUninstall() {
 		}
 		os.Exit(1)
 	}
-	// "Nothing found" and "couldn't look" are different answers, and conflating
-	// them is the same class of lie as the one above. Under sudo, env_reset
-	// drops XDG_RUNTIME_DIR, so `systemctl --user` cannot reach a bus and a
-	// user-scope unit is invisible to both the removal loop and the re-probe.
-	// Claiming nothing was installed would leave it enabled and starting at
-	// login, which is exactly the outcome this function exists to prevent.
 	// "Nothing found" and "couldn't look" are different answers, and the probe
 	// above cannot tell them apart on its own: `systemctl --user cat` fails
 	// identically when the unit is absent and when no user bus is reachable
@@ -833,10 +897,14 @@ func serviceUninstall() {
 	// silent for a non-root user with no user manager.
 	//
 	// Ask the filesystem instead. effectiveHome() resolves SUDO_USER, so this
-	// finds the invoking user's unit even when the probe could not.
+	// finds the invoking user's unit even when the probe could not. Narrow by
+	// design: it reports only when a user unit is on disk AND the bus is
+	// unreachable. A reachable bus belonging to the WRONG manager (root with
+	// its own session) still goes unreported — pre-existing, not closed here.
 	userUnitPath := filepath.Join(effectiveHome(), ".config", "systemd", "user", unit)
-	_, userUnitOnDisk := os.Stat(userUnitPath)
-	if !userBusReachable() && userUnitOnDisk == nil {
+	_, statErr := os.Stat(userUnitPath)
+	userUnitOnDisk := statErr == nil
+	if !userBusReachable() && userUnitOnDisk {
 		fmt.Printf("Could not remove the user-scope unit: %s exists, but no user session bus is reachable from here.\n", userUnitPath)
 		fmt.Println("Remove it as that user, from a normal login session:")
 		fmt.Printf("  systemctl --user disable --now %s && rm -f %s\n", unit, userUnitPath)
