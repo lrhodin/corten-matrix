@@ -555,6 +555,61 @@ func offerAddToPath(self string) {
 	fmt.Printf("  run manually: sudo ln -sf %s %s\n", self, target)
 }
 
+// systemdUnitBody renders the bridge's systemd unit. Pure, so it can be tested
+// on any platform — the body is the part that cannot be exercised without a
+// systemd box, and it is the part whose mistakes are silent (a unit that fails
+// to find its config still returns 0 from `enable --now`, because Type=simple
+// reports success as soon as the fork succeeds).
+//
+// Must stay field-equivalent to install_systemd_user / install_systemd_system
+// in scripts/install-linux.sh and scripts/install-beeper-linux.sh, because
+// `install-service` overwrites units those scripts wrote. See
+// TestSystemdUnitBodyMatchesInstallScripts.
+func systemdUnitBody(system bool, owner, xdgDataHome, self, data, wantedBy string) string {
+	identity := ""
+	if system && owner != "" {
+		identity += "User=" + owner + "\n"
+	}
+	if xdgDataHome != "" {
+		identity += "Environment=XDG_DATA_HOME=" + xdgDataHome + "\n"
+	}
+	return fmt.Sprintf(`[Unit]
+Description=corten-matrix iMessage bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+%sExecStart=%s bridge-all
+WorkingDirectory=%s
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=%s
+`, identity, self, data, wantedBy)
+}
+
+// existingUnitIdentity reads User= and Environment=XDG_DATA_HOME= out of an
+// already-installed unit file so an overwrite can carry them forward instead of
+// re-deriving them from whatever environment happens to be running the command.
+// Returns empty strings when the file is absent or does not set them.
+func existingUnitIdentity(path string) (owner, xdgDataHome string) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if v, ok := strings.CutPrefix(line, "User="); ok {
+			owner = strings.TrimSpace(v)
+		} else if v, ok := strings.CutPrefix(line, "Environment=XDG_DATA_HOME="); ok {
+			xdgDataHome = strings.TrimSpace(v)
+		}
+	}
+	return owner, xdgDataHome
+}
+
 // serviceInstall installs (and starts) the bridge as a user service pointing at
 // this binary. setup/setup-beeper call this; it's also exposed as a manual command.
 func serviceInstall() {
@@ -610,50 +665,47 @@ func serviceInstall() {
 	}
 	unit := filepath.Join(dir, "corten-matrix.service")
 
-	// A SYSTEM unit must pin the identity and the data dir, and this body has
-	// to stay equivalent to the one install_systemd_system writes in the
-	// install scripts — because resolving by location above means a re-install
-	// OVERWRITES whatever is there, including a unit those scripts authored.
+	// Resolving by location means this OVERWRITES whatever unit is already
+	// there, including one the install scripts authored. So the identity
+	// fields are PRESERVED from that file rather than re-derived: the process
+	// running `install-service` is not necessarily the one the unit runs as
+	// (`su -`, a different login, a cron-ish context), and every attempt to
+	// guess it from the ambient environment has been wrong in a different way.
+	// Derivation is only for a genuinely fresh install, where there is nothing
+	// to preserve.
 	//
-	// Without User=, a system unit runs as root. RunAllBridges resolves its
-	// data dir from the runtime process environment (effectiveHome →
-	// cortenDataDir), and effectiveHome's SUDO_USER branch cannot help a
-	// systemd-spawned process — so root's $HOME is consulted, config.yaml is
-	// not found, and the bridge exits 1 on every start. Environment=
-	// XDG_DATA_HOME pins the same directory the scripts pin, so the unit finds
-	// the account regardless of whose home systemd hands it.
+	// Why these two fields specifically:
 	//
-	// User-scope units get neither: they already run as the user, and User= is
-	// not valid in a user unit.
-	identity := ""
-	if system {
-		owner := os.Getenv("SUDO_USER")
-		if owner == "" || owner == "root" {
+	//   User=  — a system unit without it runs as root, and per systemd.exec's
+	//   SetLoginEnvironment=, $HOME/$LOGNAME/$SHELL default to being set only
+	//   when User= is present. So OMITTING it is not the same as User=root:
+	//   omitted leaves $HOME unset, and os.UserConfigDir() then returns an
+	//   error that pkg/bbctl/main.go discards into a relative path. Write it
+	//   explicitly, root included.
+	//
+	//   Environment=XDG_DATA_HOME= — the bridge resolves its data dir from the
+	//   runtime environment (cortenDataDir), and a systemd user manager is
+	//   started by logind, so it never sees a login shell's exports. Both the
+	//   user AND system units the scripts write pin this; dropping it sends a
+	//   user with a custom XDG_DATA_HOME back to the default path, where
+	//   config.yaml does not exist and the bridge exits 1 on every start.
+	//
+	// User= is still system-scope only — it is not valid in a user unit.
+	owner, xdg := existingUnitIdentity(unit)
+	if owner == "" {
+		owner = os.Getenv("SUDO_USER")
+		if owner == "" {
 			if u, err := user.Current(); err == nil {
 				owner = u.Username
 			}
 		}
-		if owner != "" && owner != "root" {
-			identity += "User=" + owner + "\n"
-		}
+	}
+	if xdg == "" {
 		// cortenDataDir() is "<XDG_DATA_HOME>/corten-matrix", so the parent is
 		// the value XDG_DATA_HOME has to carry.
-		identity += "Environment=XDG_DATA_HOME=" + filepath.Dir(data) + "\n"
+		xdg = filepath.Dir(data)
 	}
-	body := fmt.Sprintf(`[Unit]
-Description=corten-matrix iMessage bridge
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-%sExecStart=%s bridge-all
-WorkingDirectory=%s
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=%s
-`, identity, self, data, wantedBy)
+	body := systemdUnitBody(system, owner, xdg, self, data, wantedBy)
 	if system && os.Geteuid() != 0 {
 		// system unit needs root: write it via sudo tee.
 		_ = exec.Command("sudo", "mkdir", "-p", dir).Run()
@@ -772,13 +824,23 @@ func serviceUninstall() {
 	// user-scope unit is invisible to both the removal loop and the re-probe.
 	// Claiming nothing was installed would leave it enabled and starting at
 	// login, which is exactly the outcome this function exists to prevent.
-	if !userBusReachable() && os.Geteuid() == 0 {
-		fmt.Println("Could not check the user scope: no user session bus is reachable as root.")
-		fmt.Println("If the service was installed as a user unit, remove it as that user:")
-		fmt.Printf("  systemctl --user disable --now %s && rm -f ~/.config/systemd/user/%s\n", unit, unit)
-		if !removedAny {
-			os.Exit(1)
-		}
+	// "Nothing found" and "couldn't look" are different answers, and the probe
+	// above cannot tell them apart on its own: `systemctl --user cat` fails
+	// identically when the unit is absent and when no user bus is reachable
+	// (under sudo, env_reset drops XDG_RUNTIME_DIR; in a container there is no
+	// user manager at all). Gating on euid==0 was wrong in both directions —
+	// it fired on every LXC-root run where no user unit can exist, and stayed
+	// silent for a non-root user with no user manager.
+	//
+	// Ask the filesystem instead. effectiveHome() resolves SUDO_USER, so this
+	// finds the invoking user's unit even when the probe could not.
+	userUnitPath := filepath.Join(effectiveHome(), ".config", "systemd", "user", unit)
+	_, userUnitOnDisk := os.Stat(userUnitPath)
+	if !userBusReachable() && userUnitOnDisk == nil {
+		fmt.Printf("Could not remove the user-scope unit: %s exists, but no user session bus is reachable from here.\n", userUnitPath)
+		fmt.Println("Remove it as that user, from a normal login session:")
+		fmt.Printf("  systemctl --user disable --now %s && rm -f %s\n", unit, userUnitPath)
+		os.Exit(1)
 	} else if !removedAny {
 		fmt.Println("No corten-matrix service unit was installed; nothing to remove.")
 		os.Exit(0)
