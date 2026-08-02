@@ -412,7 +412,12 @@ func startAfterSetup() {
 			return
 		}
 	}
-	startOneNow(0) // one service runs every configured account (bridge-all)
+	// one service runs every configured account (bridge-all)
+	if err := startOneNow(0); err != nil {
+		fmt.Printf("\n%s!%s Service installed, but starting it failed: %v\n", cRed, cReset, err)
+		fmt.Println("  Try: corten-matrix start   (then: corten-matrix status)")
+		return
+	}
 	fmt.Printf("\n%s✓%s Bridge started — view logs with: corten-matrix logs\n", cGreen, cReset)
 }
 
@@ -503,7 +508,9 @@ func setEnv(env []string, key, val string) []string {
 }
 
 // startOneNow loads (and force-starts) one account's already-installed service.
-func startOneNow(idx int) {
+// Returns the start error so the caller can avoid announcing a success that did
+// not happen — a sudo prompt can be declined, and a unit can fail to start.
+func startOneNow(idx int) error {
 	label := serviceLabel(idx)
 	if runtime.GOOS == "darwin" {
 		uid := strconv.Itoa(os.Getuid())
@@ -511,12 +518,11 @@ func startOneNow(idx int) {
 		if exec.Command("launchctl", "bootstrap", "gui/"+uid, plist).Run() != nil {
 			_ = exec.Command("launchctl", "load", "-w", plist).Run()
 		}
-		_ = exec.Command("launchctl", "kickstart", "-k", "gui/"+uid+"/"+label).Run()
-		return
+		return exec.Command("launchctl", "kickstart", "-k", "gui/"+uid+"/"+label).Run()
 	}
 	// Unit-aware: the unit may live in the system scope even when a user bus
 	// is reachable (see linuxSystemctlFor).
-	_ = sysctlUnit("start", label+".service")
+	return sysctlUnit("start", label+".service")
 }
 
 // offerAddToPath offers to symlink the binary into /usr/local/bin so `corten-matrix`
@@ -581,12 +587,21 @@ func serviceInstall() {
 	// Linux: systemd unit — a user unit normally, a system unit in LXC/containers
 	// (no user bus), matching the install scripts' SYSTEMD_MODE fallback.
 	//
-	// Bus reachability is the right question HERE specifically, and only here:
-	// the unit does not exist yet, so there is no location to resolve against —
-	// we are choosing where to create it. Resolve once and reuse `base` for the
-	// daemon-reload and enable below, so those cannot land in a different scope
-	// than the one we just wrote the unit into.
-	base, system := linuxSystemctl()
+	// Resolve against the EXISTING unit when there is one, and only fall back
+	// to bus reachability on a genuinely fresh install.
+	//
+	// Re-install is the case that matters. `sudo corten-matrix setup` has no
+	// user bus and writes a SYSTEM unit; running `install-service` later from a
+	// login shell does have one, so a bus-only choice would write a SECOND,
+	// user-scope unit and enable it. Two units, same ExecStart, same data dir
+	// and database — and since scope resolution checks user scope first, every
+	// later status/stop/uninstall would then address the user unit while the
+	// system one kept running. Resolving by location makes a re-install
+	// overwrite the unit that is already there.
+	//
+	// Resolve once and reuse `base` for the daemon-reload and enable below, so
+	// those cannot land in a different scope than the one just written.
+	base, system := linuxSystemctlFor("corten-matrix.service")
 	dir := filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user")
 	wantedBy := "default.target"
 	if system {
@@ -650,20 +665,71 @@ func serviceUninstall() {
 	// file that was never there and print "service removed" while the real
 	// unit stayed enabled and running.
 	unit := "corten-matrix.service"
-	base, system := linuxSystemctlFor(unit)
-	_ = streamRun(base[0], append(append([]string{}, base[1:]...), "disable", "--now", unit)...)
-	if system {
-		path := "/etc/systemd/system/" + unit
-		if os.Geteuid() != 0 {
-			_ = exec.Command("sudo", "rm", "-f", path).Run()
-		} else {
-			_ = os.Remove(path)
+	// Loop, because there can legitimately be a unit in BOTH scopes: the
+	// install scripts and `install-service` pick their scope by bus
+	// reachability, so a setup run under sudo (system unit) followed by one
+	// from a login shell (user unit) leaves two. Removing only the one that
+	// resolves first is how "removed" can be true and the bridge still runs.
+	removedAny := false
+	for _, userScope := range []bool{true, false} {
+		if !systemdUnitExists(userScope, unit) {
+			continue
 		}
-	} else {
-		_ = os.Remove(filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user", unit))
+		removedAny = true
+		base := []string{"systemctl"}
+		if userScope {
+			base = append(base, "--user")
+		} else if os.Geteuid() != 0 {
+			base = []string{"sudo", "systemctl"}
+		}
+		_ = streamRun(base[0], append(append([]string{}, base[1:]...), "disable", "--now", unit)...)
+		if userScope {
+			_ = os.Remove(filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user", unit))
+		} else {
+			path := "/etc/systemd/system/" + unit
+			if os.Geteuid() != 0 {
+				_ = exec.Command("sudo", "rm", "-f", path).Run()
+			} else {
+				_ = os.Remove(path)
+			}
+		}
+		// daemon-reload in the same scope we just modified.
+		_ = streamRun(base[0], append(append([]string{}, base[1:]...), "daemon-reload")...)
 	}
-	// daemon-reload in the same scope we just modified.
-	_ = streamRun(base[0], append(append([]string{}, base[1:]...), "daemon-reload")...)
+
+	// Say what is actually true. Every command above discards its error —
+	// sudo can be declined or absent, a system unit can refuse to disable —
+	// so the only trustworthy signal is whether the unit is still there.
+	// Printing unconditional success was the other half of the bug this
+	// function had: right scope, still a lie when the removal failed.
+	var leftover []string
+	for _, userScope := range []bool{true, false} {
+		if !systemdUnitExists(userScope, unit) {
+			continue
+		}
+		if userScope {
+			leftover = append(leftover, "user")
+		} else {
+			leftover = append(leftover, "system")
+		}
+	}
+	if len(leftover) > 0 {
+		fmt.Printf("corten-matrix service could NOT be fully removed — still present in the %s scope.\n",
+			strings.Join(leftover, " and "))
+		fmt.Println("Remove it manually, e.g.:")
+		for _, scope := range leftover {
+			if scope == "user" {
+				fmt.Printf("  systemctl --user disable --now %s && rm -f ~/.config/systemd/user/%s\n", unit, unit)
+			} else {
+				fmt.Printf("  sudo systemctl disable --now %s && sudo rm -f /etc/systemd/system/%s\n", unit, unit)
+			}
+		}
+		os.Exit(1)
+	}
+	if !removedAny {
+		fmt.Println("No corten-matrix service unit was installed; nothing to remove.")
+		os.Exit(0)
+	}
 	fmt.Println("corten-matrix service removed.")
 	os.Exit(0)
 }

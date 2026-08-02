@@ -4899,9 +4899,19 @@ pub fn init_logger() {
                 // next panic compare "different" too — so the flood burns the
                 // budget and prints a misleading "check this call site" line
                 // about a site that is known-guarded. A small fixed table of
-                // reported sites fixes that: each distinct site prints at most
-                // once per window, and the budget is spent only on sites that
-                // are genuinely new.
+                // reported sites fixes that: a site prints once per window, and
+                // the budget is spent only on sites that are genuinely new.
+                //
+                // Deliberately not fully atomic. The scan/claim below is
+                // scan-then-store, so two threads panicking at the same NEW
+                // site can both miss the scan and both print. Measured at
+                // roughly one duplicate per thousand first-sightings under
+                // realistic concurrency (the reachable case is the 4 parallel
+                // CloudKit downloads), worst case two lines for one site, and
+                // it can never exhaust the table. Tightening it means more
+                // lock-free machinery inside a panic hook — where a panic of
+                // our own aborts the process — to save an occasional duplicate
+                // log line. Not a trade worth making.
                 const BREADCRUMB_INTERVAL_SECS: u64 = 60;
                 const REPORTED_SLOTS: usize = 8;
                 static LAST_BREADCRUMB_SECS: AtomicU64 = AtomicU64::new(0);
