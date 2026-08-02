@@ -418,7 +418,7 @@ A periodic scrubber (every 5 minutes) NULLs the plaintext columns — `text`, `s
 
 Scrubbing the local cache is not data loss: the canonical copy of every message stays in Messages in iCloud on Apple's servers. The `cloud_message` table is only a staging cache for backfill, never the source of truth.
 
-On SQLite, the bridge also sets `_secure_delete=on` for every pooled connection, so the freed pages holding the old plaintext are zeroed rather than left readable on disk. This is SQLite-only; on Postgres the columns are NULLed identically, but scrubbed bytes sit in dead tuples until a routine `VACUUM` reclaims them (the bridge does not run `VACUUM FULL` automatically).
+On SQLite — the supported database — the bridge also sets `_secure_delete=on` for every pooled connection, so the freed pages holding the old plaintext are zeroed rather than left readable on disk. There is no equivalent on the unsupported Postgres path: the columns are NULLed identically, but the scrubbed bytes sit in dead tuples until a routine `VACUUM` reclaims them (the bridge does not run `VACUUM FULL` automatically), so plaintext stays recoverable from the data files for longer.
 
 Message **deletes and unsends** scrub the cached body right away — not waiting for the periodic tick — and are fail-closed. For inbound (Apple-side) deletes and unsends, a scrub failure makes the bridge skip emitting the Matrix removal, so the row stays scrub-eligible rather than leaking plaintext. For outbound (Matrix-initiated) redactions, the scrub failure is reported back to the framework so it won't drop its own message row before the body is cleared. The row itself is kept (soft-deleted, body NULLed) for echo detection — it isn't removed from the cache.
 
@@ -550,7 +550,7 @@ Most knobs live at the top level of the network connector config. Defaults shown
 | `carddav.email` / `carddav.url` / `carddav.username` / `carddav.password_encrypted` | *(unset)* | External CardDAV server for contact name resolution (Google with app passwords, Nextcloud, Radicale, Fastmail, etc.). Set up via the setup flow's CardDAV prompt. When configured, used instead of iCloud contacts. |
 | `backfill.max_initial_messages` | `2147483647` | Cap on messages per chat for the initial backfill (`2147483647` = uncapped). Setup writes this when CloudKit backfill is enabled — uncapped by default, or the per-chat limit (≥100) you pick on first install. |
 | `encryption.allow` | `false` | bridgev2 framework option. Set `true` to enable end-to-bridge encryption. |
-| `database.type` | `postgres` | bridgev2 framework option. `postgres` or `sqlite3-fk-wal`; setup asks during first run and defaults to `postgres`. |
+| `database.type` | `sqlite3-fk-wal` | bridgev2 framework option. Setup asks during first run and defaults to SQLite. **SQLite is the only supported database** — it is what the bridge is developed and tested against. `postgres` is accepted by the framework but unsupported here: it gets no testing, and problems specific to it are yours to diagnose. |
 | `debug_disable_privacy` | `false` | **Development only — leave `false` in any real deployment.** Turns off log anonymization and the message-body scrubber, and re-fills previously-scrubbed plaintext on the next CloudKit sync. See [Privacy](#privacy). Does not undo deletes/unsends and does not re-deliver anything to Matrix. |
 
 ## Build from source (macOS)
