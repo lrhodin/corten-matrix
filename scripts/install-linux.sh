@@ -50,13 +50,21 @@ else
 
     echo ""
     echo "Database:"
-    echo "  1) PostgreSQL (recommended)"
-    echo "  2) SQLite"
+    echo "  1) SQLite (recommended)"
+    echo "  2) PostgreSQL (unsupported)"
+    echo ""
+    echo "  SQLite is the only database this bridge is developed and tested"
+    echo "  against, and it is what every supported install uses. PostgreSQL"
+    echo "  is not supported: it gets no testing here, and problems specific"
+    echo "  to it are yours to diagnose. Pick SQLite unless you have a"
+    echo "  concrete reason not to and are comfortable on your own."
     read -p "Choice [1]: " DB_CHOICE
     DB_CHOICE="${DB_CHOICE:-1}"
 
-    if [ "$DB_CHOICE" = "1" ]; then
+    if [ "$DB_CHOICE" = "2" ]; then
         DB_TYPE="postgres"
+        echo ""
+        echo "WARNING: PostgreSQL is unsupported. Proceeding at your own risk."
         read -p "PostgreSQL URI [postgres://localhost/corten_matrix?sslmode=disable]: " DB_URI
         DB_URI="${DB_URI:-postgres://localhost/corten_matrix?sslmode=disable}"
     else
