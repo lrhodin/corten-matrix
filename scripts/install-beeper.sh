@@ -507,11 +507,18 @@ open('$CONFIG', 'w').write(text)
             fi
 
             # Encrypt password and patch config
-            CARDDAV_ARGS="--email $CARDDAV_EMAIL --password $CARDDAV_PASSWORD --url $CARDDAV_URL"
+            # Built as an ARRAY, not a string. A plain "$CARDDAV_ARGS"
+            # expansion word-splits, so a password containing a space arrives
+            # as two arguments — carddav-setup then sees only the part before
+            # the space and the rest lands as a stray positional. Spaces are
+            # deliberately NOT stripped: they can be a real part of the
+            # password, and it is the user's call whether to remove the ones
+            # providers add for readability.
+            CARDDAV_ARGS=(--email "$CARDDAV_EMAIL" --password "$CARDDAV_PASSWORD" --url "$CARDDAV_URL")
             if [ -n "$CARDDAV_USERNAME" ]; then
-                CARDDAV_ARGS="$CARDDAV_ARGS --username $CARDDAV_USERNAME"
+                CARDDAV_ARGS+=(--username "$CARDDAV_USERNAME")
             fi
-            CARDDAV_JSON=$("$BINARY" carddav-setup $CARDDAV_ARGS 2>/dev/null) || CARDDAV_JSON=""
+            CARDDAV_JSON=$("$BINARY" carddav-setup "${CARDDAV_ARGS[@]}" 2>/dev/null) || CARDDAV_JSON=""
 
             if [ -z "$CARDDAV_JSON" ]; then
                 echo "⚠  CardDAV setup failed. You can configure it manually in $CONFIG"

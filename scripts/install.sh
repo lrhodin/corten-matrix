@@ -44,13 +44,21 @@ else
 
     echo ""
     echo "Database:"
-    echo "  1) PostgreSQL (recommended)"
-    echo "  2) SQLite"
+    echo "  1) SQLite (recommended)"
+    echo "  2) PostgreSQL (unsupported)"
+    echo ""
+    echo "  SQLite is the only database this bridge is developed and tested"
+    echo "  against, and it is what every supported install uses. PostgreSQL"
+    echo "  is not supported: it gets no testing here, and problems specific"
+    echo "  to it are yours to diagnose. Pick SQLite unless you have a"
+    echo "  concrete reason not to and are comfortable on your own."
     read -p "Choice [1]: " DB_CHOICE
     DB_CHOICE="${DB_CHOICE:-1}"
 
-    if [ "$DB_CHOICE" = "1" ]; then
+    if [ "$DB_CHOICE" = "2" ]; then
         DB_TYPE="postgres"
+        echo ""
+        echo "WARNING: PostgreSQL is unsupported. Proceeding at your own risk."
         read -p "PostgreSQL URI [postgres://localhost/corten_matrix?sslmode=disable]: " DB_URI
         DB_URI="${DB_URI:-postgres://localhost/corten_matrix?sslmode=disable}"
     else
@@ -434,11 +442,18 @@ open('$CONFIG', 'w').write(text)
             fi
 
             # Encrypt password and patch config
-            CARDDAV_ARGS="--email $CARDDAV_EMAIL --password $CARDDAV_PASSWORD --url $CARDDAV_URL"
+            # Built as an ARRAY, not a string. A plain "$CARDDAV_ARGS"
+            # expansion word-splits, so a password containing a space arrives
+            # as two arguments — carddav-setup then sees only the part before
+            # the space and the rest lands as a stray positional. Spaces are
+            # deliberately NOT stripped: they can be a real part of the
+            # password, and it is the user's call whether to remove the ones
+            # providers add for readability.
+            CARDDAV_ARGS=(--email "$CARDDAV_EMAIL" --password "$CARDDAV_PASSWORD" --url "$CARDDAV_URL")
             if [ -n "$CARDDAV_USERNAME" ]; then
-                CARDDAV_ARGS="$CARDDAV_ARGS --username $CARDDAV_USERNAME"
+                CARDDAV_ARGS+=(--username "$CARDDAV_USERNAME")
             fi
-            CARDDAV_JSON=$("$BINARY" carddav-setup $CARDDAV_ARGS 2>/dev/null) || CARDDAV_JSON=""
+            CARDDAV_JSON=$("$BINARY" carddav-setup "${CARDDAV_ARGS[@]}" 2>/dev/null) || CARDDAV_JSON=""
 
             if [ -z "$CARDDAV_JSON" ]; then
                 echo "⚠  CardDAV setup failed. You can configure it manually in $CONFIG"
