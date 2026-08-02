@@ -4884,10 +4884,34 @@ pub fn init_logger() {
                 // since the last one. Two relaxed atomics only: a lock here
                 // could be held by the panicking thread, and a panic inside a
                 // panic hook aborts the process.
+                // A pure time gate is not enough on its own. The Ford-key loops
+                // panic repeatedly at a stable line, so a window opened by that
+                // flood would swallow the FIRST sighting of a genuinely new
+                // panic site — the one case this whole breadcrumb exists to
+                // surface. So gate on the site as well: a location that differs
+                // from the last one reported prints immediately, bounded to a
+                // few per window so an alternating flood can't reopen the noise
+                // problem the suppression is here to solve.
                 const BREADCRUMB_INTERVAL_SECS: u64 = 60;
+                const MAX_NOVEL_SITES_PER_WINDOW: u64 = 3;
                 static LAST_BREADCRUMB_SECS: AtomicU64 = AtomicU64::new(0);
                 static SUPPRESSED_COUNT: AtomicU64 = AtomicU64::new(0);
+                static LAST_SITE: AtomicU64 = AtomicU64::new(0);
+                static NOVEL_SITES_THIS_WINDOW: AtomicU64 = AtomicU64::new(0);
+
                 SUPPRESSED_COUNT.fetch_add(1, Ordering::Relaxed);
+                // FNV-1a over file+line. Inline and allocation-free: this runs
+                // inside a panic hook, where a panic of our own would abort.
+                let site = {
+                    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                    for b in file.as_bytes() {
+                        h ^= *b as u64;
+                        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                    }
+                    h ^= loc.line() as u64;
+                    h.wrapping_mul(0x0000_0100_0000_01b3)
+                };
+                let previous_site = LAST_SITE.swap(site, Ordering::Relaxed);
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -4898,14 +4922,30 @@ pub fn init_logger() {
                         .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
                         .is_ok()
                 {
+                    NOVEL_SITES_THIS_WINDOW.store(0, Ordering::Relaxed);
+                    // This panic is itself counted and is the latest of them,
+                    // so the location below really is the most recent one.
                     let swallowed = SUPPRESSED_COUNT.swap(0, Ordering::Relaxed);
                     warn!(
                         "suppressed {} rustpush MMCS/CloudKit panic(s) since the last breadcrumb; \
-                         most recent at {}:{} (rate-limited to one line per {}s). These are \
-                         EXPECTED for the catch_unwind-guarded recovery paths. If one shows up \
-                         next to a receive stall or a 'process task' line, an UNGUARDED call site \
-                         is unwinding its task.",
+                         most recent at {}:{} (this summary is rate-limited to one line per {}s). \
+                         These are EXPECTED for the catch_unwind-guarded recovery paths. If one \
+                         shows up next to a receive stall or a 'process task' line, an UNGUARDED \
+                         call site is unwinding its task.",
                         swallowed,
+                        file,
+                        loc.line(),
+                        BREADCRUMB_INTERVAL_SECS
+                    );
+                } else if previous_site != site
+                    && NOVEL_SITES_THIS_WINDOW.fetch_add(1, Ordering::Relaxed)
+                        < MAX_NOVEL_SITES_PER_WINDOW
+                {
+                    warn!(
+                        "suppressed rustpush panic at a DIFFERENT site than the last one reported: \
+                         {}:{}. Printed immediately rather than waiting for the {}s summary, \
+                         because a new site is the interesting case — check whether this call site \
+                         is actually inside a catch_unwind.",
                         file,
                         loc.line(),
                         BREADCRUMB_INTERVAL_SECS
@@ -7072,6 +7112,31 @@ pub struct Client {
     statuskit_interest_tokens: tokio::sync::Mutex<Vec<rustpush::statuskit::ChannelInterestToken>>,
 }
 
+/// Backdate the liveness stamp the Go receive-wedge watchdog polls, so its
+/// next tick sees a wedge and rebuilds the client.
+///
+/// `WrappedAPSConnection::seconds_since_last_inbound` reports `now - stamp`,
+/// and `runReceiveWedgeWatchdog` (pkg/connector/client.go) rebuilds once that
+/// crosses `receiveWedgeRecoverySecs`. When nothing is consuming APNs frames
+/// any more, the stamp would reach the threshold on its own — but only after
+/// the entire threshold has elapsed with inbound messages hitting the floor.
+/// Backdating collapses that to the watchdog's next 60s tick.
+///
+/// One hour is deliberately far past any plausible value of that constant
+/// (600s today) so the two stay decoupled, while still producing a readable
+/// `idle_secs` in the watchdog's log line.
+fn force_receive_wedge(last_inbound_ms: &AtomicU64) {
+    const FORCE_WEDGE_BACKDATE_MS: u64 = 60 * 60 * 1000;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    last_inbound_ms.store(
+        now_ms.saturating_sub(FORCE_WEDGE_BACKDATE_MS),
+        Ordering::Relaxed,
+    );
+}
+
 /// Held by the APNs process task for its entire life. Its `Drop` fires on
 /// every exit, but only *acts* when the task is unwinding on a panic —
 /// `thread::panicking()` is false on a normal return and on the `abort()` that
@@ -7081,6 +7146,14 @@ pub struct Client {
 /// outside: no task consumes APNs frames, the drain exits on its next frame,
 /// and inbound messages simply stop. The guards in the loop should make this
 /// unreachable; this is what happens if one of them ever misses.
+///
+/// NOTE: this backdate alone is not sufficient, and must not be relied on by
+/// itself. The drain task stamps `last_inbound_ms` on every frame BEFORE it
+/// discovers the receiver is gone, so the first frame to arrive after this
+/// fires — a keepalive Pong, so within ~60s on a live transport — overwrites
+/// it. `force_receive_wedge` is therefore applied AGAIN at that detection
+/// point in the drain, which is the write that actually survives. This one
+/// covers the window before the drain notices.
 struct ProcessTaskUnwindSentinel {
     last_inbound_ms: Arc<AtomicU64>,
 }
@@ -7095,24 +7168,7 @@ impl Drop for ProcessTaskUnwindSentinel {
              for this connection. Forcing the receive-wedge watchdog to rebuild the client on its \
              next tick instead of waiting out the full idle threshold."
         );
-        // The Go receive-wedge watchdog (pkg/connector/client.go,
-        // `receiveWedgeRecoverySecs`) polls `seconds_since_last_inbound()` on a
-        // 60s tick and rebuilds the client once it crosses the threshold.
-        // Nothing refreshes this stamp anymore, so it would get there on its
-        // own — but only after the whole threshold has elapsed with messages
-        // being dropped on the floor. Backdate the stamp so the very next tick
-        // trips it, turning a full wedge cycle of loss into at most ~60s.
-        //
-        // One hour is deliberately far past any plausible value of that
-        // constant (600s today), so the two stay decoupled, while still
-        // producing a sane-looking `idle_secs` in the watchdog's log line.
-        const FORCE_WEDGE_BACKDATE_MS: u64 = 60 * 60 * 1000;
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        self.last_inbound_ms
-            .store(now_ms.saturating_sub(FORCE_WEDGE_BACKDATE_MS), Ordering::Relaxed);
+        force_receive_wedge(&self.last_inbound_ms);
     }
 }
 
@@ -7405,17 +7461,29 @@ pub async fn new_client(
                                         if tx.send((msg, now_ms)).is_err() {
                                             // The receiver only drops if the process task
                                             // ended — either it unwound on a panic (see
-                                            // ProcessTaskUnwindSentinel, which logs and
-                                            // forces the wedge) or the whole receive task
-                                            // was aborted during teardown. Either way this
-                                            // is the end of inbound message processing for
-                                            // this client, not routine bookkeeping, so log
-                                            // it at a level that shows up by default.
+                                            // ProcessTaskUnwindSentinel) or the whole
+                                            // receive task was aborted during teardown.
+                                            // Either way this is the end of inbound message
+                                            // processing for this client, not routine
+                                            // bookkeeping, so log it at a level that shows
+                                            // up by default.
                                             error!(
                                                 "APNs process task is gone — no further inbound \
                                                  frames will be processed on this connection; \
                                                  stopping drain"
                                             );
+                                            // This is the write that matters. `now_ms` was
+                                            // already stored above, BEFORE we knew the
+                                            // receiver was gone — so it just overwrote any
+                                            // backdate the sentinel set when the process
+                                            // task unwound, and left the watchdog counting
+                                            // a fresh threshold from this very frame. Undo
+                                            // that here, at the one point that definitively
+                                            // knows nothing is consuming frames any more,
+                                            // so it holds regardless of how the process
+                                            // task died. Nothing writes this atomic after
+                                            // the break.
+                                            force_receive_wedge(&last_inbound_ms);
                                             break;
                                         }
                                     }
@@ -8233,6 +8301,30 @@ pub async fn new_client(
                             // guard exists for the call site nobody has thought
                             // about yet — losing one message beats losing every
                             // message for the length of a watchdog cycle.
+                            //
+                            // Scope, precisely: this covers the POST-handle()
+                            // body only. The StatusKit and FaceTime sections
+                            // earlier in this same loop iteration are outside
+                            // it, and are not uniformly guarded — StatusKit's
+                            // sk.handle() goes through spawn → JoinError, but
+                            // the receive_message workaround above it and
+                            // FaceTime's ft.handle() do not. A panic there
+                            // still unwinds the task. What limits the damage in
+                            // that case is force_receive_wedge (via the
+                            // sentinel and the drain's send-failure branch),
+                            // which turns it into a ~60s rebuild rather than a
+                            // full watchdog threshold — containment here,
+                            // fast recovery there.
+                            //
+                            // Also worth stating: for a panic that is
+                            // deterministic in the message (one peer sending a
+                            // shape that always trips this body), containment
+                            // means those messages are dropped indefinitely
+                            // rather than wedging the bridge. That is the
+                            // better trade, but it is a trade — the error!
+                            // below is the only signal, since the receive path
+                            // now stays healthy from the watchdog's point of
+                            // view.
                             let processed = {
                                 use futures::FutureExt;
                                 let body = async {
