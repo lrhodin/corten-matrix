@@ -3586,20 +3586,26 @@ func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portal
 	// the last substantive message and uses its direction as the read signal.
 	//
 	// The tiebreaker used to be `rowid DESC` — SQLite's implicit insertion
-	// counter, which Postgres tables do not have at all. `created_ts` is the
-	// closest portable stand-in (it is the insertion timestamp), but unlike
-	// rowid it is not unique: a batch upsert stamps every row in it with the
-	// same time.Now().UnixMilli(). Two messages sharing both timestamp_ms and
-	// created_ts would then order arbitrarily, and this query's single result
-	// decides the conversation's read state. `guid` breaks the remaining tie —
-	// it is half of the primary key, so it is always unique per login, which
-	// makes the result deterministic on both dialects.
+	// counter, which Postgres tables do not have at all. `guid` replaces it:
+	// it is half of the primary key, so it is unique per login and the result
+	// is deterministic on both dialects.
+	//
+	// Deliberately NOT `created_ts DESC, guid DESC`. created_ts adds no
+	// determinism (a batch upsert stamps every row in a batch with the same
+	// millisecond, so it is strictly less unique than guid) and it is not
+	// merely redundant — it OVERRIDES guid, which makes this query disagree
+	// with the paging queries that choose the message a read receipt actually
+	// targets. Those all order by (timestamp_ms, guid) alone — see
+	// listLatestMessages/listForwardMessages above and client.go's lastMsg.
+	// With created_ts in the middle, this can report "not read by me" for a
+	// conversation whose newest message by that ordering IS the user's own,
+	// and the receipt is then never sent.
 	var isFromMe bool
 	err := s.db.QueryRow(ctx, `
 		SELECT is_from_me FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
 		  AND tapback_type IS NULL
-		ORDER BY timestamp_ms DESC, created_ts DESC, guid DESC
+		ORDER BY timestamp_ms DESC, guid DESC
 		LIMIT 1
 	`, s.loginID, portalID).Scan(&isFromMe)
 	if err == nil {

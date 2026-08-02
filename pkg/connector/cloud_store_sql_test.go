@@ -195,8 +195,15 @@ func TestExistingDatabaseSurvivesTheDialectChanges(t *testing.T) {
 	}
 
 	// The integer-valued fwd_backfill_done rows must still satisfy the
-	// boolean predicates the queries now use. This is the specific risk of
-	// swapping =1/=0 for =TRUE/=FALSE on an already-populated database.
+	// boolean predicates the queries now use.
+	//
+	// Honest about what this proves: on SQLite, TRUE and FALSE are literally
+	// aliases for 1 and 0, so this assertion cannot fail there and reverting
+	// the boolean change would not break it. It is here to pin that the
+	// change is a genuine NO-OP on the supported database — which is the
+	// claim being made — not to catch a SQLite regression. The change exists
+	// for Postgres, where `BOOLEAN = 1` is a hard error and no test here can
+	// reach.
 	if !backfill.isForwardBackfillDone(ctx, "gid:legacy-done") {
 		t.Error("legacy fwd_backfill_done=1 row no longer matches fwd_backfill_done=TRUE")
 	}
@@ -211,8 +218,10 @@ func TestExistingDatabaseSurvivesTheDialectChanges(t *testing.T) {
 		t.Errorf("getForwardBackfillDonePortals = %v, want only gid:legacy-done", done)
 	}
 
-	// Legacy BLOB data must read back byte-identical through the new
-	// dialect-typed column declaration.
+	// Legacy BLOB data must read back byte-identical after migration. Note
+	// that sqlBlobType returns "BLOB" on SQLite, i.e. the declaration is
+	// unchanged here — that is deliberate, and this asserts it, rather than
+	// asserting that some new SQLite type name round-trips.
 	rows, err := profiles.loadAll(ctx)
 	if err != nil {
 		t.Fatalf("loadAll over legacy DB: %v", err)
@@ -370,15 +379,21 @@ func TestInsertOrIgnoreReplacementsAreNoOpOnConflict(t *testing.T) {
 	}
 }
 
-// TestGetConversationReadByMeIsDeterministic guards the ORDER BY change.
+// TestGetConversationReadByMeMatchesTheReceiptTarget guards the ORDER BY.
 //
-// The tiebreaker used to be SQLite's implicit rowid, which is unique. Postgres
-// has no rowid, so it became created_ts — which is NOT unique, since a batch
-// upsert stamps every row with the same millisecond. Two messages tied on both
-// timestamp_ms and created_ts would then order arbitrarily, and this query's
-// single row decides whether the conversation shows as read. guid completes
-// the ordering; this test fails if that tiebreaker is dropped.
-func TestGetConversationReadByMeIsDeterministic(t *testing.T) {
+// The old tiebreaker was SQLite's implicit rowid; Postgres has no rowid, so it
+// had to change. What it must change TO is `guid DESC` alone, matching every
+// paging query in this file (listLatestMessages, listForwardMessages, and the
+// windowed variants) — because those choose the message that a read receipt
+// actually targets, and this query decides whether that receipt is sent at all.
+// If the two orderings disagree, the bridge decides "not read by me" about a
+// different message than the one it would have acknowledged.
+//
+// Adding `created_ts DESC` ahead of guid looks harmless and is not: created_ts
+// is stamped once per batch, so it is less unique than guid, and it overrides
+// guid rather than backing it up. This test constructs exactly that
+// disagreement, so it fails if created_ts is reintroduced into the ORDER BY.
+func TestGetConversationReadByMeMatchesTheReceiptTarget(t *testing.T) {
 	ctx := context.Background()
 	db := newTestSQLiteDB(t)
 	store := newCloudBackfillStore(db, testSQLLoginID)
@@ -386,32 +401,51 @@ func TestGetConversationReadByMeIsDeterministic(t *testing.T) {
 		t.Fatalf("ensureSchema: %v", err)
 	}
 
-	// Two messages tied on timestamp_ms AND created_ts, differing in
-	// direction, inserted so that neither insertion order nor rowid order
-	// agrees with guid order.
+	// Two messages tied on timestamp_ms. guid order and created_ts order
+	// point at DIFFERENT rows with different directions:
+	//   bbbb (outgoing) — highest guid, but the OLDER created_ts
+	//   aaaa (incoming) — lowest guid, but the NEWER created_ts
+	// Ordering by guid selects bbbb -> read by me. Ordering by created_ts
+	// first selects aaaa -> not read by me. Only the former agrees with the
+	// paging queries, which order by (timestamp_ms, guid).
 	ts := time.Now().UnixMilli()
 	for _, m := range []struct {
-		guid     string
-		isFromMe bool
+		guid      string
+		isFromMe  bool
+		createdTS int64
 	}{
-		{"bbbb-outgoing", true},
-		{"aaaa-incoming", false},
+		{"bbbb-outgoing", true, ts - 1000},
+		{"aaaa-incoming", false, ts + 1000},
 	} {
 		if _, err := db.Exec(ctx, `
 			INSERT INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, created_ts, updated_ts)
 			VALUES ($1, $2, $3, $4, $5, $6, $6)
-		`, testSQLLoginID, m.guid, "gid:portal-1", ts, m.isFromMe, ts); err != nil {
+		`, testSQLLoginID, m.guid, "gid:portal-1", ts, m.isFromMe, m.createdTS); err != nil {
 			t.Fatalf("insert %s: %v", m.guid, err)
 		}
 	}
 
-	// Highest guid wins the tie: "bbbb-outgoing", which is from me.
+	// Cross-check against the ordering the paging queries use, so this test
+	// keeps meaning something even if both are changed together.
+	var receiptTarget string
+	if err := db.QueryRow(ctx, `
+		SELECT guid FROM cloud_message
+		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND tapback_type IS NULL
+		ORDER BY timestamp_ms DESC, guid DESC LIMIT 1
+	`, testSQLLoginID, "gid:portal-1").Scan(&receiptTarget); err != nil {
+		t.Fatalf("resolve receipt target: %v", err)
+	}
+	if receiptTarget != "bbbb-outgoing" {
+		t.Fatalf("test setup wrong: paging order picked %q, expected bbbb-outgoing", receiptTarget)
+	}
+
 	first, err := store.getConversationReadByMe(ctx, "gid:portal-1")
 	if err != nil {
 		t.Fatalf("getConversationReadByMe: %v", err)
 	}
 	if !first {
-		t.Error("getConversationReadByMe = false; the guid tiebreaker should select bbbb-outgoing")
+		t.Error("getConversationReadByMe = false, but the message a receipt would target " +
+			"(bbbb-outgoing) is from me — the ORDER BY disagrees with the paging queries")
 	}
 	for i := 0; i < 5; i++ {
 		got, err := store.getConversationReadByMe(ctx, "gid:portal-1")
