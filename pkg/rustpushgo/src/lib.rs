@@ -4870,6 +4870,47 @@ pub fn init_logger() {
                 "icloud\\cloudkit.rs",
             ];
             if noisy.iter().any(|p| file.ends_with(p)) {
+                // Suppress the flood, but never go completely silent. This
+                // filter matches by FILE, not by "is anyone actually catching
+                // this" — so it erased UNCAUGHT panics from these files just
+                // as thoroughly. That is exactly how an unguarded
+                // `expect("No record found?")` reached from the inline
+                // ShareProfile fetch was able to unwind the APNs process task
+                // and stall all message receiving with zero trace in the logs.
+                //
+                // Keep the flood protection (the Ford-key brute force panics
+                // once per wrong key) but always leave a breadcrumb naming the
+                // most recent file:line and how many panics were swallowed
+                // since the last one. Two relaxed atomics only: a lock here
+                // could be held by the panicking thread, and a panic inside a
+                // panic hook aborts the process.
+                const BREADCRUMB_INTERVAL_SECS: u64 = 60;
+                static LAST_BREADCRUMB_SECS: AtomicU64 = AtomicU64::new(0);
+                static SUPPRESSED_COUNT: AtomicU64 = AtomicU64::new(0);
+                SUPPRESSED_COUNT.fetch_add(1, Ordering::Relaxed);
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let last = LAST_BREADCRUMB_SECS.load(Ordering::Relaxed);
+                if now_secs.saturating_sub(last) >= BREADCRUMB_INTERVAL_SECS
+                    && LAST_BREADCRUMB_SECS
+                        .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    let swallowed = SUPPRESSED_COUNT.swap(0, Ordering::Relaxed);
+                    warn!(
+                        "suppressed {} rustpush MMCS/CloudKit panic(s) since the last breadcrumb; \
+                         most recent at {}:{} (rate-limited to one line per {}s). These are \
+                         EXPECTED for the catch_unwind-guarded recovery paths. If one shows up \
+                         next to a receive stall or a 'process task' line, an UNGUARDED call site \
+                         is unwinding its task.",
+                        swallowed,
+                        file,
+                        loc.line(),
+                        BREADCRUMB_INTERVAL_SECS
+                    );
+                }
                 return;
             }
         }
@@ -6288,6 +6329,31 @@ async fn download_one_mmcs_attachment_once(
     Ok(unwrapped)
 }
 
+/// Await `fut`, converting an escaping panic into `None`.
+///
+/// Upstream rustpush signals several routine "it isn't there" outcomes with a
+/// panic instead of an error — `FetchedRecords::get_record`'s
+/// `.expect("No record found?")` when CloudKit returns no matching record, the
+/// `unwrap()`s in the MMCS Ford paths — so any call into those from a
+/// long-lived task has to opt out of unwinding or the task dies with it.
+///
+/// `what` names the call site, because the panic's own message is very likely
+/// suppressed: `init_logger`'s hook silences panics originating in
+/// `icloud/mmcs.rs` and `icloud/cloudkit.rs`, which is where these land.
+async fn guard_panic<F: std::future::Future>(what: &str, fut: F) -> Option<F::Output> {
+    use futures::FutureExt;
+    match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(v) => Some(v),
+        Err(_) => {
+            error!(
+                "{} panicked inside upstream rustpush — contained here; continuing without it",
+                what
+            );
+            None
+        }
+    }
+}
+
 /// Download the group photo for an IconChange message via MMCS.
 /// Apple delivers group photo changes as MMCS file transfers inside IconChange
 /// APNs messages — NOT via CloudKit. This downloads the photo inline so the
@@ -6309,14 +6375,30 @@ async fn download_icon_change_photo(
                 iris: false,
             };
             let mut buf: Vec<u8> = Vec::new();
-            match att.get_attachment(conn, &mut buf, |_, _| {}).await {
-                Ok(()) => {
+            // This is upstream's V1-only `get_mmcs` path — unlike ordinary
+            // attachments, which go through the manual Ford downloader in
+            // `download_one_mmcs_attachment_once` — so it can panic rather
+            // than return an error. It runs on the APNs process task, so an
+            // escaping panic would unwind the receive loop.
+            //
+            // `get_attachment` writes into `buf` progressively, so on a panic
+            // `buf` may hold a truncated image that is indistinguishable from
+            // a complete one. Drop it rather than ship a corrupt avatar to
+            // Matrix; the message itself still goes through.
+            let result = guard_panic(
+                "IconChange group-photo MMCS download",
+                att.get_attachment(conn, &mut buf, |_, _| {}),
+            )
+            .await;
+            match result {
+                Some(Ok(())) => {
                     info!("Downloaded group photo via MMCS ({} bytes)", buf.len());
                     wrapped.icon_change_photo_data = Some(buf);
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     error!("Failed to download group photo via MMCS: {}", e);
                 }
+                None => {}
             }
         }
     }
@@ -6990,6 +7072,50 @@ pub struct Client {
     statuskit_interest_tokens: tokio::sync::Mutex<Vec<rustpush::statuskit::ChannelInterestToken>>,
 }
 
+/// Held by the APNs process task for its entire life. Its `Drop` fires on
+/// every exit, but only *acts* when the task is unwinding on a panic —
+/// `thread::panicking()` is false on a normal return and on the `abort()` that
+/// teardown uses, so a clean shutdown stays silent.
+///
+/// It exists because a dead process task is close to invisible from the
+/// outside: no task consumes APNs frames, the drain exits on its next frame,
+/// and inbound messages simply stop. The guards in the loop should make this
+/// unreachable; this is what happens if one of them ever misses.
+struct ProcessTaskUnwindSentinel {
+    last_inbound_ms: Arc<AtomicU64>,
+}
+
+impl Drop for ProcessTaskUnwindSentinel {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        error!(
+            "APNs process task is UNWINDING ON A PANIC — inbound message processing has stopped \
+             for this connection. Forcing the receive-wedge watchdog to rebuild the client on its \
+             next tick instead of waiting out the full idle threshold."
+        );
+        // The Go receive-wedge watchdog (pkg/connector/client.go,
+        // `receiveWedgeRecoverySecs`) polls `seconds_since_last_inbound()` on a
+        // 60s tick and rebuilds the client once it crosses the threshold.
+        // Nothing refreshes this stamp anymore, so it would get there on its
+        // own — but only after the whole threshold has elapsed with messages
+        // being dropped on the floor. Backdate the stamp so the very next tick
+        // trips it, turning a full wedge cycle of loss into at most ~60s.
+        //
+        // One hour is deliberately far past any plausible value of that
+        // constant (600s today), so the two stay decoupled, while still
+        // producing a sane-looking `idle_secs` in the watchdog's log line.
+        const FORCE_WEDGE_BACKDATE_MS: u64 = 60 * 60 * 1000;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.last_inbound_ms
+            .store(now_ms.saturating_sub(FORCE_WEDGE_BACKDATE_MS), Ordering::Relaxed);
+    }
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn new_client(
     connection: &WrappedAPSConnection,
@@ -7277,7 +7403,19 @@ pub async fn new_client(
                                         }
                                         drain_pending.fetch_add(1, Ordering::Relaxed);
                                         if tx.send((msg, now_ms)).is_err() {
-                                            info!("Process task gone, stopping drain");
+                                            // The receiver only drops if the process task
+                                            // ended — either it unwound on a panic (see
+                                            // ProcessTaskUnwindSentinel, which logs and
+                                            // forces the wedge) or the whole receive task
+                                            // was aborted during teardown. Either way this
+                                            // is the end of inbound message processing for
+                                            // this client, not routine bookkeeping, so log
+                                            // it at a level that shows up by default.
+                                            error!(
+                                                "APNs process task is gone — no further inbound \
+                                                 frames will be processed on this connection; \
+                                                 stopping drain"
+                                            );
                                             break;
                                         }
                                     }
@@ -7374,6 +7512,11 @@ pub async fn new_client(
             });
 
             // --- Process task: mpsc → handle + callback -----------------
+            // Armed for the lifetime of the loop below; see the type's docs.
+            // Only fires if this task unwinds on a panic.
+            let _unwind_sentinel = ProcessTaskUnwindSentinel {
+                last_inbound_ms: last_inbound_ms.clone(),
+            };
             const MAX_RETRIES: u32 = 5;
             const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 
@@ -8065,81 +8208,121 @@ pub async fn new_client(
                     };
                     match handled {
                         Ok(Some(msg_inst)) => {
-                            // Certify delivery back to the sender when the
-                            // incoming message carries a certified context.
-                            // Without this, the sender's device displays a
-                            // "not delivered" indicator even though we
-                            // received and decrypted the message successfully.
-                            if let Some(ref context) = msg_inst.certified_context {
-                                if let Err(e) = client_for_recv
-                                    .identity
-                                    .certify_delivery("com.apple.madrid", context, msg_inst.send_delivered)
-                                    .await
-                                {
-                                    warn!("Failed to certify delivery for {}: {:?}", msg_inst.id, e);
-                                }
-                            }
-
-                            // Diagnostic: surface profile-sharing arrivals so we can confirm
-                            // APNs is actually delivering them. Logged here, before the
-                            // has_payload gate, so a future filter regression can't hide it.
-                            match &msg_inst.message {
-                                Message::ShareProfile(p) => info!(
-                                    "received Message::ShareProfile from {:?} (record_key_len={}, has_poster={})",
-                                    msg_inst.sender,
-                                    p.cloud_kit_record_key.len(),
-                                    p.poster.is_some()
-                                ),
-                                Message::UpdateProfile(u) => info!(
-                                    "received Message::UpdateProfile from {:?} (share_contacts={}, has_embedded_profile={})",
-                                    msg_inst.sender,
-                                    u.share_contacts,
-                                    u.profile.is_some()
-                                ),
-                                Message::UpdateProfileSharing(s) => info!(
-                                    "received Message::UpdateProfileSharing from {:?} (version={}, dismissed={}, all={})",
-                                    msg_inst.sender,
-                                    s.version,
-                                    s.shared_dismissed.len(),
-                                    s.shared_all.len()
-                                ),
-                                _ => {}
-                            }
-
-                            if msg_inst.has_payload() || matches!(msg_inst.message, Message::Typing(_, _) | Message::Read | Message::Delivered | Message::Error(_) | Message::PeerCacheInvalidate) {
-                                let mut wrapped = message_inst_to_wrapped(&msg_inst);
-
-                                // Mark as stored if within the post-reconnect window.
-                                // Uses the drain timestamp (when the message was received
-                                // from APNs) instead of now, so MMCS download time and
-                                // retry backoff don't push messages past the window.
-                                let reconn = reconnected_at.load(Ordering::Relaxed);
-                                if reconn > 0 {
-                                    let delta = drain_ts.saturating_sub(reconn);
-                                    wrapped.is_stored_message = delta < RECONNECT_WINDOW_MS;
-                                    if wrapped.is_stored_message {
-                                        info!("Stored message detected: uuid={} delta={}ms (window={}ms)", wrapped.uuid, delta, RECONNECT_WINDOW_MS);
+                            // BACKSTOP GUARD. Everything from here to
+                            // `callback.on_message` runs on the APNs process
+                            // task and sits OUTSIDE handle()'s guard above, yet
+                            // it reaches straight into the two subsystems that
+                            // signal "not there" with a panic rather than an
+                            // error: the IDS identity manager (certify_delivery)
+                            // and rustpush's CloudKit/MMCS download paths.
+                            //
+                            // A panic escaping this arm unwinds the process task
+                            // outright. The drain task's next `tx.send` then
+                            // fails ("Process task gone"), the drain exits, and
+                            // NOTHING consumes APNs frames until the Go-side
+                            // receive-wedge watchdog rebuilds the client — every
+                            // message Apple pushes in that window is lost. It
+                            // was invisible on top of that, because the panic
+                            // hook drops panics originating in cloudkit.rs/
+                            // mmcs.rs whether or not anything catches them.
+                            //
+                            // The individual calls below carry their own
+                            // narrower guards, so the ordinary failure degrades
+                            // gracefully: the message still reaches Matrix, just
+                            // without an avatar or a group photo. This outer
+                            // guard exists for the call site nobody has thought
+                            // about yet — losing one message beats losing every
+                            // message for the length of a watchdog cycle.
+                            let processed = {
+                                use futures::FutureExt;
+                                let body = async {
+                                    // Certify delivery back to the sender when the
+                                    // incoming message carries a certified context.
+                                    // Without this, the sender's device displays a
+                                    // "not delivered" indicator even though we
+                                    // received and decrypted the message successfully.
+                                    if let Some(ref context) = msg_inst.certified_context {
+                                        if let Err(e) = client_for_recv
+                                            .identity
+                                            .certify_delivery("com.apple.madrid", context, msg_inst.send_delivered)
+                                            .await
+                                        {
+                                            warn!("Failed to certify delivery for {}: {:?}", msg_inst.id, e);
+                                        }
                                     }
-                                }
 
-                                // Download MMCS attachments so Go receives inline data
-                                download_mmcs_attachments(&mut wrapped, &msg_inst, &conn_for_download).await;
-                                // Download group photo for IconChange messages via MMCS
-                                if wrapped.is_icon_change && !wrapped.group_photo_cleared {
-                                    download_icon_change_photo(&mut wrapped, &msg_inst, &conn_for_download).await;
-                                }
-                                // Download Name & Photo Sharing profile from CloudKit
-                                // (mirrors the IconChange MMCS pattern: fetch in Rust,
-                                // hand Go ready-to-display name + avatar bytes).
-                                if wrapped.is_share_profile {
-                                    if let Some(client_arc) = client_weak_for_loop
-                                        .get()
-                                        .and_then(|w| w.upgrade())
-                                    {
-                                        client_arc.populate_inline_share_profile(&msg_inst, &mut wrapped).await;
+                                    // Diagnostic: surface profile-sharing arrivals so we can confirm
+                                    // APNs is actually delivering them. Logged here, before the
+                                    // has_payload gate, so a future filter regression can't hide it.
+                                    match &msg_inst.message {
+                                        Message::ShareProfile(p) => info!(
+                                            "received Message::ShareProfile from {:?} (record_key_len={}, has_poster={})",
+                                            msg_inst.sender,
+                                            p.cloud_kit_record_key.len(),
+                                            p.poster.is_some()
+                                        ),
+                                        Message::UpdateProfile(u) => info!(
+                                            "received Message::UpdateProfile from {:?} (share_contacts={}, has_embedded_profile={})",
+                                            msg_inst.sender,
+                                            u.share_contacts,
+                                            u.profile.is_some()
+                                        ),
+                                        Message::UpdateProfileSharing(s) => info!(
+                                            "received Message::UpdateProfileSharing from {:?} (version={}, dismissed={}, all={})",
+                                            msg_inst.sender,
+                                            s.version,
+                                            s.shared_dismissed.len(),
+                                            s.shared_all.len()
+                                        ),
+                                        _ => {}
                                     }
-                                }
-                                callback.on_message(wrapped);
+
+                                    if msg_inst.has_payload() || matches!(msg_inst.message, Message::Typing(_, _) | Message::Read | Message::Delivered | Message::Error(_) | Message::PeerCacheInvalidate) {
+                                        let mut wrapped = message_inst_to_wrapped(&msg_inst);
+
+                                        // Mark as stored if within the post-reconnect window.
+                                        // Uses the drain timestamp (when the message was received
+                                        // from APNs) instead of now, so MMCS download time and
+                                        // retry backoff don't push messages past the window.
+                                        let reconn = reconnected_at.load(Ordering::Relaxed);
+                                        if reconn > 0 {
+                                            let delta = drain_ts.saturating_sub(reconn);
+                                            wrapped.is_stored_message = delta < RECONNECT_WINDOW_MS;
+                                            if wrapped.is_stored_message {
+                                                info!("Stored message detected: uuid={} delta={}ms (window={}ms)", wrapped.uuid, delta, RECONNECT_WINDOW_MS);
+                                            }
+                                        }
+
+                                        // Download MMCS attachments so Go receives inline data
+                                        download_mmcs_attachments(&mut wrapped, &msg_inst, &conn_for_download).await;
+                                        // Download group photo for IconChange messages via MMCS
+                                        if wrapped.is_icon_change && !wrapped.group_photo_cleared {
+                                            download_icon_change_photo(&mut wrapped, &msg_inst, &conn_for_download).await;
+                                        }
+                                        // Download Name & Photo Sharing profile from CloudKit
+                                        // (mirrors the IconChange MMCS pattern: fetch in Rust,
+                                        // hand Go ready-to-display name + avatar bytes).
+                                        if wrapped.is_share_profile {
+                                            if let Some(client_arc) = client_weak_for_loop
+                                                .get()
+                                                .and_then(|w| w.upgrade())
+                                            {
+                                                client_arc.populate_inline_share_profile(&msg_inst, &mut wrapped).await;
+                                            }
+                                        }
+                                        callback.on_message(wrapped);
+                                    }
+                                };
+                                std::panic::AssertUnwindSafe(body).catch_unwind().await
+                            };
+                            if processed.is_err() {
+                                error!(
+                                    "post-handle processing panicked for message {} — dropping it \
+                                     to keep the APNs process task alive. Receiving continues; the \
+                                     breadcrumb above names the upstream file:line if the panic \
+                                     came from the suppressed MMCS/CloudKit set.",
+                                    msg_inst.id
+                                );
                             }
                             break; // success
                         }
@@ -8374,18 +8557,15 @@ impl Client {
             (Some(rk), Some(dk)) => (rk.clone(), dk.clone(), wrapped.share_profile_has_poster),
             _ => return,
         };
+        // ALWAYS None — never ask CloudKit for the poster (see the note on
+        // `fetch_profile`, which does the same for the same reasons). We only
+        // consume the name and the avatar; the synthesised `SharedPoster` this
+        // used to build could not produce a usable poster and actively broke
+        // the fetch it rode along with.
         let share_msg = rustpush::ShareProfileMessage {
             cloud_kit_record_key: record_key,
             cloud_kit_decryption_record_key: decryption_key,
-            poster: if has_poster {
-                Some(rustpush::SharedPoster {
-                    low_res_wallpaper_tag: vec![],
-                    wallpaper_tag: vec![],
-                    message_tag: vec![],
-                })
-            } else {
-                None
-            },
+            poster: None,
         };
 
         let key_prefix: String = share_msg.cloud_kit_record_key.chars().take(8).collect();
@@ -8399,8 +8579,16 @@ impl Client {
                 return;
             }
         };
-        match profiles.get_record(&share_msg).await {
-            Ok(record) => {
+        // Unlike `fetch_profile`, which Go calls on its own goroutine, this
+        // runs on the APNs *process task*. A panic escaping here unwinds that
+        // task outright: the drain task's next `tx.send` then fails, nothing
+        // consumes APNs frames, and every message Apple pushes is lost until
+        // the Go receive-wedge watchdog rebuilds the client. `get_record`
+        // panics whenever the peer has rotated or deleted the record we cached
+        // a key for, which is routine. Keys stay on the wrapped message either
+        // way, so the Go-side periodic refresh can still recover the profile.
+        match guard_panic("inline ShareProfile CloudKit fetch", profiles.get_record(&share_msg)).await {
+            Some(Ok(record)) => {
                 info!(
                     "inline ShareProfile fetch ok (record_key={}…, name='{}', avatar_bytes={})",
                     key_prefix,
@@ -8412,12 +8600,18 @@ impl Client {
                 wrapped.share_profile_last_name = Some(record.name.last);
                 wrapped.share_profile_avatar = record.image;
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 warn!(
-                    "inline ShareProfile fetch failed (record_key={}…, has_poster={}): {:?}",
-                    key_prefix,
-                    share_msg.poster.is_some(),
-                    e
+                    "inline ShareProfile fetch failed (record_key={}…, peer_has_poster={}): {:?}",
+                    key_prefix, has_poster, e
+                );
+            }
+            None => {
+                warn!(
+                    "inline ShareProfile fetch panicked in upstream CloudKit (record_key={}…, \
+                     peer_has_poster={}) — the record was almost certainly rotated or deleted; \
+                     treating it as a fetch failure",
+                    key_prefix, has_poster
                 );
             }
         }
@@ -9554,21 +9748,37 @@ impl Client {
             key_prefix, dec_len, has_poster
         );
         let profiles = self.get_or_init_profiles_client().await?;
+        // ALWAYS None, even when the peer advertised a poster.
+        //
+        // This used to synthesise a `SharedPoster` with empty tags whenever
+        // `has_poster` was set, on the theory that upstream only checks
+        // `poster.is_some()` to decide whether to pull the wallpaper record.
+        // It checks it twice, and both are harmful to us:
+        //
+        //   1. `name_photo_sharing.rs` additionally requests the separate
+        //      `{record_key}-wp` record and calls `FetchedRecords::get_record`
+        //      on it. That returns `R`, not `Result<R>`, so an absent record
+        //      is not an error path — it is `.expect("No record found?")`.
+        //      Peers routinely advertise a poster whose `-wp` record we cannot
+        //      fetch, so this was a panic we asked for.
+        //
+        //   2. Even when the `-wp` record IS present, the decrypt does
+        //      `decrypt_verify("wm", &poster.wm, &poster.share_meta.message_tag)`
+        //      and rejects on `field.tag != tag`. `share_meta` is the struct we
+        //      synthesised, whose tags are empty, so the comparison against the
+        //      real HMAC could never match. It returned
+        //      `NickNameCryptoError("Decrypt tag mismatch!")` — which fails the
+        //      WHOLE record, taking the name and avatar down with it.
+        //
+        // So `has_poster == true` had exactly two outcomes: panic, or lose the
+        // profile. Asking for `poster: None` fetches only the record we
+        // actually read, and makes these profiles work for the first time.
+        // `has_poster` stays in the signature (it is a uniffi export and the Go
+        // side persists it per row) but is now diagnostic only.
         let share_msg = rustpush::ShareProfileMessage {
             cloud_kit_record_key: record_key,
             cloud_kit_decryption_record_key: decryption_key,
-            poster: if has_poster {
-                // Minimal poster struct — the fetch path only checks
-                // `poster.is_some()` to decide whether to pull the wallpaper
-                // record alongside the profile record.
-                Some(rustpush::SharedPoster {
-                    low_res_wallpaper_tag: vec![],
-                    wallpaper_tag: vec![],
-                    message_tag: vec![],
-                })
-            } else {
-                None
-            },
+            poster: None,
         };
         // The cloudkit.rs `FetchedRecords::get_record` does
         // `.expect("No record found?")` when CloudKit returns a response
@@ -9576,13 +9786,11 @@ impl Client {
         // peer rotated/deleted their shared-profile record after we cached
         // its key, but that panic → crosses the FFI boundary →
         // takes the bridge down (and systemd restarts into the same row,
-        // crashloop). Wrap in catch_unwind so the panic becomes an error
-        // and the Go-side periodic refresh logs+skips the stale row.
-        use futures::FutureExt;
-        let fetch_fut = profiles.get_record(&share_msg);
-        let record = match std::panic::AssertUnwindSafe(fetch_fut).catch_unwind().await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
+        // crashloop). `guard_panic` turns the panic into an error so the
+        // Go-side periodic refresh logs+skips the stale row.
+        let record = match guard_panic("fetch_profile CloudKit fetch", profiles.get_record(&share_msg)).await {
+            Some(Ok(r)) => r,
+            Some(Err(e)) => {
                 warn!(
                     "fetch_profile failed (record_key={}…, has_poster={}): {:?}",
                     key_prefix, has_poster, e
@@ -9591,9 +9799,9 @@ impl Client {
                     msg: format!("Failed to fetch profile: {:?}", e),
                 });
             }
-            Err(_) => {
+            None => {
                 warn!(
-                    "fetch_profile panicked in upstream CloudKit (record_key={}…, has_poster={}) — likely record rotated/deleted; treating as fetch error",
+                    "fetch_profile panicked in upstream CloudKit (record_key={}…, peer_has_poster={}) — likely record rotated/deleted; treating as fetch error",
                     key_prefix, has_poster
                 );
                 return Err(WrappedError::GenericError {
