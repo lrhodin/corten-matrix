@@ -162,13 +162,62 @@ func serviceCtl(action string) {
 	os.Exit(0)
 }
 
-// linuxSystemctl picks the systemctl mode: --user when a user session bus is
-// reachable (a normal login), else system. Containers (LXC) and SSH-without-
-// lingering have no user bus — `systemctl --user` there dies with "Failed to
-// connect to bus", and the install scripts fall back to a SYSTEM unit
-// (SYSTEMD_MODE=system) in that case, which this drives instead.
+// userBusReachable reports whether a systemd user session bus is available.
+// Containers (LXC) and SSH-without-lingering have none — `systemctl --user`
+// there dies with "Failed to connect to bus".
+func userBusReachable() bool {
+	return exec.Command("systemctl", "--user", "show-environment").Run() == nil
+}
+
+// systemdUnitExists reports whether `unit` is installed in the given scope.
+// Probed with plain `systemctl` (never sudo): reading unit state needs no
+// privileges, and we must not prompt for a password just to locate a unit.
+func systemdUnitExists(userScope bool, unit string) bool {
+	args := []string{}
+	if userScope {
+		args = append(args, "--user")
+	}
+	args = append(args, "cat", "--no-pager", unit)
+	cmd := exec.Command("systemctl", args...)
+	cmd.Stdout, cmd.Stderr = nil, nil
+	return cmd.Run() == nil
+}
+
+// linuxSystemctl picks the systemctl mode with no particular unit in mind:
+// --user when a user session bus is reachable (a normal login), else system.
+// Prefer linuxSystemctlFor when the unit is known — bus reachability alone
+// does not tell you where the unit actually lives.
 func linuxSystemctl() (base []string, system bool) {
-	if exec.Command("systemctl", "--user", "show-environment").Run() == nil {
+	return linuxSystemctlFor("")
+}
+
+// linuxSystemctlFor picks the systemctl mode for a SPECIFIC unit.
+//
+// Bus reachability on its own is the wrong question, and getting it wrong is
+// silent. `corten-matrix setup` run under sudo re-execs the install script via
+// `sudo -u $SUDO_USER -H env ...`, an environment with no XDG_RUNTIME_DIR or
+// DBUS_SESSION_BUS_ADDRESS — so the script's own `systemctl --user` probe
+// fails and it installs a SYSTEM unit. Later, from a normal login shell, the
+// user bus IS reachable, so a reachability-only check would pick `--user` and
+// report "Unit corten-matrix.service could not be found" for a service that is
+// installed and running.
+//
+// So: ask where the unit actually is, and only fall back to bus reachability
+// when it is nowhere to be found (e.g. before install).
+func linuxSystemctlFor(unit string) (base []string, system bool) {
+	hasUserBus := userBusReachable()
+	if unit != "" {
+		if hasUserBus && systemdUnitExists(true, unit) {
+			return []string{"systemctl", "--user"}, false
+		}
+		if systemdUnitExists(false, unit) {
+			if os.Geteuid() == 0 {
+				return []string{"systemctl"}, true
+			}
+			return []string{"sudo", "systemctl"}, true
+		}
+	}
+	if hasUserBus {
 		return []string{"systemctl", "--user"}, false
 	}
 	if os.Geteuid() == 0 {
@@ -181,6 +230,18 @@ func linuxSystemctl() (base []string, system bool) {
 func sysctl(args ...string) error {
 	b, _ := linuxSystemctl()
 	return streamRun(b[0], append(append([]string{}, b[1:]...), args...)...)
+}
+
+// sysctlUnit streams a systemctl action against a known unit, in whichever
+// scope actually has that unit. `status` is downgraded to run without sudo:
+// reading a system unit's state is unprivileged, and prompting for a password
+// to answer "is it running?" is a good way to make people stop asking.
+func sysctlUnit(action, unit string) error {
+	b, _ := linuxSystemctlFor(unit)
+	if action == "status" && len(b) > 0 && b[0] == "sudo" {
+		b = b[1:]
+	}
+	return streamRun(b[0], append(append([]string{}, b[1:]...), action, unit)...)
 }
 
 // serviceCtlOne runs one action against a single account's service label
@@ -200,12 +261,13 @@ func serviceCtlOne(action, label string) error {
 		}
 		return nil
 	}
-	// Linux: drive the systemd unit the install scripts created, in whichever mode
-	// has a bus — user normally, system in LXC/containers (see linuxSystemctl).
+	// Linux: drive the systemd unit the install scripts created, in whichever
+	// scope actually HAS that unit — not merely whichever has a bus. See
+	// linuxSystemctlFor for why the difference matters.
 	unit := label + ".service"
 	switch action {
 	case "start", "stop", "restart", "status":
-		return sysctl(action, unit)
+		return sysctlUnit(action, unit)
 	}
 	return nil
 }

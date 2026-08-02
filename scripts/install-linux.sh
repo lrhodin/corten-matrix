@@ -475,12 +475,11 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
 fi
 
 if [ -z "${IN_DOCKER:-}" ]; then
-# ── Optional shell shortcuts (asked before preferred handle so the
-#    handle prompt remains the last interactive step) ─────────────
-# This used to detect the systemd scope here to build raw systemctl /
-# journalctl shortcuts. Nothing read them any more — the corten-matrix CLI
-# does that detection itself at run time, which is the whole reason to point
-# people at it instead of at a fixed systemctl spelling.
+# ── Management tip (printed before the preferred-handle prompt so that
+#    prompt remains the last interactive step) ────────────────────
+# No systemd scope detection here: the corten-matrix CLI resolves which scope
+# actually holds the unit at run time, which is the whole reason to point
+# people at it rather than at a spelling frozen at install time.
 echo ""
 echo ""
 echo "Tip: control the bridge with:  corten-matrix start | stop | restart | logs"
