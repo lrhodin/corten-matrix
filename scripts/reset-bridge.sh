@@ -56,10 +56,27 @@ fi
 
 # ── Stop the bridge ──────────────────────────────────────────
 echo "Stopping bridge..."
+SYSTEMCTL_SCOPE=""   # "--user", or "" for the system manager
+SYSTEMCTL_SUDO=""    # "sudo" when driving the system manager as non-root
 if [ "$UNAME_S" = "Darwin" ]; then
     launchctl unload "$HOME/Library/LaunchAgents/$BUNDLE_ID.plist" 2>/dev/null || true
 else
-    systemctl --user stop "$SERVICE_NAME" 2>/dev/null || true
+    # Pick the scope by where the unit actually IS, not by which bus answers.
+    # `systemctl --user` succeeds whenever a user session bus is reachable —
+    # even when the unit is a SYSTEM unit — so an unconditional `--user stop`
+    # silently no-ops on a bridge installed via `sudo corten-matrix setup`.
+    # The bridge then survives, the pgrep check below sees it, and the reset
+    # aborts with "still running after stop". Same resolution the Go CLI does
+    # in linuxSystemctlFor.
+    if systemctl --user cat "$SERVICE_NAME.service" >/dev/null 2>&1; then
+        SYSTEMCTL_SCOPE="--user"
+    elif systemctl cat "$SERVICE_NAME.service" >/dev/null 2>&1; then
+        [ "$(id -u)" = "0" ] || SYSTEMCTL_SUDO="sudo"
+    else
+        # Nothing installed in either scope; the stop is a no-op either way.
+        SYSTEMCTL_SCOPE="--user"
+    fi
+    ${SYSTEMCTL_SUDO:+$SYSTEMCTL_SUDO} systemctl ${SYSTEMCTL_SCOPE:+$SYSTEMCTL_SCOPE} stop "$SERVICE_NAME" 2>/dev/null || true
 fi
 
 sleep 1
@@ -101,8 +118,10 @@ fi
 echo ""
 echo "Clearing bridge journal logs..."
 if [ "$UNAME_S" != "Darwin" ]; then
-    journalctl --user --unit="$SERVICE_NAME" --rotate 2>/dev/null || true
-    journalctl --user --unit="$SERVICE_NAME" --vacuum-time=1s 2>/dev/null || true
+    # Same scope the stop above resolved — a system unit's journal is not in
+    # the user journal, so `--user` here would silently clear nothing.
+    ${SYSTEMCTL_SUDO:+$SYSTEMCTL_SUDO} journalctl ${SYSTEMCTL_SCOPE:+$SYSTEMCTL_SCOPE} --unit="$SERVICE_NAME" --rotate 2>/dev/null || true
+    ${SYSTEMCTL_SUDO:+$SYSTEMCTL_SUDO} journalctl ${SYSTEMCTL_SCOPE:+$SYSTEMCTL_SCOPE} --unit="$SERVICE_NAME" --vacuum-time=1s 2>/dev/null || true
     echo "✓ Logs cleared"
 else
     echo "  (macOS — logs managed by launchd, skipping)"

@@ -603,6 +603,20 @@ WantedBy=%s
 // below, and anything else is refused rather than rewritten.
 const managedUnitMarker = "# Managed by corten-matrix install-service. Do not hand-edit; this file is overwritten."
 
+// userUnitDir is where systemd loads user units from. Per systemd.unit(5) the
+// search path is $XDG_CONFIG_HOME/systemd/user when that variable is set, and
+// ~/.config/systemd/user otherwise — the two are NOT both searched, so
+// hardcoding .config writes units into a directory systemd never reads.
+//
+// Takes the home directory explicitly so callers can pass effectiveHome()
+// (which resolves SUDO_USER) rather than root's.
+func userUnitDir(home string) string {
+	if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
+		return filepath.Join(x, "systemd", "user")
+	}
+	return filepath.Join(home, ".config", "systemd", "user")
+}
+
 // unitState reports whether a unit file exists and whether this command wrote
 // it. A file that exists without the marker was authored by the install
 // scripts, an admin, or a config-management tool, and must not be overwritten.
@@ -776,7 +790,7 @@ func serviceInstall() {
 	// Resolve once and reuse `base` for the daemon-reload and enable below, so
 	// those cannot land in a different scope than the one just written.
 	base, system := linuxSystemctlFor("corten-matrix.service")
-	dir := filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user")
+	dir := userUnitDir(effectiveHome())
 	wantedBy := "default.target"
 	if system {
 		dir = "/etc/systemd/system"
@@ -909,7 +923,7 @@ func serviceUninstall() {
 		}
 		_ = streamRun(base[0], append(append([]string{}, base[1:]...), "disable", "--now", unit)...)
 		if userScope {
-			_ = os.Remove(filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user", unit))
+			_ = os.Remove(filepath.Join(userUnitDir(effectiveHome()), unit))
 		} else {
 			path := "/etc/systemd/system/" + unit
 			if os.Geteuid() != 0 {
@@ -964,7 +978,7 @@ func serviceUninstall() {
 	// design: it reports only when a user unit is on disk AND the bus is
 	// unreachable. A reachable bus belonging to the WRONG manager (root with
 	// its own session) still goes unreported — pre-existing, not closed here.
-	userUnitPath := filepath.Join(effectiveHome(), ".config", "systemd", "user", unit)
+	userUnitPath := filepath.Join(userUnitDir(effectiveHome()), unit)
 	_, statErr := os.Stat(userUnitPath)
 	userUnitOnDisk := statErr == nil
 	if !userBusReachable() && userUnitOnDisk {

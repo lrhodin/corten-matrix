@@ -71,11 +71,18 @@ func TestSystemdUnitBodyMatchesInstallScripts(t *testing.T) {
 			"Service/LimitNOFILE":      "65536",
 			"Service/WorkingDirectory": "/home/david/.local/share/corten-matrix",
 			"Service/ExecStart":        "/opt/corten/corten-matrix bridge-all",
-			"Unit/Description":         "corten-matrix iMessage bridge",
 		} {
 			if got := f[k]; got != want {
 				t.Errorf("%s = %q, want %q (the install scripts set it)", k, got, want)
 			}
+		}
+		// Description is pinned separately BECAUSE it does not match the
+		// scripts: they write "corten-matrix bridge", this writes
+		// "corten-matrix iMessage bridge". Cosmetic — systemd does not care and
+		// nothing reads it — but it was previously asserted under a comment
+		// claiming the scripts set this value, which was simply untrue.
+		if got := f["Unit/Description"]; got != "corten-matrix iMessage bridge" {
+			t.Errorf("Description = %q, want %q", got, "corten-matrix iMessage bridge")
 		}
 	})
 

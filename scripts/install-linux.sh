@@ -78,36 +78,47 @@ else
     "$BINARY" -c "$CONFIG" -e 2>/dev/null
     echo "✓ Generated config"
 
-    python3 -c "
-import re, sys
-text = open('$CONFIG').read()
+    # Values are passed through the ENVIRONMENT, never spliced into the Python
+    # source. Interpolating them into '...' literals meant a value containing a
+    # quote or a backslash — a Postgres URI with a password, a domain someone
+    # typo'd — either broke config generation or ran as Python. os.environ
+    # keeps them as data.
+    CM_CONFIG="$CONFIG" CM_ADDRESS="$HS_ADDRESS" CM_DOMAIN="$HS_DOMAIN" \
+    CM_DBTYPE="$DB_TYPE" CM_DBURI="$DB_URI" CM_ADMIN="$ADMIN_USER" \
+    python3 -c '
+import os, re
+cfg = os.environ["CM_CONFIG"]
+text = open(cfg).read()
 
 def patch(text, key, val):
+    # re.sub expands backreferences in the REPLACEMENT, so a value containing
+    # a backslash would corrupt the output — pass it through a function to
+    # disable that.
     return re.sub(
-        r'^(\s+' + re.escape(key) + r'\s*:)\s*.*$',
-        r'\1 ' + val,
+        r"^(\s+" + re.escape(key) + r"\s*:)\s*.*$",
+        lambda m: m.group(1) + " " + val,
         text, count=1, flags=re.MULTILINE
     )
 
-text = patch(text, 'address', '$HS_ADDRESS')
-text = patch(text, 'domain', '$HS_DOMAIN')
-text = patch(text, 'type', '$DB_TYPE')
-text = patch(text, 'uri', '$DB_URI')
+text = patch(text, "address", os.environ["CM_ADDRESS"])
+text = patch(text, "domain",  os.environ["CM_DOMAIN"])
+text = patch(text, "type",    os.environ["CM_DBTYPE"])
+text = patch(text, "uri",     os.environ["CM_DBURI"])
 
-lines = text.split('\n')
+lines = text.split("\n")
 in_perms = False
 for i, line in enumerate(lines):
-    if 'permissions:' in line and not line.strip().startswith('#'):
+    if "permissions:" in line and not line.strip().startswith("#"):
         in_perms = True
         continue
-    if in_perms and line.strip() and not line.strip().startswith('#'):
+    if in_perms and line.strip() and not line.strip().startswith("#"):
         indent = len(line) - len(line.lstrip())
-        lines[i] = ' ' * indent + '\"$ADMIN_USER\": admin'
+        lines[i] = " " * indent + "\"" + os.environ["CM_ADMIN"] + "\": admin"
         break
-text = '\n'.join(lines)
+text = "\n".join(lines)
 
-open('$CONFIG', 'w').write(text)
-"
+open(cfg, "w").write(text)
+'
     # iMessage CloudKit chats can have tens of thousands of messages.
     # Deliver all history in one forward batch to avoid DAG fragmentation.
     sed -i 's/max_initial_messages: [0-9]*/max_initial_messages: 2147483647/' "$CONFIG"
