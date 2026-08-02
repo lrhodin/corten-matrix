@@ -609,20 +609,51 @@ func serviceInstall() {
 		wantedBy = "multi-user.target"
 	}
 	unit := filepath.Join(dir, "corten-matrix.service")
+
+	// A SYSTEM unit must pin the identity and the data dir, and this body has
+	// to stay equivalent to the one install_systemd_system writes in the
+	// install scripts — because resolving by location above means a re-install
+	// OVERWRITES whatever is there, including a unit those scripts authored.
+	//
+	// Without User=, a system unit runs as root. RunAllBridges resolves its
+	// data dir from the runtime process environment (effectiveHome →
+	// cortenDataDir), and effectiveHome's SUDO_USER branch cannot help a
+	// systemd-spawned process — so root's $HOME is consulted, config.yaml is
+	// not found, and the bridge exits 1 on every start. Environment=
+	// XDG_DATA_HOME pins the same directory the scripts pin, so the unit finds
+	// the account regardless of whose home systemd hands it.
+	//
+	// User-scope units get neither: they already run as the user, and User= is
+	// not valid in a user unit.
+	identity := ""
+	if system {
+		owner := os.Getenv("SUDO_USER")
+		if owner == "" || owner == "root" {
+			if u, err := user.Current(); err == nil {
+				owner = u.Username
+			}
+		}
+		if owner != "" && owner != "root" {
+			identity += "User=" + owner + "\n"
+		}
+		// cortenDataDir() is "<XDG_DATA_HOME>/corten-matrix", so the parent is
+		// the value XDG_DATA_HOME has to carry.
+		identity += "Environment=XDG_DATA_HOME=" + filepath.Dir(data) + "\n"
+	}
 	body := fmt.Sprintf(`[Unit]
 Description=corten-matrix iMessage bridge
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=%s bridge-all
+%sExecStart=%s bridge-all
 WorkingDirectory=%s
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=%s
-`, self, data, wantedBy)
+`, identity, self, data, wantedBy)
 	if system && os.Geteuid() != 0 {
 		// system unit needs root: write it via sudo tee.
 		_ = exec.Command("sudo", "mkdir", "-p", dir).Run()
@@ -654,6 +685,15 @@ func serviceUninstall() {
 		plist := filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents", cortenBundleID+".plist")
 		_ = exec.Command("launchctl", "unload", "-w", plist).Run()
 		_ = os.Remove(plist)
+		// Report what is true, same as the Linux path below: if the plist is
+		// still there the LaunchAgent reloads at login, so "removed" would be
+		// a lie.
+		if _, err := os.Stat(plist); err == nil {
+			fmt.Printf("corten-matrix service could NOT be removed — %s still exists.\n", plist)
+			fmt.Printf("Remove it manually:\n  launchctl bootout gui/%d/%s ; rm -f %s\n",
+				os.Getuid(), cortenBundleID, plist)
+			os.Exit(1)
+		}
 		fmt.Println("corten-matrix service removed.")
 		os.Exit(0)
 	}
@@ -726,7 +766,20 @@ func serviceUninstall() {
 		}
 		os.Exit(1)
 	}
-	if !removedAny {
+	// "Nothing found" and "couldn't look" are different answers, and conflating
+	// them is the same class of lie as the one above. Under sudo, env_reset
+	// drops XDG_RUNTIME_DIR, so `systemctl --user` cannot reach a bus and a
+	// user-scope unit is invisible to both the removal loop and the re-probe.
+	// Claiming nothing was installed would leave it enabled and starting at
+	// login, which is exactly the outcome this function exists to prevent.
+	if !userBusReachable() && os.Geteuid() == 0 {
+		fmt.Println("Could not check the user scope: no user session bus is reachable as root.")
+		fmt.Println("If the service was installed as a user unit, remove it as that user:")
+		fmt.Printf("  systemctl --user disable --now %s && rm -f ~/.config/systemd/user/%s\n", unit, unit)
+		if !removedAny {
+			os.Exit(1)
+		}
+	} else if !removedAny {
 		fmt.Println("No corten-matrix service unit was installed; nothing to remove.")
 		os.Exit(0)
 	}
