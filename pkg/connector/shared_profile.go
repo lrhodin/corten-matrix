@@ -70,15 +70,19 @@ func newSharedProfileStore(db *dbutil.Database, loginID networkid.UserLoginID) *
 }
 
 func (s *sharedProfileStore) ensureSchema(ctx context.Context) error {
+	// Postgres has no BLOB type, and CREATE TABLE IF NOT EXISTS validates
+	// column types before it checks whether the table exists — so a literal
+	// BLOB fails on every startup, not just the first.
+	blobType := sqlBlobType(s.db)
 	_, err := s.db.Exec(ctx, `CREATE TABLE IF NOT EXISTS shared_profiles (
 		login_id       TEXT    NOT NULL,
 		identifier     TEXT    NOT NULL,
 		display_name   TEXT    NOT NULL DEFAULT '',
 		first_name     TEXT    NOT NULL DEFAULT '',
 		last_name      TEXT    NOT NULL DEFAULT '',
-		avatar         BLOB,
+		avatar         `+blobType+`,
 		record_key     TEXT    NOT NULL,
-		decryption_key BLOB    NOT NULL,
+		decryption_key `+blobType+` NOT NULL,
 		has_poster     BOOLEAN NOT NULL DEFAULT FALSE,
 		updated_ts     BIGINT  NOT NULL,
 		PRIMARY KEY (login_id, identifier)
