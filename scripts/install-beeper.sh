@@ -1193,9 +1193,14 @@ echo "════════════════════════�
 echo "  Setup Complete"
 echo "═══════════════════════════════════════════════"
 echo ""
-echo "  Logs:    tail -f $LOG_OUT"
-echo "  Stop:    launchctl bootout $GUI_DOMAIN/$BUNDLE_ID"
-echo "  Restart: launchctl kickstart -k $GUI_DOMAIN/$BUNDLE_ID"
+# Prefer the corten-matrix CLI over raw launchctl: it renders the structured
+# JSON log readably, and start/stop/restart/status work the same here as on
+# Linux. Raw launchctl equivalents are in the README under Management.
+echo "  Status:  corten-matrix status"
+echo "  Logs:    corten-matrix logs"
+echo "  Start:   corten-matrix start"
+echo "  Stop:    corten-matrix stop"
+echo "  Restart: corten-matrix restart"
 fi
 
 # ── Add to PATH (optional; symlink only, no shell-rc edits) ────

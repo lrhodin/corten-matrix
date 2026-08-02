@@ -477,22 +477,10 @@ fi
 if [ -z "${IN_DOCKER:-}" ]; then
 # ── Optional shell shortcuts (asked before preferred handle so the
 #    handle prompt remains the last interactive step) ─────────────
-# Detect existing systemd scope from installed unit files. If neither
-# scope has the unit yet (first-time install before systemd setup),
-# default to --user (the common path for non-root installs).
-_SHORTCUT_SYSCTL=""
-_SHORTCUT_JCTL=""
-if systemctl --user list-unit-files "$SERVICE_NAME.service" 2>/dev/null | grep -q "$SERVICE_NAME"; then
-    _SHORTCUT_SYSCTL="systemctl --user"
-    _SHORTCUT_JCTL="journalctl --user"
-elif systemctl list-unit-files "$SERVICE_NAME.service" 2>/dev/null | grep -q "$SERVICE_NAME"; then
-    _SHORTCUT_SYSCTL="${SUDO:+$SUDO }systemctl"
-    _SHORTCUT_JCTL="${SUDO:+$SUDO }journalctl"
-else
-    _SHORTCUT_SYSCTL="systemctl --user"
-    _SHORTCUT_JCTL="journalctl --user"
-fi
-
+# This used to detect the systemd scope here to build raw systemctl /
+# journalctl shortcuts. Nothing read them any more — the corten-matrix CLI
+# does that detection itself at run time, which is the whole reason to point
+# people at it instead of at a fixed systemctl spelling.
 echo ""
 echo ""
 echo "Tip: control the bridge with:  corten-matrix start | stop | restart | logs"
@@ -972,16 +960,20 @@ echo "  Binary: $BINARY"
 echo "  Config: $CONFIG"
 echo "  Registration: $REGISTRATION"
 echo ""
-if [ "$SYSTEMD_MODE" = "user" ] && [ -f "$USER_SERVICE_FILE" ]; then
-    echo "  Status:  systemctl --user status "$SERVICE_NAME""
-    echo "  Logs:    journalctl --user -u "$SERVICE_NAME" -f"
-    echo "  Stop:    systemctl --user stop "$SERVICE_NAME""
-    echo "  Restart: systemctl --user restart "$SERVICE_NAME""
-elif [ "$SYSTEMD_MODE" = "system" ] && [ -f "$SYSTEM_SERVICE_FILE" ]; then
-    echo "  Status:  systemctl status "$SERVICE_NAME""
-    echo "  Logs:    journalctl -u "$SERVICE_NAME" -f"
-    echo "  Stop:    systemctl stop "$SERVICE_NAME""
-    echo "  Restart: systemctl restart "$SERVICE_NAME""
+if { [ "$SYSTEMD_MODE" = "user" ] && [ -f "$USER_SERVICE_FILE" ]; } \
+   || { [ "$SYSTEMD_MODE" = "system" ] && [ -f "$SYSTEM_SERVICE_FILE" ]; }; then
+    # Use the corten-matrix CLI rather than raw systemctl/journalctl. It works
+    # out whether the unit is a --user unit or a system one and whether sudo is
+    # needed, which the raw commands cannot do for you — printing one fixed
+    # spelling here sends half of all installs the wrong one.
+    echo "  Status:  corten-matrix status"
+    echo "  Logs:    corten-matrix logs"
+    echo "  Start:   corten-matrix start"
+    echo "  Stop:    corten-matrix stop"
+    echo "  Restart: corten-matrix restart"
+    echo ""
+    echo "  (Raw systemctl/journalctl equivalents are in the README under"
+    echo "   Management, if you are wiring your own tooling.)"
 else
     echo "  Run manually:"
     echo "    cd $(dirname "$CONFIG") && $BINARY -c $CONFIG"
