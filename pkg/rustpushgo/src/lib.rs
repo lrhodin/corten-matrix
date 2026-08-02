@@ -4892,12 +4892,31 @@ pub fn init_logger() {
                 // from the last one reported prints immediately, bounded to a
                 // few per window so an alternating flood can't reopen the noise
                 // problem the suppression is here to solve.
+                //
+                // The memory has to be a SET of sites already reported this
+                // window, not just the last one seen. With a single slot, a
+                // novel site interleaved with the flood makes the flood's very
+                // next panic compare "different" too — so the flood burns the
+                // budget and prints a misleading "check this call site" line
+                // about a site that is known-guarded. A small fixed table of
+                // reported sites fixes that: each distinct site prints at most
+                // once per window, and the budget is spent only on sites that
+                // are genuinely new.
                 const BREADCRUMB_INTERVAL_SECS: u64 = 60;
-                const MAX_NOVEL_SITES_PER_WINDOW: u64 = 3;
+                const REPORTED_SLOTS: usize = 8;
                 static LAST_BREADCRUMB_SECS: AtomicU64 = AtomicU64::new(0);
                 static SUPPRESSED_COUNT: AtomicU64 = AtomicU64::new(0);
-                static LAST_SITE: AtomicU64 = AtomicU64::new(0);
-                static NOVEL_SITES_THIS_WINDOW: AtomicU64 = AtomicU64::new(0);
+                static REPORTED_SITES: [AtomicU64; REPORTED_SLOTS] = [
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                ];
+                static REPORTED_CURSOR: AtomicU64 = AtomicU64::new(0);
 
                 SUPPRESSED_COUNT.fetch_add(1, Ordering::Relaxed);
                 // FNV-1a over file+line. Inline and allocation-free: this runs
@@ -4911,7 +4930,6 @@ pub fn init_logger() {
                     h ^= loc.line() as u64;
                     h.wrapping_mul(0x0000_0100_0000_01b3)
                 };
-                let previous_site = LAST_SITE.swap(site, Ordering::Relaxed);
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -4922,7 +4940,14 @@ pub fn init_logger() {
                         .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
                         .is_ok()
                 {
-                    NOVEL_SITES_THIS_WINDOW.store(0, Ordering::Relaxed);
+                    // New window: forget which sites have been reported, and
+                    // seed the table with this one so the summary below does
+                    // not immediately get echoed by a novel-site line.
+                    for slot in REPORTED_SITES.iter() {
+                        slot.store(0, Ordering::Relaxed);
+                    }
+                    REPORTED_SITES[0].store(site, Ordering::Relaxed);
+                    REPORTED_CURSOR.store(1, Ordering::Relaxed);
                     // This panic is itself counted and is the latest of them,
                     // so the location below really is the most recent one.
                     let swallowed = SUPPRESSED_COUNT.swap(0, Ordering::Relaxed);
@@ -4937,19 +4962,33 @@ pub fn init_logger() {
                         loc.line(),
                         BREADCRUMB_INTERVAL_SECS
                     );
-                } else if previous_site != site
-                    && NOVEL_SITES_THIS_WINDOW.fetch_add(1, Ordering::Relaxed)
-                        < MAX_NOVEL_SITES_PER_WINDOW
+                } else if !REPORTED_SITES
+                    .iter()
+                    .any(|slot| slot.load(Ordering::Relaxed) == site)
                 {
-                    warn!(
-                        "suppressed rustpush panic at a DIFFERENT site than the last one reported: \
-                         {}:{}. Printed immediately rather than waiting for the {}s summary, \
-                         because a new site is the interesting case — check whether this call site \
-                         is actually inside a catch_unwind.",
-                        file,
-                        loc.line(),
-                        BREADCRUMB_INTERVAL_SECS
-                    );
+                    let cursor = REPORTED_CURSOR.fetch_add(1, Ordering::Relaxed);
+                    if (cursor as usize) < REPORTED_SLOTS {
+                        REPORTED_SITES[cursor as usize].store(site, Ordering::Relaxed);
+                        // Printed on its own rather than folded into the count,
+                        // so subtract it back out — otherwise the next summary
+                        // counts a panic it already showed.
+                        let _ = SUPPRESSED_COUNT.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |n| Some(n.saturating_sub(1)),
+                        );
+                        warn!(
+                            "suppressed rustpush panic at a site not yet reported this window: \
+                             {}:{}. Printed immediately rather than waiting for the {}s summary, \
+                             because a new site is the interesting case — check whether this call \
+                             site is actually inside a catch_unwind. At most {} distinct sites are \
+                             reported per window.",
+                            file,
+                            loc.line(),
+                            BREADCRUMB_INTERVAL_SECS,
+                            REPORTED_SLOTS
+                        );
+                    }
                 }
                 return;
             }

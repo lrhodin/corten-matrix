@@ -514,7 +514,9 @@ func startOneNow(idx int) {
 		_ = exec.Command("launchctl", "kickstart", "-k", "gui/"+uid+"/"+label).Run()
 		return
 	}
-	_ = sysctl("start", label+".service")
+	// Unit-aware: the unit may live in the system scope even when a user bus
+	// is reachable (see linuxSystemctlFor).
+	_ = sysctlUnit("start", label+".service")
 }
 
 // offerAddToPath offers to symlink the binary into /usr/local/bin so `corten-matrix`
@@ -578,7 +580,13 @@ func serviceInstall() {
 	}
 	// Linux: systemd unit — a user unit normally, a system unit in LXC/containers
 	// (no user bus), matching the install scripts' SYSTEMD_MODE fallback.
-	_, system := linuxSystemctl()
+	//
+	// Bus reachability is the right question HERE specifically, and only here:
+	// the unit does not exist yet, so there is no location to resolve against —
+	// we are choosing where to create it. Resolve once and reuse `base` for the
+	// daemon-reload and enable below, so those cannot land in a different scope
+	// than the one we just wrote the unit into.
+	base, system := linuxSystemctl()
 	dir := filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user")
 	wantedBy := "default.target"
 	if system {
@@ -615,8 +623,11 @@ WantedBy=%s
 			die("write systemd unit: %v", err)
 		}
 	}
-	_ = sysctl("daemon-reload")
-	if err := sysctl("enable", "--now", "corten-matrix.service"); err != nil {
+	run := func(args ...string) error {
+		return streamRun(base[0], append(append([]string{}, base[1:]...), args...)...)
+	}
+	_ = run("daemon-reload")
+	if err := run("enable", "--now", "corten-matrix.service"); err != nil {
 		os.Exit(1)
 	}
 	os.Exit(0)
@@ -631,19 +642,28 @@ func serviceUninstall() {
 		fmt.Println("corten-matrix service removed.")
 		os.Exit(0)
 	}
-	_, system := linuxSystemctl()
-	_ = sysctl("disable", "--now", "corten-matrix.service")
+	// Resolve the scope ONCE, from where the unit actually is, and use that
+	// same answer for both the disable and the file removal. Deciding with a
+	// bus-reachability probe is how this used to fail silently: a system unit
+	// installed by `sudo corten-matrix setup` would be "disabled" via
+	// `systemctl --user` (error discarded), then we would delete a user unit
+	// file that was never there and print "service removed" while the real
+	// unit stayed enabled and running.
+	unit := "corten-matrix.service"
+	base, system := linuxSystemctlFor(unit)
+	_ = streamRun(base[0], append(append([]string{}, base[1:]...), "disable", "--now", unit)...)
 	if system {
-		unit := "/etc/systemd/system/corten-matrix.service"
+		path := "/etc/systemd/system/" + unit
 		if os.Geteuid() != 0 {
-			_ = exec.Command("sudo", "rm", "-f", unit).Run()
+			_ = exec.Command("sudo", "rm", "-f", path).Run()
 		} else {
-			_ = os.Remove(unit)
+			_ = os.Remove(path)
 		}
 	} else {
-		_ = os.Remove(filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user", "corten-matrix.service"))
+		_ = os.Remove(filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user", unit))
 	}
-	_ = sysctl("daemon-reload")
+	// daemon-reload in the same scope we just modified.
+	_ = streamRun(base[0], append(append([]string{}, base[1:]...), "daemon-reload")...)
 	fmt.Println("corten-matrix service removed.")
 	os.Exit(0)
 }

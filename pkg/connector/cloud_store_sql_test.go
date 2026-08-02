@@ -393,6 +393,12 @@ func TestInsertOrIgnoreReplacementsAreNoOpOnConflict(t *testing.T) {
 // is stamped once per batch, so it is less unique than guid, and it overrides
 // guid rather than backing it up. This test constructs exactly that
 // disagreement, so it fails if created_ts is reintroduced into the ORDER BY.
+//
+// The cross-check calls listLatestMessages itself rather than re-typing its
+// ORDER BY, so changing the two apart is caught. It does NOT cover the other
+// ways these can disagree (the paging queries' `record_name <> ”` filter, and
+// lastMsg being a capped slice index) — those are pre-existing and documented
+// on getConversationReadByMe, not fixed here.
 func TestGetConversationReadByMeMatchesTheReceiptTarget(t *testing.T) {
 	ctx := context.Background()
 	db := newTestSQLiteDB(t)
@@ -408,6 +414,10 @@ func TestGetConversationReadByMeMatchesTheReceiptTarget(t *testing.T) {
 	// Ordering by guid selects bbbb -> read by me. Ordering by created_ts
 	// first selects aaaa -> not read by me. Only the former agrees with the
 	// paging queries, which order by (timestamp_ms, guid).
+	// record_name must be non-empty: the paging queries filter
+	// `record_name <> ''` to skip persistMessageUUID's echo stubs, so rows
+	// without it are invisible to the very query this test cross-checks
+	// against.
 	ts := time.Now().UnixMilli()
 	for _, m := range []struct {
 		guid      string
@@ -418,23 +428,26 @@ func TestGetConversationReadByMeMatchesTheReceiptTarget(t *testing.T) {
 		{"aaaa-incoming", false, ts + 1000},
 	} {
 		if _, err := db.Exec(ctx, `
-			INSERT INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, created_ts, updated_ts)
-			VALUES ($1, $2, $3, $4, $5, $6, $6)
-		`, testSQLLoginID, m.guid, "gid:portal-1", ts, m.isFromMe, m.createdTS); err != nil {
+			INSERT INTO cloud_message (login_id, guid, record_name, portal_id, timestamp_ms, is_from_me, created_ts, updated_ts)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+		`, testSQLLoginID, m.guid, "rec-"+m.guid, "gid:portal-1", ts, m.isFromMe, m.createdTS); err != nil {
 			t.Fatalf("insert %s: %v", m.guid, err)
 		}
 	}
 
-	// Cross-check against the ordering the paging queries use, so this test
-	// keeps meaning something even if both are changed together.
-	var receiptTarget string
-	if err := db.QueryRow(ctx, `
-		SELECT guid FROM cloud_message
-		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE AND tapback_type IS NULL
-		ORDER BY timestamp_ms DESC, guid DESC LIMIT 1
-	`, testSQLLoginID, "gid:portal-1").Scan(&receiptTarget); err != nil {
-		t.Fatalf("resolve receipt target: %v", err)
+	// Cross-check against the REAL paging query rather than a hand-copied
+	// ORDER BY, so this notices if the two are ever changed apart.
+	// listLatestMessages is what feeds client.go's lastMsg, i.e. the message a
+	// read receipt would actually target.
+	latest, err := store.listLatestMessages(ctx, "gid:portal-1", 1)
+	if err != nil {
+		t.Fatalf("listLatestMessages: %v", err)
 	}
+	if len(latest) != 1 {
+		t.Fatalf("listLatestMessages returned %d rows, want 1 — the fixture is invisible to "+
+			"the paging queries, so this test would prove nothing", len(latest))
+	}
+	receiptTarget := latest[0].GUID
 	if receiptTarget != "bbbb-outgoing" {
 		t.Fatalf("test setup wrong: paging order picked %q, expected bbbb-outgoing", receiptTarget)
 	}

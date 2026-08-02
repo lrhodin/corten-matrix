@@ -3593,13 +3593,21 @@ func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portal
 	// Deliberately NOT `created_ts DESC, guid DESC`. created_ts adds no
 	// determinism (a batch upsert stamps every row in a batch with the same
 	// millisecond, so it is strictly less unique than guid) and it is not
-	// merely redundant — it OVERRIDES guid, which makes this query disagree
-	// with the paging queries that choose the message a read receipt actually
-	// targets. Those all order by (timestamp_ms, guid) alone — see
-	// listLatestMessages/listForwardMessages above and client.go's lastMsg.
-	// With created_ts in the middle, this can report "not read by me" for a
-	// conversation whose newest message by that ordering IS the user's own,
-	// and the receipt is then never sent.
+	// merely redundant — it OVERRIDES guid, which makes this query's ordering
+	// disagree with the paging queries that feed the message a read receipt
+	// targets. listLatestMessages/listOldestMessages/listForwardMessages all
+	// order by (timestamp_ms, guid) alone. With created_ts in the middle, this
+	// can report "not read by me" for a conversation whose newest message by
+	// that ordering IS the user's own, and the receipt is never sent.
+	//
+	// Scoped honestly: aligning the ORDER BY removes the ordering disagreement,
+	// not every disagreement. Two pre-existing ones remain, both out of scope
+	// here. This query has no `record_name <> ''` filter, so the stub rows
+	// persistMessageUUID writes for realtime APNs echoes are visible to it and
+	// invisible to the paging queries. And the receipt target is ultimately
+	// client.go's `lastMsg` — an index into an already-paged, count-capped
+	// slice, not a query — so with more messages than the page size it is not
+	// the newest message at all.
 	var isFromMe bool
 	err := s.db.QueryRow(ctx, `
 		SELECT is_from_me FROM cloud_message
