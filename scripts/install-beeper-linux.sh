@@ -654,11 +654,14 @@ fi
 # This catches upgrades from pre-keychain versions where the device-passcode
 # step was never run. If trustedpeers.plist exists with a user_identity, the
 # keychain was joined successfully and any transient PCS errors are harmless.
-# Trust-circle only applies when CloudKit backfill is enabled.
 TRUSTEDPEERS_FILE="$SESSION_DIR/trustedpeers.plist"
 FORCE_CLEAR_STATE=false
+# Trust-circle only applies to CloudKit backfill — chatdb never creates
+# trustedpeers.plist.  Match Go's UseCloudKitBackfill(): cloudkit_backfill
+# must be true AND backfill_source must not be "chatdb".
 CK_ENABLED=$(awk '/cloudkit_backfill:/{print $2; exit}' "$CONFIG" 2>/dev/null)
-if [ "$NEEDS_LOGIN" = "false" ] && [ "$CK_ENABLED" = "true" ]; then
+BF_SOURCE=$(awk '/backfill_source:/{print $2; exit}' "$CONFIG" 2>/dev/null)
+if [ "$NEEDS_LOGIN" = "false" ] && [ "$CK_ENABLED" = "true" ] && [ "$BF_SOURCE" != "chatdb" ]; then
     HAS_CLIQUE=false
     if [ -f "$TRUSTEDPEERS_FILE" ]; then
         if grep -q "<key>userIdentity</key>\|<key>user_identity</key>" "$TRUSTEDPEERS_FILE" 2>/dev/null; then
@@ -1001,7 +1004,8 @@ chmod +x "$DATA_DIR/start.sh"
 # connects.  This ensures CloudKit backfill can deduplicate any messages that
 # Apple buffers and delivers the moment the bridge registers with APNs.
 _ck_backfill=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
-if [ "$IS_FRESH_DB" = "true" ] && [ "$_ck_backfill" = "true" ] && [ -t 0 ]; then
+_ck_source=$(grep 'backfill_source:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*backfill_source: *//' || true)
+if [ "$IS_FRESH_DB" = "true" ] && [ "$_ck_backfill" = "true" ] && [ "$_ck_source" != "chatdb" ] && [ -t 0 ]; then
     echo ""
     echo "┌─────────────────────────────────────────────────────────────┐"
     echo "│  Last step: sync iCloud Messages before starting            │"

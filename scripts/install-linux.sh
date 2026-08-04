@@ -130,7 +130,6 @@ open(cfg, "w").write(text)
     echo "✓ Configured: $HS_ADDRESS, $HS_DOMAIN, $ADMIN_USER, $DB_TYPE"
 fi
 
-
 # ── CloudKit backfill toggle (runs every time) ────────────────
 CURRENT_BACKFILL=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
 if [ -t 0 ]; then
@@ -444,12 +443,15 @@ fi
 # This catches upgrades from pre-keychain versions where the device-passcode
 # step was never run. If trustedpeers.plist exists with a user_identity, the
 # keychain was joined successfully and any transient PCS errors are harmless.
-# Trust-circle only applies when CloudKit backfill is enabled.
 SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/corten-matrix"
 TRUSTEDPEERS_FILE="$SESSION_DIR/trustedpeers.plist"
 FORCE_CLEAR_STATE=false
+# Trust-circle only applies to CloudKit backfill — chatdb never creates
+# trustedpeers.plist.  Match Go's UseCloudKitBackfill(): cloudkit_backfill
+# must be true AND backfill_source must not be "chatdb".
 CK_ENABLED=$(awk '/cloudkit_backfill:/{print $2; exit}' "$CONFIG" 2>/dev/null)
-if [ "$NEEDS_LOGIN" = "false" ] && [ "$CK_ENABLED" = "true" ]; then
+BF_SOURCE=$(awk '/backfill_source:/{print $2; exit}' "$CONFIG" 2>/dev/null)
+if [ "$NEEDS_LOGIN" = "false" ] && [ "$CK_ENABLED" = "true" ] && [ "$BF_SOURCE" != "chatdb" ]; then
     HAS_CLIQUE=false
     if [ -f "$TRUSTEDPEERS_FILE" ]; then
         if grep -q "<key>userIdentity</key>\|<key>user_identity</key>" "$TRUSTEDPEERS_FILE" 2>/dev/null; then
