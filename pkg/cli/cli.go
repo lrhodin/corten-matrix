@@ -29,7 +29,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -431,15 +431,65 @@ func RunAllBridges() {
 	if hasSecondAccount() {
 		dirs = append(dirs, secondDataDir())
 	}
-	var cmds []*exec.Cmd
-	// Parallel to cmds: the data dir each child was launched from, so the exit
-	// report below can name the account that actually failed.
-	var cmdDirs []string
+	var started int
 	for i, d := range dirs {
-		cfg := filepath.Join(d, "config.yaml")
-		if _, err := os.Stat(cfg); err != nil {
+		if _, err := os.Stat(filepath.Join(d, "config.yaml")); err != nil {
 			continue // account not configured yet — skip
 		}
+		started++
+		go superviseAccount(self, i, d)
+	}
+	if started == 0 {
+		fmt.Fprintln(os.Stderr, "corten-matrix: no configured account to run (run setup first)")
+		os.Exit(1)
+	}
+	// Supervisors never return. systemd's Restart=always now only fires if
+	// bridge-all itself dies — not every time one account does.
+	select {}
+}
+
+// superviseAccount runs one account's bridge and restarts it whenever it exits.
+// It never returns.
+//
+// Accounts are supervised INDEPENDENTLY on purpose. bridge-all used to take
+// every account down when any single one stopped: the first child to exit
+// SIGTERMed its siblings and the process exited 1. One misconfigured or
+// half-registered account therefore produced a total outage — restarted by
+// systemd every five seconds, indefinitely — while the healthy account's log
+// stopped mid-startup with no error and looked perfectly fine. Nothing on the
+// system named the account at fault, so the working bridge and the broken one
+// were indistinguishable from the outside.
+//
+// A broken account is now just a broken account. The others keep bridging.
+func superviseAccount(self string, i int, d string) {
+	const restartDelay = 5 * time.Second
+	for {
+		c := accountCmd(self, i, d)
+		if err := c.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "corten-matrix: account %d (%s): start failed: %v; retrying in %s\n",
+				i, d, err, restartDelay)
+			time.Sleep(restartDelay)
+			continue
+		}
+		_ = c.Wait()
+		state := "exited with unknown status"
+		if ps := c.ProcessState; ps != nil {
+			state = ps.String()
+		}
+		// bridge-all's own stderr — the service's stdout, i.e. the journal —
+		// not the per-account bridge.stdout.log the child is redirected into.
+		// `journalctl --user -u corten-matrix.service` is where someone
+		// watching a restart loop looks first.
+		fmt.Fprintf(os.Stderr, "corten-matrix: account %d (%s) %s; restarting it in %s\n",
+			i, d, state, restartDelay)
+		time.Sleep(restartDelay)
+	}
+}
+
+// accountCmd builds the command that runs one account's bridge.
+func accountCmd(self string, i int, d string) *exec.Cmd {
+	{
+		cfg := filepath.Join(d, "config.yaml")
 		// Beeper accounts run via their generated start.sh (permission-fix + the
 		// right flags); a self-hosted account runs the binary against its config.
 		var c *exec.Cmd
@@ -476,48 +526,8 @@ func RunAllBridges() {
 		} else {
 			c.Stdout, c.Stderr = os.Stdout, os.Stderr
 		}
-		if err := c.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "corten-matrix: start account %d: %v\n", i, err)
-			continue
-		}
-		cmds = append(cmds, c)
-		cmdDirs = append(cmdDirs, d)
+		return c
 	}
-	if len(cmds) == 0 {
-		fmt.Fprintln(os.Stderr, "corten-matrix: no configured account to run (run setup first)")
-		os.Exit(1)
-	}
-	exited := make(chan int, len(cmds))
-	for i, c := range cmds {
-		go func(i int, c *exec.Cmd) { _ = c.Wait(); exited <- i }(i, c)
-	}
-	first := <-exited // first bridge to stop takes the service down → restart as a unit
-
-	// Say which account died, before SIGTERMing the rest.
-	//
-	// Without this the service is undebuggable: bridge-all exits 1 no matter
-	// what went wrong, the survivors are killed mid-startup so their logs just
-	// stop with no error, and every per-account log therefore looks equally
-	// healthy. Nothing anywhere on the system names the account to look at.
-	// Under Restart=always that presents as a silent six-second crash loop.
-	//
-	// This goes to bridge-all's own stderr, which is the service's stdout —
-	// the journal — NOT the per-account bridge.stdout.log the children are
-	// redirected to. `journalctl --user -u corten-matrix.service` is where a
-	// user staring at a restart loop actually looks first.
-	state := "unknown exit status"
-	if ps := cmds[first].ProcessState; ps != nil {
-		state = ps.String()
-	}
-	fmt.Fprintf(os.Stderr, "corten-matrix: account %d (%s) %s — stopping the other %d and exiting\n",
-		first, cmdDirs[first], state, len(cmds)-1)
-
-	for _, c := range cmds {
-		if c.Process != nil {
-			_ = c.Process.Signal(syscall.SIGTERM)
-		}
-	}
-	os.Exit(1)
 }
 
 // setEnv returns env with key set to val (replacing any existing entry).
