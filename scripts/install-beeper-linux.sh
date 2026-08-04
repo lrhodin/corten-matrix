@@ -1016,8 +1016,11 @@ chmod +x "$DATA_DIR/start.sh"
 # Runs before Apple login so that iCloud is fully synced before APNs first
 # connects.  This ensures CloudKit backfill can deduplicate any messages that
 # Apple buffers and delivers the moment the bridge registers with APNs.
-_ck_backfill=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
-_ck_source=$(grep 'backfill_source:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*backfill_source: *//' || true)
+# Same UseCloudKitBackfill() test as the trust-circle guard above, so read the
+# keys the same way — a raw grep|sed leaves quotes and inline comments in place
+# and would offer the sync to a chatdb config.
+_ck_backfill=$(cfg_scalar cloudkit_backfill)
+_ck_source=$(cfg_scalar backfill_source)
 if [ "$IS_FRESH_DB" = "true" ] && [ "$_ck_backfill" = "true" ] && [ "$_ck_source" != "chatdb" ] && [ -t 0 ]; then
     echo ""
     echo "┌─────────────────────────────────────────────────────────────┐"
