@@ -515,8 +515,18 @@ FORCE_CLEAR_STATE=false
 # Trust-circle only applies to CloudKit backfill — chatdb never creates
 # trustedpeers.plist.  Match Go's UseCloudKitBackfill(): cloudkit_backfill
 # must be true AND backfill_source must not be "chatdb".
-CK_ENABLED=$(awk '/cloudkit_backfill:/{print $2; exit}' "$CONFIG" 2>/dev/null)
-BF_SOURCE=$(awk '/backfill_source:/{print $2; exit}' "$CONFIG" 2>/dev/null)
+#
+# Anchored so a commented-out key sitting above the live one cannot win,
+# and tolerant of `key:value`, quoted values, inline comments and CRLF.
+# A misread backfill_source is the dangerous direction — it re-arms the
+# guard and wipes a login the bridge itself treats as backfill-disabled.
+cfg_scalar() {
+    awk -F: -v k="$1" '$0 ~ "^[[:space:]]*" k "[[:space:]]*:" {
+        sub(/#.*/, ""); gsub(/[[:space:]"\047\r]/, "", $2); print $2; exit
+    }' "$CONFIG" 2>/dev/null || true
+}
+CK_ENABLED=$(cfg_scalar cloudkit_backfill)
+BF_SOURCE=$(cfg_scalar backfill_source)
 if [ "$NEEDS_LOGIN" = "false" ] && [ "$CK_ENABLED" = "true" ] && [ "$BF_SOURCE" != "chatdb" ]; then
     HAS_CLIQUE=false
     if [ -f "$TRUSTEDPEERS_FILE" ]; then
