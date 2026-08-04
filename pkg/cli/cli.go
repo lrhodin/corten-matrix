@@ -432,6 +432,9 @@ func RunAllBridges() {
 		dirs = append(dirs, secondDataDir())
 	}
 	var cmds []*exec.Cmd
+	// Parallel to cmds: the data dir each child was launched from, so the exit
+	// report below can name the account that actually failed.
+	var cmdDirs []string
 	for i, d := range dirs {
 		cfg := filepath.Join(d, "config.yaml")
 		if _, err := os.Stat(cfg); err != nil {
@@ -478,16 +481,37 @@ func RunAllBridges() {
 			continue
 		}
 		cmds = append(cmds, c)
+		cmdDirs = append(cmdDirs, d)
 	}
 	if len(cmds) == 0 {
 		fmt.Fprintln(os.Stderr, "corten-matrix: no configured account to run (run setup first)")
 		os.Exit(1)
 	}
-	exited := make(chan struct{}, len(cmds))
-	for _, c := range cmds {
-		go func(c *exec.Cmd) { _ = c.Wait(); exited <- struct{}{} }(c)
+	exited := make(chan int, len(cmds))
+	for i, c := range cmds {
+		go func(i int, c *exec.Cmd) { _ = c.Wait(); exited <- i }(i, c)
 	}
-	<-exited // first bridge to stop takes the service down → restart as a unit
+	first := <-exited // first bridge to stop takes the service down → restart as a unit
+
+	// Say which account died, before SIGTERMing the rest.
+	//
+	// Without this the service is undebuggable: bridge-all exits 1 no matter
+	// what went wrong, the survivors are killed mid-startup so their logs just
+	// stop with no error, and every per-account log therefore looks equally
+	// healthy. Nothing anywhere on the system names the account to look at.
+	// Under Restart=always that presents as a silent six-second crash loop.
+	//
+	// This goes to bridge-all's own stderr, which is the service's stdout —
+	// the journal — NOT the per-account bridge.stdout.log the children are
+	// redirected to. `journalctl --user -u corten-matrix.service` is where a
+	// user staring at a restart loop actually looks first.
+	state := "unknown exit status"
+	if ps := cmds[first].ProcessState; ps != nil {
+		state = ps.String()
+	}
+	fmt.Fprintf(os.Stderr, "corten-matrix: account %d (%s) %s — stopping the other %d and exiting\n",
+		first, cmdDirs[first], state, len(cmds)-1)
+
 	for _, c := range cmds {
 		if c.Process != nil {
 			_ = c.Process.Signal(syscall.SIGTERM)
