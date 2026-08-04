@@ -130,10 +130,6 @@ open(cfg, "w").write(text)
     echo "✓ Configured: $HS_ADDRESS, $HS_DOMAIN, $ADMIN_USER, $DB_TYPE"
 fi
 
-# ── Ensure backfill_source key exists in config ───────────────
-if ! grep -q 'backfill_source:' "$CONFIG" 2>/dev/null; then
-    sed -i '/cloudkit_backfill:/a\    backfill_source: cloudkit' "$CONFIG"
-fi
 
 # ── CloudKit backfill toggle (runs every time) ────────────────
 CURRENT_BACKFILL=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
@@ -448,10 +444,12 @@ fi
 # This catches upgrades from pre-keychain versions where the device-passcode
 # step was never run. If trustedpeers.plist exists with a user_identity, the
 # keychain was joined successfully and any transient PCS errors are harmless.
+# Trust-circle only applies when CloudKit backfill is enabled.
 SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/corten-matrix"
 TRUSTEDPEERS_FILE="$SESSION_DIR/trustedpeers.plist"
 FORCE_CLEAR_STATE=false
-if [ "$NEEDS_LOGIN" = "false" ]; then
+CK_ENABLED=$(awk '/cloudkit_backfill:/{print $2; exit}' "$CONFIG" 2>/dev/null)
+if [ "$NEEDS_LOGIN" = "false" ] && [ "$CK_ENABLED" = "true" ]; then
     HAS_CLIQUE=false
     if [ -f "$TRUSTEDPEERS_FILE" ]; then
         if grep -q "<key>userIdentity</key>\|<key>user_identity</key>" "$TRUSTEDPEERS_FILE" 2>/dev/null; then

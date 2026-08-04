@@ -284,11 +284,6 @@ if ! grep -q 'cloudkit_backfill:' "$CONFIG" 2>/dev/null; then
     fi
 fi
 
-# ── Ensure backfill_source key exists in config ───────────────
-if ! grep -q 'backfill_source:' "$CONFIG" 2>/dev/null; then
-    sed -i '/cloudkit_backfill:/a\    backfill_source: cloudkit' "$CONFIG"
-fi
-
 # ── CloudKit backfill toggle ───────────────────────────────────
 # Only prompt on first run (fresh DB). On re-runs, preserve existing setting.
 DB_PATH_CHECK=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
@@ -659,9 +654,11 @@ fi
 # This catches upgrades from pre-keychain versions where the device-passcode
 # step was never run. If trustedpeers.plist exists with a user_identity, the
 # keychain was joined successfully and any transient PCS errors are harmless.
+# Trust-circle only applies when CloudKit backfill is enabled.
 TRUSTEDPEERS_FILE="$SESSION_DIR/trustedpeers.plist"
 FORCE_CLEAR_STATE=false
-if [ "$NEEDS_LOGIN" = "false" ]; then
+CK_ENABLED=$(awk '/cloudkit_backfill:/{print $2; exit}' "$CONFIG" 2>/dev/null)
+if [ "$NEEDS_LOGIN" = "false" ] && [ "$CK_ENABLED" = "true" ]; then
     HAS_CLIQUE=false
     if [ -f "$TRUSTEDPEERS_FILE" ]; then
         if grep -q "<key>userIdentity</key>\|<key>user_identity</key>" "$TRUSTEDPEERS_FILE" 2>/dev/null; then
@@ -1004,8 +1001,7 @@ chmod +x "$DATA_DIR/start.sh"
 # connects.  This ensures CloudKit backfill can deduplicate any messages that
 # Apple buffers and delivers the moment the bridge registers with APNs.
 _ck_backfill=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
-_ck_source=$(grep 'backfill_source:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*backfill_source: *//' || true)
-if [ "$IS_FRESH_DB" = "true" ] && [ "$_ck_backfill" = "true" ] && [ "$_ck_source" != "chatdb" ] && [ -t 0 ]; then
+if [ "$IS_FRESH_DB" = "true" ] && [ "$_ck_backfill" = "true" ] && [ -t 0 ]; then
     echo ""
     echo "┌─────────────────────────────────────────────────────────────┐"
     echo "│  Last step: sync iCloud Messages before starting            │"
