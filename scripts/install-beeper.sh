@@ -15,6 +15,20 @@ BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
 PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
 
+# ── Back up an existing config before anything rewrites it ────
+# Re-running setup is a supported, routine thing to do, and several blocks
+# below rewrite config values in place on every run: the CloudKit backfill
+# toggle, the transcoding / HEIC / FaceTime / StatusKit prompts, and
+# preferred_handle. Accepting a default at a prompt writes that default.
+# Nothing else in this script keeps a copy, so a re-run used to be able to
+# take a hand-edited setting with no way back. Take one before the first
+# write, not after.
+if [ -f "$CONFIG" ]; then
+    CONFIG_BACKUP="$CONFIG.bak.$(date +%Y%m%d%H%M%S)"
+    cp -p "$CONFIG" "$CONFIG_BACKUP"
+    echo "✓ Backed up existing config to $CONFIG_BACKUP"
+fi
+
 # Where we build/cache bbctl (sparse clone — only cmd/bbctl/)
 
 echo ""
