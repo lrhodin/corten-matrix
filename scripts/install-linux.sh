@@ -451,11 +451,14 @@ FORCE_CLEAR_STATE=false
 # must be true AND backfill_source must not be "chatdb".
 #
 # Anchored so a commented-out key sitting above the live one cannot win,
-# and tolerant of `key:value`, quoted values, inline comments and CRLF.
+# and tolerant of quoted values, inline comments and CRLF.  The colon must
+# be followed by whitespace: `key:value` is not a YAML mapping — go-yaml
+# rejects the whole file — so treating it as a value would arm the guard
+# on a config the bridge cannot even load.
 # A misread backfill_source is the dangerous direction — it re-arms the
 # guard and wipes a login the bridge itself treats as backfill-disabled.
 cfg_scalar() {
-    awk -F: -v k="$1" '$0 ~ "^[[:space:]]*" k "[[:space:]]*:" {
+    awk -F: -v k="$1" '$0 ~ "^[[:space:]]*" k "[[:space:]]*:[[:space:]]" {
         sub(/#.*/, ""); gsub(/[[:space:]"\047\r]/, "", $2); print $2; exit
     }' "$CONFIG" 2>/dev/null || true
 }
