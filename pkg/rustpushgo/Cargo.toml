@@ -19,6 +19,16 @@ name = "rustpushgo"
 #   key_establishment/sign; no unicorn or Apple framework required)
 # - ADI/anisette: omnisette + icloud_auth remote-clearadi (ClearADIClient backed
 #   by the clearadi crate's portable ProvisioningSession + gen_otp)
+#
+# Caveat against the currently pinned upstream: the ADI/anisette half above is
+# real (omnisette declares remote-clearadi and vendors apple-private-apis/
+# clearadi), but `open-absinthe/native-nac-rust` is an EMPTY placeholder feature
+# with zero references in open-absinthe's source. So this shape compiles and
+# gives clean-room ADI, but the pure-Rust NAC it names is not present in the
+# vendored tree. Verify before treating a default build as fully clean-room.
+#
+# This IS the Linux build shape. The Makefile overrides it, but the Makefile is
+# macOS-only (it hard-errors on non-Darwin), so nothing else selects it.
 default = ["cleanroom-registration"]
 cleanroom-registration = [
     "open-absinthe/native-nac-rust",

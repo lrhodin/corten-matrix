@@ -54,6 +54,25 @@ pub type BridgeDefaultAnisetteProvider = omnisette::DefaultAnisetteProvider;
 #[cfg(all(not(target_os = "macos"), feature = "anisette-remote-v3"))]
 pub type BridgeDefaultAnisetteProvider = anisette::BridgeAnisetteProvider;
 
+// `omnisette::default_provider` is 2-arg in EVERY cfg variant the vendored
+// omnisette defines (apple-private-apis/omnisette/src/lib.rs: :86
+// remote-anisette-v3, :97 remote-clearadi, :125 macOS AOSKit). There is no
+// 3-arg variant in this tree to be compatible with.
+//
+// A previous version gated this call on `cleanroom-registration` and passed a
+// third `device_id` there, on the belief that the clean-room omnisette takes
+// one. It does not: `cleanroom-registration` pulls `omnisette/remote-clearadi`,
+// which on non-macOS selects the ClearADIClient variant at :97 — 2-arg — so the
+// gated call could not compile under the crate's own default features. That is
+// the Linux build (the Makefile is macOS-only), so the gate broke exactly the
+// shape it was meant to serve.
+//
+// Keep this 2-arg. If a 3-arg provider is ever vendored, reintroduce the gate
+// with a compile check for BOTH shapes rather than restoring it from memory.
+//
+// `device_id` is accepted but unused: both cfg variants of this function ignore
+// it, and it is retained only so the two call sites (which do hold a device
+// UUID) keep a stable signature if provider selection changes.
 #[cfg(any(target_os = "macos", not(feature = "anisette-remote-v3")))]
 fn bridge_default_provider(
     info: omnisette::LoginClientInfo,

@@ -86,14 +86,31 @@ check-deps:
 
 # From-source build feature selection.
 # ---------------------------------------------------------------------------
-# The rustpushgo crate's default feature, `cleanroom-registration`, enables
-# `open-absinthe/native-nac-rust` + `remote-clearadi`, which are NOT provided by
-# the upstream OpenBubbles crates this from-source build vendors. So this build
-# opts out of the default and selects the native AAAbsintheContext NAC path
-# (`nac-apple-framework`). omnisette's built-in macOS AOSKit anisette compiles
-# automatically — no provider feature, no unicorn, no cmake. The rustpushgo
-# `anisette-*` features are skipped because they pull `prefer-*` omnisette
-# features that upstream omnisette doesn't define.
+# This Makefile is the macOS-only path (see the Darwin guard above). It opts out
+# of the crate default and selects Apple's native AAAbsintheContext NAC
+# (`nac-apple-framework`), because that is the NAC implementation available on a
+# Mac. omnisette's built-in macOS AOSKit anisette compiles automatically — no
+# provider feature, no unicorn, no cmake.
+#
+# The default feature shape (`cleanroom-registration`) is NOT dead code: it is
+# what Linux builds, since Linux never reaches this Makefile. Do not "clean it
+# up" on the assumption that nothing selects it.
+#
+# An earlier version of this comment claimed the vendored upstream crates do not
+# provide `open-absinthe/native-nac-rust`, `remote-clearadi` or omnisette's
+# `prefer-*` features. That is wrong on all three counts and cost real debugging
+# time, so, as of the pinned SHA:
+#   - omnisette declares `remote-clearadi` and both `prefer-*` features, and
+#     vendors the clearadi crate (apple-private-apis/clearadi).
+#   - rustpush and icloud_auth declare `remote-clearadi`.
+#   - open-absinthe declares `native-nac-rust`, but as an EMPTY placeholder with
+#     zero references in its source — it exists so the feature name resolves.
+#     That is the real reason this build cannot rely on the default shape for
+#     NAC, and it is specific to `native-nac-rust`, not to the others.
+#
+# Note that `--no-default-features` leaves omnisette without its `async` feature
+# (only the `remote-*` features enable it), which makes `omnisette::AnisetteClient`
+# unresolvable. That is why this shape does not build on Linux.
 #
 # Override on the command line to build a different feature shape, e.g.:
 #   make CARGO_FEATURES="--features cleanroom-registration"
