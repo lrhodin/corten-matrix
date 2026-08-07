@@ -516,6 +516,11 @@ type IMClient struct {
 	// overwhelming CloudKit/Matrix with simultaneous attachment downloads.
 	forwardBackfillSem chan struct{}
 
+	// deferredBackwardBackfills records tasks temporarily completed while a
+	// portal's forward import was still establishing its Matrix anchor.
+	deferredBackwardBackfills   map[string]struct{}
+	deferredBackwardBackfillsMu sync.Mutex
+
 	// attachmentContentCache maps CloudKit record_name → *event.MessageEventContent.
 	// Populated by preUploadCloudAttachments, which runs in the cloud sync
 	// goroutine BEFORE createPortalsFromCloudSync. Checked first by
@@ -7946,6 +7951,54 @@ type cloudBackfillCursor struct {
 	GUID        string `json:"g"`
 }
 
+// backwardBackfillShouldWaitForForward reports whether a backward task should
+// be deferred until the portal's initial forward import has established its
+// Matrix anchor. The task must be re-queued after forward completion rather
+// than returned with HasMore=true and an empty cursor.
+func backwardBackfillShouldWaitForForward(forwardDone, hasMessages bool) bool {
+	return !forwardDone && hasMessages
+}
+
+func (c *IMClient) deferBackwardBackfill(portalID string) {
+	c.deferredBackwardBackfillsMu.Lock()
+	defer c.deferredBackwardBackfillsMu.Unlock()
+	if c.deferredBackwardBackfills == nil {
+		c.deferredBackwardBackfills = make(map[string]struct{})
+	}
+	c.deferredBackwardBackfills[portalID] = struct{}{}
+}
+
+func (c *IMClient) takeDeferredBackwardBackfill(portalID string) bool {
+	c.deferredBackwardBackfillsMu.Lock()
+	defer c.deferredBackwardBackfillsMu.Unlock()
+	if _, ok := c.deferredBackwardBackfills[portalID]; !ok {
+		return false
+	}
+	delete(c.deferredBackwardBackfills, portalID)
+	return true
+}
+
+func (c *IMClient) requeueDeferredBackwardBackfill(ctx context.Context, portalKey networkid.PortalKey) {
+	if !c.takeDeferredBackwardBackfill(string(portalKey.ID)) {
+		return
+	}
+	err := c.Main.Bridge.DB.BackfillTask.Upsert(ctx, &database.BackfillTask{
+		PortalKey:         portalKey,
+		UserLoginID:       c.UserLogin.ID,
+		BatchCount:        -1,
+		IsDone:            false,
+		Cursor:            "",
+		OldestMessageID:   "",
+		NextDispatchMinTS: time.Now().Add(5 * time.Second),
+	})
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).Str("portal_id", string(portalKey.ID)).
+			Msg("Failed to requeue backward backfill after forward import")
+		return
+	}
+	c.Main.Bridge.WakeupBackfillQueue()
+}
+
 func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
 	fetchStart := time.Now()
 	log := zerolog.Ctx(ctx)
@@ -8193,6 +8246,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				readByMe, readErr := cloudStoreDone.getConversationReadByMe(context.Background(), portalID)
 
 				cloudStoreDone.markForwardBackfillDone(context.Background(), portalID)
+				c.requeueDeferredBackwardBackfill(context.Background(), portalKey)
 
 				// NOTE: Receipt 1 (ghost "they read my message") is intentionally
 				// NOT sent during backfill. CloudKit's date_read_ms is unreliable:
@@ -8266,21 +8320,11 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		// creates an infinite retry loop.
 		if !c.cloudStore.isForwardBackfillDone(ctx, portalID) {
 			hasMessages, _ := c.cloudStore.hasPortalMessages(ctx, portalID)
-			if hasMessages {
+			if backwardBackfillShouldWaitForForward(false, hasMessages) {
+				c.deferBackwardBackfill(portalID)
 				log.Info().Str("portal_id", portalID).
-					Msg("Backward backfill: no anchor yet, forward backfill still in progress — deferring")
-				// Sleep before returning HasMore=true so the bridgev2 backfill
-				// queue doesn't tight-loop on this task and steal scheduler
-				// time from forward backfill (which we're waiting on). Each
-				// tight-loop iteration was ~1s of pure no-op — with 30+
-				// deferred portals, that's 30+ CPU-seconds per second burned
-				// waiting for a state change that takes minutes to happen.
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(30 * time.Second):
-				}
-				return &bridgev2.FetchMessagesResponse{HasMore: true, Forward: false}, nil
+					Msg("Backward backfill: no anchor yet, forward backfill still in progress — completing task until forward import finishes")
+				return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
 			}
 			log.Info().Str("portal_id", portalID).
 				Msg("Backward backfill: no anchor and no messages — stopping (nothing to backfill)")
