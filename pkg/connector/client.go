@@ -516,11 +516,6 @@ type IMClient struct {
 	// overwhelming CloudKit/Matrix with simultaneous attachment downloads.
 	forwardBackfillSem chan struct{}
 
-	// deferredBackwardBackfills records tasks temporarily completed while a
-	// portal's forward import was still establishing its Matrix anchor.
-	deferredBackwardBackfills   map[string]struct{}
-	deferredBackwardBackfillsMu sync.Mutex
-
 	// attachmentContentCache maps CloudKit record_name → *event.MessageEventContent.
 	// Populated by preUploadCloudAttachments, which runs in the cloud sync
 	// goroutine BEFORE createPortalsFromCloudSync. Checked first by
@@ -7951,49 +7946,76 @@ type cloudBackfillCursor struct {
 	GUID        string `json:"g"`
 }
 
-// backwardBackfillShouldWaitForForward reports whether a backward task should
-// be deferred until the portal's initial forward import has established its
-// Matrix anchor. The task must be re-queued after forward completion rather
-// than returned with HasMore=true and an empty cursor.
-func backwardBackfillShouldWaitForForward(forwardDone, hasMessages bool) bool {
-	return !forwardDone && hasMessages
-}
-
-func (c *IMClient) deferBackwardBackfill(portalID string) {
-	c.deferredBackwardBackfillsMu.Lock()
-	defer c.deferredBackwardBackfillsMu.Unlock()
-	if c.deferredBackwardBackfills == nil {
-		c.deferredBackwardBackfills = make(map[string]struct{})
-	}
-	c.deferredBackwardBackfills[portalID] = struct{}{}
-}
-
-func (c *IMClient) takeDeferredBackwardBackfill(portalID string) bool {
-	c.deferredBackwardBackfillsMu.Lock()
-	defer c.deferredBackwardBackfillsMu.Unlock()
-	if _, ok := c.deferredBackwardBackfills[portalID]; !ok {
+// backwardBackfillShouldWaitForForward reports whether a backward task must be
+// suspended until the portal's initial forward import has established its Matrix
+// anchor.
+//
+// forwardDone is tri-state on purpose. The flag lives in SQLite (cloud_chat.
+// fwd_backfill_done), and a read of it can fail — under exactly the write
+// contention a large backfill produces. An unknown answer must not be collapsed
+// into "not done": that would suspend a portal whose forward import already
+// finished, and it must not be collapsed into "done" either, which would drop
+// the task's only anchor guard. Callers pass nil for unknown and get a wait,
+// which is recoverable, rather than a guess.
+func backwardBackfillShouldWaitForForward(forwardDone *bool, hasMessages bool) bool {
+	if !hasMessages {
+		// Nothing for a forward import to anchor against, so waiting can only
+		// suspend the task forever.
 		return false
 	}
-	delete(c.deferredBackwardBackfills, portalID)
-	return true
+	return forwardDone == nil || !*forwardDone
 }
 
-func (c *IMClient) requeueDeferredBackwardBackfill(ctx context.Context, portalKey networkid.PortalKey) {
-	if !c.takeDeferredBackwardBackfill(string(portalKey.ID)) {
+// pullForwardBackwardBackfillQuery moves a suspended backward task's next
+// dispatch earlier. It is deliberately not BackfillTaskQuery.Upsert/Update:
+// those write every column from a struct the caller assembled, which would
+// clobber a cursor, batch count or done flag that the queue advanced
+// independently — and both are read-modify-write against a row bridgev2 also
+// writes from the queue goroutine.
+//
+// The guards make the statement safe to run at any moment:
+//   - is_done/queue_done false: never resurrect a task that legitimately finished.
+//   - next_dispatch_min_ts > new value: only ever move dispatch EARLIER. A task
+//     already scheduled sooner (or mid-batch, where MarkDispatched has parked it
+//     an hour out and the queue owns the row) is left alone.
+//
+// Nothing here is load-bearing for correctness. If this update is lost to a
+// race with the queue's own trailing Update, the task keeps the 24h suspension
+// bridgev2 gave it and recovers on its own — later than ideal, never never.
+const pullForwardBackwardBackfillQuery = `
+	UPDATE backfill_task
+	SET next_dispatch_min_ts = $4
+	WHERE bridge_id = $1 AND portal_id = $2 AND portal_receiver = $3
+	  AND is_done = false AND queue_done = false
+	  AND next_dispatch_min_ts > $4
+`
+
+// wakeBackwardBackfillAfterForward un-suspends the backward task for a portal
+// whose forward import just landed.
+//
+// This is an optimization over the 24h retry bridgev2 schedules for a pending
+// task, not the mechanism that makes deferral work. That distinction is the
+// whole point: an earlier version tracked deferred portals in an in-memory map
+// and returned HasMore=false, which made bridgev2 persist is_done=true
+// (portalbackfill.go:156) and left this callback as the ONLY path back. Since
+// getNextBackfillQuery filters on is_done=false and nothing calls MarkNotDone at
+// startup, any missed callback — a crash, a room-send failure before
+// CompleteCallback runs, a lost update from the queue's trailing Update — cost
+// that portal its entire history, permanently and silently.
+func (c *IMClient) wakeBackwardBackfillAfterForward(ctx context.Context, portalKey networkid.PortalKey) {
+	dispatchAt := time.Now().Add(5 * time.Second)
+	res, err := c.Main.Bridge.DB.Exec(ctx, pullForwardBackwardBackfillQuery,
+		c.Main.Bridge.DB.BridgeID, portalKey.ID, portalKey.Receiver, dispatchAt.UnixNano(),
+	)
+	if err != nil {
+		// Warn, not error: the task is still queued with its own retry.
+		zerolog.Ctx(ctx).Warn().Err(err).Str("portal_id", string(portalKey.ID)).
+			Msg("Failed to bring backward backfill forward after forward import (task will retry on its own)")
 		return
 	}
-	err := c.Main.Bridge.DB.BackfillTask.Upsert(ctx, &database.BackfillTask{
-		PortalKey:         portalKey,
-		UserLoginID:       c.UserLogin.ID,
-		BatchCount:        -1,
-		IsDone:            false,
-		Cursor:            "",
-		OldestMessageID:   "",
-		NextDispatchMinTS: time.Now().Add(5 * time.Second),
-	})
-	if err != nil {
-		zerolog.Ctx(ctx).Warn().Err(err).Str("portal_id", string(portalKey.ID)).
-			Msg("Failed to requeue backward backfill after forward import")
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		// Normal: the portal had no suspended backward task, or the queue is
+		// already working it.
 		return
 	}
 	c.Main.Bridge.WakeupBackfillQueue()
@@ -8205,6 +8227,11 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			// Use context.Background() — if the bridge is shutting down, ctx
 			// may be cancelled but we still need to persist the flag.
 			c.cloudStore.markForwardBackfillDone(context.Background(), portalID)
+			// Reachable with a suspended backward task waiting on this portal:
+			// hasPortalMessages counts raw cloud_message rows, and conversion can
+			// still drop every one of them. There is no CompleteCallback on this
+			// path, so wake the backward task here or it sits out the full 24h.
+			c.wakeBackwardBackfillAfterForward(context.Background(), params.Portal.PortalKey)
 			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: true}, nil
 		}
 
@@ -8246,7 +8273,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				readByMe, readErr := cloudStoreDone.getConversationReadByMe(context.Background(), portalID)
 
 				cloudStoreDone.markForwardBackfillDone(context.Background(), portalID)
-				c.requeueDeferredBackwardBackfill(context.Background(), portalKey)
+				c.wakeBackwardBackfillAfterForward(context.Background(), portalKey)
 
 				// NOTE: Receipt 1 (ghost "they read my message") is intentionally
 				// NOT sent during backfill. CloudKit's date_read_ms is unreliable:
@@ -8318,13 +8345,32 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		// But if the portal has no messages at all, stop waiting — there's
 		// nothing for forward backfill to anchor against, and deferring
 		// creates an infinite retry loop.
-		if !c.cloudStore.isForwardBackfillDone(ctx, portalID) {
-			hasMessages, _ := c.cloudStore.hasPortalMessages(ctx, portalID)
-			if backwardBackfillShouldWaitForForward(false, hasMessages) {
-				c.deferBackwardBackfill(portalID)
+		forwardDone, forwardErr := c.cloudStore.checkForwardBackfillDone(ctx, portalID)
+		if forwardErr != nil || !forwardDone {
+			hasMessages, msgErr := c.cloudStore.hasPortalMessages(ctx, portalID)
+			if msgErr != nil {
+				// Unknown, so assume there is history to protect. The opposite
+				// default sends this task down the "nothing to backfill" path
+				// below, which is permanent — one transient SQLite error would
+				// cost the portal its history.
+				hasMessages = true
+			}
+			var forwardDoneRead *bool
+			if forwardErr == nil {
+				forwardDoneRead = &forwardDone
+			}
+			if backwardBackfillShouldWaitForForward(forwardDoneRead, hasMessages) {
 				log.Info().Str("portal_id", portalID).
-					Msg("Backward backfill: no anchor yet, forward backfill still in progress — completing task until forward import finishes")
-				return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
+					AnErr("forward_state_err", forwardErr).
+					AnErr("message_check_err", msgErr).
+					Msg("Backward backfill: no anchor yet, forward backfill still in progress — suspending task until forward import finishes")
+				// Pending, not HasMore=false. bridgev2 parks a pending task for
+				// 24h with is_done/queue_done untouched (portalbackfill.go:135),
+				// so the suspension survives a restart and self-heals even if
+				// the forward CompleteCallback never runs. HasMore=false would
+				// instead persist is_done=true, which nothing reverses.
+				// wakeBackwardBackfillAfterForward normally cuts the 24h to ~5s.
+				return &bridgev2.FetchMessagesResponse{Pending: true, Forward: false}, nil
 			}
 			log.Info().Str("portal_id", portalID).
 				Msg("Backward backfill: no anchor and no messages — stopping (nothing to backfill)")

@@ -3490,19 +3490,33 @@ func (s *cloudBackfillStore) markForwardBackfillDone(ctx context.Context, portal
 	}
 }
 
-// isForwardBackfillDone returns true if forward backfill has completed for the
-// given portal. Used by backward backfill to avoid permanently marking
-// is_done=true before forward backfill has inserted the anchor message.
-func (s *cloudBackfillStore) isForwardBackfillDone(ctx context.Context, portalID string) bool {
+// checkForwardBackfillDone reports whether forward backfill has completed for
+// the given portal, keeping a failed read distinguishable from a negative one.
+//
+// Backward backfill needs that distinction: it uses this flag to decide whether
+// marking a task done is safe, and "the query failed" is not evidence either
+// way. See backwardBackfillShouldWaitForForward.
+func (s *cloudBackfillStore) checkForwardBackfillDone(ctx context.Context, portalID string) (bool, error) {
 	var done bool
 	err := s.db.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND fwd_backfill_done=TRUE)`,
 		s.loginID, portalID,
 	).Scan(&done)
 	if err != nil {
-		return false
+		return false, err
 	}
-	return done
+	return done, nil
+}
+
+// isForwardBackfillDone returns true if forward backfill has completed for the
+// given portal. Used by backward backfill to avoid permanently marking
+// is_done=true before forward backfill has inserted the anchor message.
+//
+// Reports false on a failed read. Only call this where treating an error as
+// "not done" is the safe direction; otherwise use checkForwardBackfillDone.
+func (s *cloudBackfillStore) isForwardBackfillDone(ctx context.Context, portalID string) bool {
+	done, err := s.checkForwardBackfillDone(ctx, portalID)
+	return err == nil && done
 }
 
 // getForwardBackfillDonePortals returns the set of portal IDs whose forward
