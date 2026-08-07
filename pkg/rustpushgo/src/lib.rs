@@ -60,20 +60,8 @@ fn bridge_default_provider(
     path: PathBuf,
     device_id: String,
 ) -> omnisette::ArcAnisetteClient<BridgeDefaultAnisetteProvider> {
-    // The omnisette provider selected with `cleanroom-registration` takes a
-    // `device_id`; upstream OpenBubbles omnisette's `default_provider` is 2-arg.
-    // Gate on the feature so both signatures build: with cleanroom-registration
-    // the 3-arg call is used; without it (this from-source build) the 2-arg
-    // upstream signature is used.
-    #[cfg(feature = "cleanroom-registration")]
-    {
-        omnisette::default_provider(info, path, device_id)
-    }
-    #[cfg(not(feature = "cleanroom-registration"))]
-    {
-        let _ = device_id;
-        omnisette::default_provider(info, path)
-    }
+    let _ = device_id;
+    omnisette::default_provider(info, path)
 }
 #[cfg(all(not(target_os = "macos"), feature = "anisette-remote-v3"))]
 fn bridge_default_provider(
