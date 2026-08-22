@@ -1599,7 +1599,28 @@ async fn join_keychain_with_bottles(
                     }
                 }
                 Err(e) => {
-                    warn!("Bottle {} failed: {}", i, e);
+                    // A BadMsg here is the escrow record's peer-key signature
+                    // failing to verify against that peer's CURRENT signing key
+                    // (rustpush keychain.rs, verify_signature on the outer
+                    // bottle). It means the device re-keyed after this record
+                    // was written — a macOS/iOS major upgrade, a re-enrollment,
+                    // or an earlier bridge install that has since generated a
+                    // fresh identity. Such a record can never open again, and
+                    // Apple keeps serving it, so this is expected on accounts
+                    // with any device history. Say so, rather than leaving a
+                    // bare "Bad message" that reads like the login broke.
+                    if matches!(e, rustpush::PushError::BadMsg) {
+                        warn!(
+                            "Bottle {} (serial={}, build={}) has a stale signature — that device \
+                             re-keyed after this escrow record was written (OS upgrade, \
+                             re-enrollment, or an earlier bridge install), so it can never be \
+                             opened. Skipping to the next bottle; this is not a failure as long \
+                             as a later one succeeds.",
+                            i, meta.serial, meta.build
+                        );
+                    } else {
+                        warn!("Bottle {} failed: {}", i, e);
+                    }
                     last_err = format!("{}", e);
                 }
             }

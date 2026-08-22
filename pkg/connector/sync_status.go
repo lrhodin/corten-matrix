@@ -653,15 +653,15 @@ func (r *SyncStatusReport) Format() string {
 	if r.PendingMessages() > 0 {
 		sb.WriteString("\n")
 		if r.BatchSending != nil && !*r.BatchSending {
-			sb.WriteString("This homeserver does not support Beeper batch sending, so the backfill queue never starts. Each chat still gets the batch delivered when its room is created, but anything that batch did not cover will not arrive — expect the pending count to stall rather than drain.\n")
+			sb.WriteString("This homeserver does not support Beeper batch sending, so bridgev2's own backfill queue never starts. The bridge drains the queue itself instead, delivering older messages as individual events. That drain waits for the initial sync and each chat's first batch to finish before it starts, so pending can sit still for a while and then move.\n")
 		} else if r.BatchSending == nil {
-			sb.WriteString("Note: the backfill queue only runs on a homeserver that supports Beeper batch sending. Where it does not, chats still get the batch delivered at room creation, but anything beyond it will not arrive and pending will stall. Run `sync-status` in the management room to see which case this is.\n")
+			sb.WriteString("Note: bridgev2's backfill queue only runs on a homeserver that supports Beeper batch sending. Where it does not, the bridge drains the queue itself and delivers older messages as individual events — but only when no per-chat message cap is set. Run `sync-status` in the management room to see which case this is.\n")
 		}
 		if r.BackfillTasksPresent && r.BackfillTasksUndispatched > 0 {
 			sb.WriteString(fmt.Sprintf("Backfill queue: %d of %d tasks done, %d never dispatched.\n",
 				r.BackfillTasksDone, r.BackfillTasksTotal, r.BackfillTasksUndispatched))
 		}
-		sb.WriteString("Pending counts bridgeable messages that have not reached Matrix. If it holds steady with no sync running, the remainder is not recoverable from CloudKit — search the log for \"VISIBLE data loss\".\n")
+		sb.WriteString("Pending counts bridgeable messages that have not reached Matrix. If it holds steady with no sync running, the remainder is not recoverable from CloudKit — search the log for \"marking done with nothing delivered\".\n")
 	} else if r.FullyCaughtUp() {
 		sb.WriteString("\n✅ Backfill is complete — every bridgeable message has been delivered.\n")
 	}
