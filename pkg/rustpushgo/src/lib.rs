@@ -3873,6 +3873,154 @@ pub trait StatusCallback: Send + Sync {
 // Top-level functions
 // ============================================================================
 
+/// Proves, at startup, that AES key wrap still works with an implicit IV.
+///
+/// rustpush wraps keys for the iCloud Keychain — the escrow bottle and every
+/// TLK share handed to a newly joined peer — with `rfc6637_wrap_key`, which
+/// calls `Crypter::new(AES128_WRAP, .., iv: None)` and lets OpenSSL apply the
+/// RFC 3394 default IV. openssl 0.10.76 added an assert that turns exactly that
+/// call into a panic:
+///
+///   panicked at openssl/src/symm.rs: an IV is required for this cipher
+///
+/// which lands mid-login, AFTER the bottle has opened and after real requests
+/// to Apple, and reads like an Apple-side failure rather than a dependency
+/// bump. The crate is pinned below 0.10.76 for that reason, but a pin is a
+/// promise about the build and this is a check on the binary: it runs the same
+/// operation once, before anything talks to Apple, so a regression shows up as
+/// one line at startup instead of a failed trust-circle join.
+fn preflight_key_wrap_check() {
+    use openssl::nid::Nid;
+    use openssl::symm::{Cipher, Crypter, Mode};
+
+    let result = std::panic::catch_unwind(|| -> Result<usize, openssl::error::ErrorStack> {
+        let key = [0u8; 16];
+        let plaintext = [0u8; 16];
+        let mut out = vec![0u8; plaintext.len() + 16];
+        // iv: None on purpose — this is the shape rfc6637_wrap_key uses.
+        let mut c = Crypter::new(
+            Cipher::from_nid(Nid::ID_AES128_WRAP).expect("AES-128-WRAP unavailable"),
+            Mode::Encrypt,
+            &key,
+            None,
+        )?;
+        let mut count = c.update(&plaintext, &mut out)?;
+        count += c.finalize(&mut out[count..])?;
+        Ok(count)
+    });
+
+    match result {
+        // AES-KW adds one 8-byte block, so 16 in must give 24 out. A short
+        // result would mean the cipher ran but not as key wrap.
+        Ok(Ok(n)) if n == 24 => {
+            info!("preflight: AES key wrap OK (openssl {})", openssl::version::version());
+        }
+        Ok(Ok(n)) => {
+            error!(
+                "preflight: AES key wrap produced {n} bytes, expected 24 (openssl {}). \
+                 Joining the iCloud Keychain will likely fail — do not retry a login into this.",
+                openssl::version::version()
+            );
+        }
+        Ok(Err(e)) => {
+            error!("preflight: AES key wrap errored: {e} (openssl {})", openssl::version::version());
+        }
+        Err(_) => {
+            error!(
+                "preflight: AES key wrap PANICKED (openssl {}). This build has an openssl \
+                 whose Crypter::new rejects an implicit IV (>=0.10.76), so the iCloud Keychain \
+                 join will panic mid-login. Rebuild with the pinned openssl (<0.10.76) — do NOT \
+                 retry the login, each attempt is a real trust-circle request to Apple.",
+                openssl::version::version()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod key_wrap_preflight_tests {
+    use openssl::nid::Nid;
+    use openssl::symm::{Cipher, Crypter, Mode};
+
+    /// RFC 3394 §4.1 — wrap 128 bits of key data with a 128-bit KEK.
+    ///
+    /// This is not a test of OpenSSL. It is a test of one assumption this
+    /// bridge's login depends on: that `Crypter::new(AES128_WRAP, .., None)`
+    /// works and applies the RFC 3394 default IV (A6A6A6A6A6A6A6A6).
+    /// `rfc6637_wrap_key` in rustpush wraps the iCloud Keychain escrow bottle
+    /// and every TLK share that way. openssl 0.10.76 added an assert that
+    /// panics on the `None`, which took out a login mid-flight — after the
+    /// bottle had opened and after real requests to Apple — while looking like
+    /// an Apple-side failure. openssl is pinned below that version; this test
+    /// is what notices if the pin is ever raised or dropped.
+    ///
+    /// Asserting the published ciphertext, not just "it didn't panic", is the
+    /// point: it pins the default IV too. A different default would still
+    /// produce 24 bytes and would still round-trip against itself, while
+    /// silently failing to interoperate with Apple.
+    #[test]
+    fn aes_key_wrap_with_implicit_iv_matches_rfc3394() {
+        let kek: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        ];
+        let key_data: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+        ];
+        let expected: [u8; 24] = [
+            0x1F, 0xA6, 0x8B, 0x0A, 0x81, 0x12, 0xB4, 0x47,
+            0xAE, 0xF3, 0x4B, 0xD8, 0xFB, 0x5A, 0x7B, 0x82,
+            0x9D, 0x3E, 0x86, 0x23, 0x71, 0xD2, 0xCF, 0xE5,
+        ];
+
+        let cipher = Cipher::from_nid(Nid::ID_AES128_WRAP).expect("AES-128-WRAP unavailable");
+        // iv: None on purpose — the exact shape rfc6637_wrap_key uses.
+        let mut c = Crypter::new(cipher, Mode::Encrypt, &kek, None)
+            .expect("Crypter::new rejected an implicit IV — openssl >=0.10.76? see the pin in Cargo.toml");
+        let mut out = vec![0u8; key_data.len() + 16];
+        let mut count = c.update(&key_data, &mut out).expect("wrap update failed");
+        count += c.finalize(&mut out[count..]).expect("wrap finalize failed");
+        out.truncate(count);
+
+        assert_eq!(
+            out, expected,
+            "AES key wrap output does not match RFC 3394 §4.1 — the default IV changed"
+        );
+    }
+
+    /// The unwrap direction, which is what actually runs during login.
+    #[test]
+    fn aes_key_unwrap_with_implicit_iv_round_trips() {
+        let kek: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        ];
+        let wrapped: [u8; 24] = [
+            0x1F, 0xA6, 0x8B, 0x0A, 0x81, 0x12, 0xB4, 0x47,
+            0xAE, 0xF3, 0x4B, 0xD8, 0xFB, 0x5A, 0x7B, 0x82,
+            0x9D, 0x3E, 0x86, 0x23, 0x71, 0xD2, 0xCF, 0xE5,
+        ];
+
+        let cipher = Cipher::from_nid(Nid::ID_AES128_WRAP).expect("AES-128-WRAP unavailable");
+        let mut c = Crypter::new(cipher, Mode::Decrypt, &kek, None)
+            .expect("Crypter::new rejected an implicit IV on unwrap");
+        let mut out = vec![0u8; wrapped.len() + 16];
+        let mut count = c.update(&wrapped, &mut out).expect("unwrap update failed");
+        count += c.finalize(&mut out[count..]).expect("unwrap finalize failed");
+        out.truncate(count);
+
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+            ],
+            "unwrap did not recover the RFC 3394 key data"
+        );
+    }
+}
+
 #[uniffi::export]
 pub fn init_logger() {
     if std::env::var("RUST_LOG").is_err() {
@@ -3898,6 +4046,9 @@ pub fn init_logger() {
         );
     }
     let _ = pretty_env_logger::try_init();
+
+    // Before anything talks to Apple.
+    preflight_key_wrap_check();
 
     // Install a panic hook that silences rustpush's `.unwrap()` /
     // `.expect()` panics inside the CloudKit download path. These panics
