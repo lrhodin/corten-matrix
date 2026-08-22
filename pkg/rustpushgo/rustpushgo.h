@@ -205,11 +205,6 @@ void* uniffi_rustpushgo_fn_method_client_get_dsid(
 	RustCallStatus* out_status
 );
 
-void* uniffi_rustpushgo_fn_method_client_get_facetime_client(
-	void* ptr,
-	RustCallStatus* out_status
-);
-
 void* uniffi_rustpushgo_fn_method_client_get_handles(
 	void* ptr,
 	RustCallStatus* out_status
@@ -681,122 +676,6 @@ void* uniffi_rustpushgo_fn_constructor_wrappedapsstate_new(
 
 RustBuffer uniffi_rustpushgo_fn_method_wrappedapsstate_to_string(
 	void* ptr,
-	RustCallStatus* out_status
-);
-
-void uniffi_rustpushgo_fn_free_wrappedfacetimeclient(
-	void* ptr,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_add_members(
-	void* ptr,
-	RustBuffer session_id,
-	RustBuffer handles,
-	int8_t letmein,
-	RustBuffer to_members,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_bind_bridge_link_to_session(
-	void* ptr,
-	RustBuffer handle,
-	RustBuffer usage,
-	RustBuffer group_id,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_clear_links(
-	void* ptr,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_create_session(
-	void* ptr,
-	RustBuffer group_id,
-	RustBuffer handle,
-	RustBuffer participants,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_create_session_no_ring(
-	void* ptr,
-	RustBuffer group_id,
-	RustBuffer handle,
-	RustBuffer participants,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_delete_link(
-	void* ptr,
-	RustBuffer pseud,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_export_state_json(
-	void* ptr,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_get_link_for_usage(
-	void* ptr,
-	RustBuffer handle,
-	RustBuffer usage,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_get_session_link(
-	void* ptr,
-	RustBuffer guid,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_list_delegated_letmein_requests(
-	void* ptr,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_register_pending_ring(
-	void* ptr,
-	RustBuffer session_id,
-	RustBuffer caller_handle,
-	RustBuffer targets,
-	uint64_t ttl_secs,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_remove_members(
-	void* ptr,
-	RustBuffer session_id,
-	RustBuffer handles,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_respond_delegated_letmein(
-	void* ptr,
-	RustBuffer delegation_uuid,
-	RustBuffer approved_group,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_ring(
-	void* ptr,
-	RustBuffer session_id,
-	RustBuffer targets,
-	int8_t letmein,
-	RustCallStatus* out_status
-);
-
-void uniffi_rustpushgo_fn_method_wrappedfacetimeclient_set_self_display_name(
-	void* ptr,
-	RustBuffer name,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_use_link_for(
-	void* ptr,
-	RustBuffer old_usage,
-	RustBuffer usage,
 	RustCallStatus* out_status
 );
 
@@ -1654,10 +1533,6 @@ uint16_t uniffi_rustpushgo_checksum_method_client_get_dsid(
 	RustCallStatus* out_status
 );
 
-uint16_t uniffi_rustpushgo_checksum_method_client_get_facetime_client(
-	RustCallStatus* out_status
-);
-
 uint16_t uniffi_rustpushgo_checksum_method_client_get_handles(
 	RustCallStatus* out_status
 );
@@ -1903,70 +1778,6 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedapsconnection_state(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedapsstate_to_string(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_add_members(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_bind_bridge_link_to_session(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_clear_links(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_create_session(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_create_session_no_ring(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_delete_link(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_export_state_json(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_get_link_for_usage(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_get_session_link(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_list_delegated_letmein_requests(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_register_pending_ring(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_remove_members(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_respond_delegated_letmein(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_ring(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_set_self_display_name(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_use_link_for(
 	RustCallStatus* out_status
 );
 

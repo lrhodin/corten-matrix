@@ -552,6 +552,21 @@ func TestInstrDialectHelperQueriesRun(t *testing.T) {
 		t.Fatalf("age messages: %v", err)
 	}
 
+	// The chat row was just written, so this portal is inside the
+	// pendingBackfillGateSQL hold: forward backfill has not marked it done and
+	// we only learned about it seconds ago. The scrubber must leave it alone
+	// until delivery is confirmed (see TestScrubHoldsOffPendingBackfillPortals
+	// for the full matrix).
+	held, err := store.scrubBridgedBodies(ctx, "test-bridge", time.Minute, nil)
+	if err != nil {
+		t.Fatalf("scrubBridgedBodies (portal still pending): %v", err)
+	}
+	if held != 0 {
+		t.Errorf("scrubBridgedBodies scrubbed %d rows while the portal was still awaiting forward backfill, want 0", held)
+	}
+
+	store.markForwardBackfillDone(ctx, "gid:right-portal")
+
 	scrubbed, err := store.scrubBridgedBodies(ctx, "test-bridge", time.Minute, nil)
 	if err != nil {
 		t.Fatalf("scrubBridgedBodies: %v", err)

@@ -2314,11 +2314,16 @@ pub async fn restore_token_provider(
     //
     // The 0bbb081 commit that removed this trick said "FetchedToken has
     // private fields so we cannot reconstruct tokens from the persisted
-    // SPD" — that was accurate against raw rustpush but no
-    // longer applies, because the Makefile's `ensure-rustpush-source`
-    // target now sed-patches `pub token`/`pub expiration` onto
-    // `FetchedToken` alongside the existing `pub mod activation; pub mod
-    // ids;` visibility bumps. See Makefile:208-217.
+    // SPD" — that was accurate against raw rustpush but no longer applies.
+    // The source-prep step both builds run before cargo (the Makefile's
+    // `ensure-rustpush-source` target, and the matching `rp_patch` calls in
+    // the private release build script) now patches the vendored
+    // apple-private-apis: `FetchedToken.token` and `FetchedToken.expiration`
+    // are made `pub` in icloud-auth's `client.rs`, and `FetchedToken` is added
+    // to the `pub use client::{…}` re-export in its `lib.rs` — which is why
+    // the `icloud_auth::FetchedToken { … }` literal below compiles. Those three
+    // patches are what this depends on; the separate `mod ids;` → `pub mod ids;`
+    // bump in rustpush is for the IDS call sites and unrelated to tokens.
     //
     // This is the PRIMARY fix for the daily-auth-breaks-at-24h regression
     // that appeared after the refactor migration to raw rustpush and
@@ -2808,6 +2813,107 @@ fn parse_cloud_reply(reply: Option<&str>) -> (Option<String>, Option<String>) {
     (Some(guid), Some(parts.join(":")))
 }
 
+/// The message-shaped fields this wrapper reads out of a CloudKit message
+/// record, flattened.
+///
+/// rustpush 0e0f13c split that record in two: `RemoteCloudMessage` is the
+/// record itself (protos as raw gzipped bytes) and `CloudMessage` is the
+/// decoded form, which keeps its protos inside a `CloudMessageType` enum.
+/// Everything below lives on the `Message` variant — msgType 1 is a message,
+/// 2 a reaction. Types 3-7 are system records (group rename, participant
+/// change, location share, ...) with no user-authored content; before the
+/// split they were decoded with the message schema regardless, so their
+/// "text" and "attributedBody" were whatever the wrong field numbers yielded.
+/// They now come back empty, and the Go side already drops them on msg_type.
+///
+/// `msg_type` mirrors upstream's `Into<RemoteCloudMessage>` numbering, with one
+/// documented exception: a CloudKit record with msgType 0 reports as 1. Real
+/// user messages arrive from CloudKit with msgType 0 (see
+/// pkg/connector/sync_controller.go:3369 — a previous release filtered on the
+/// opposite assumption and left cloud_message empty), and upstream gates the
+/// proto decode on 1..=2, discarding the payload for anything else. A build
+/// patch widens that arm to 0..=2, which folds 0 into the non-reaction Message
+/// variant. Nothing on the Go side reads msg_type, so the collapse is
+/// cosmetic — but decoding those records is not: without it every message
+/// arrives with no text and no attachments, and the startup cleanup then
+/// deletes the rows for having no body.
+///
+/// Both CloudKit normalization paths (the sync page and the newest-first
+/// fallback) read exactly these fields, so the extraction lives here once.
+struct CloudMessageFields {
+    msg_type: i64,
+    text: Option<String>,
+    subject: Option<String>,
+    tapback_type: Option<u32>,
+    tapback_target_guid: Option<String>,
+    tapback_emoji: Option<String>,
+    date_read_ms: i64,
+    has_body: bool,
+    attachment_guids: Vec<String>,
+    reply_guid: Option<String>,
+    reply_part: Option<String>,
+}
+
+fn cloud_message_fields(msg: &rustpush::cloud_messages::CloudMessage) -> CloudMessageFields {
+    use rustpush::cloud_messages::CloudMessageType;
+
+    let (msg_type, proto, proto2, proto4) = match &msg.message {
+        CloudMessageType::Message { reaction, proto, proto2, proto4, .. } => (
+            if *reaction { 2 } else { 1 },
+            Some(proto),
+            proto2.as_ref(),
+            proto4.as_ref(),
+        ),
+        CloudMessageType::GroupTitleChange { .. } => (3, None, None, None),
+        CloudMessageType::LocationShareStatusChange { .. } => (4, None, None, None),
+        CloudMessageType::MessageAction { .. } => (5, None, None, None),
+        CloudMessageType::ParticipantChange { .. } => (6, None, None, None),
+        CloudMessageType::GroupAction { .. } => (7, None, None, None),
+        // Only reachable for a msgType this build does not know about (>7).
+        // 0..=2 is handled above via the widened decode arm.
+        CloudMessageType::Unknown => (0, None, None, None),
+    };
+
+    // Attachment GUIDs come from attributedBody, plus messageSummaryInfo for
+    // companion transfers (e.g. the Live Photo MOV) that attributedBody omits.
+    let mut attachment_guids: Vec<String> = proto
+        .and_then(|p| p.attributed_body.as_ref())
+        .map(|body| extract_attachment_guids_from_attributed_body(body))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|g| !g.is_empty() && g.len() <= 256 && g.is_ascii())
+        .collect();
+    if let Some(summary) = proto.and_then(|p| p.message_summary_info.as_ref()) {
+        for sg in extract_attachment_guids_from_summary_info(summary) {
+            if !sg.is_empty() && sg.len() <= 256 && sg.is_ascii()
+                && !attachment_guids.contains(&sg)
+            {
+                attachment_guids.push(sg);
+            }
+        }
+    }
+
+    let (reply_guid, reply_part) =
+        parse_cloud_reply(proto2.and_then(|p| p.reply.as_deref()));
+
+    CloudMessageFields {
+        msg_type,
+        text: proto.and_then(|p| p.text.clone()),
+        subject: proto.and_then(|p| p.subject.clone()),
+        tapback_type: proto.and_then(|p| p.associated_message_type),
+        tapback_target_guid: proto.and_then(|p| p.associated_message_guid.clone()),
+        tapback_emoji: proto4.and_then(|p4| p4.associated_message_emoji.clone()),
+        date_read_ms: proto
+            .and_then(|p| p.date_read)
+            .map(|dr| apple_timestamp_ns_to_unix_ms(dr as i64))
+            .unwrap_or(0),
+        has_body: proto.map_or(false, |p| p.attributed_body.is_some()),
+        attachment_guids,
+        reply_guid,
+        reply_part,
+    }
+}
+
 #[derive(uniffi::Record, Clone)]
 pub struct WrappedCloudSyncMessage {
     pub record_name: String,
@@ -3260,1054 +3366,21 @@ fn populate_share_profile_keys(
     );
 }
 
+// FaceTime is notify-only. The bridge stays registered for the FaceTime IDS
+// service so Apple keeps delivering call events to it, and an incoming call
+// becomes one m.notice in the portal. Nothing else: no join links, no session
+// creation, no ringing, no LetMeIn approval, no propping the bridge into a
+// call. Everything that used to implement those paths is gone rather than
+// disabled — see the notice-only rewrite. Go recognizes this marker prefix
+// and renders the notice.
 const FACETIME_RING_MARKER: &str = "[[FACETIME_RING]]";
 const FACETIME_MISSED_MARKER: &str = "[[FACETIME_MISSED]]";
-const FACETIME_ANSWERED_ELSEWHERE_MARKER: &str = "[[FACETIME_ANSWERED_ELSEWHERE]]";
 
-// Tracks FaceTime sessions that should ring a set of targets as soon as
-// somebody *other than the caller* joins. Populated by `!im facetime` in a
-// portal room: the command creates a session for the user + contact, returns
-// a join link, and queues a pending ring here. When the caller later taps
-// the link and a JoinEvent arrives on the APNs stream, the receive loop
-// fires ft.ring() against the queued targets. We filter out the caller's
-// own handle so the implicit self-join emitted during create_session does
-// NOT trigger the ring prematurely — the contact's phone must only ring
-// after the caller has actually joined.
-struct PendingFTRing {
-    caller_handle: String,
-    targets: Vec<String>,
-    expires_at: std::time::Instant,
-}
-
-static PENDING_FT_RINGS: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, PendingFTRing>>> =
-    std::sync::OnceLock::new();
-
-fn pending_ft_rings() -> &'static tokio::sync::Mutex<HashMap<String, PendingFTRing>> {
-    PENDING_FT_RINGS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
-}
-
-async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, joiner_handle: &str) {
-    let targets = {
-        let mut map = pending_ft_rings().lock().await;
-        let Some(entry) = map.get(guid) else {
-            return;
-        };
-        if entry.expires_at <= std::time::Instant::now() {
-            map.remove(guid);
-            return;
-        }
-        if joiner_handle == entry.caller_handle {
-            // Creator's own implicit join from create_session — keep the
-            // entry pending and wait for a real remote/web joiner.
-            return;
-        }
-        let targets = entry.targets.clone();
-        map.remove(guid);
-        targets
-    };
-    let session = {
-        let state = ft.state.read().await;
-        match state.sessions.get(guid).cloned() {
-            Some(s) => s,
-            None => {
-                warn!("pending ring: session {} not found", guid);
-                return;
-            }
-        }
-    };
-    let rang = match ft.ring(&session, &targets, false).await {
-        Ok(_) => {
-            info!(
-                "pending ring: rang {} target(s) in session {} (triggered by join from {})",
-                targets.len(),
-                guid,
-                joiner_handle
-            );
-            // Flip is_ringing_inaccurate=true now that the Invitation is on
-            // the wire. create_session_no_ring starts it false to suppress
-            // prop_up_conv's RespondedElsewhere diversion; we need it true
-            // here so the missed-call detection (facetime.rs:1411)
-            // trips if the callee declines / times out — otherwise a
-            // no-answer call silently drops instead of surfacing as Missed.
-            let mut state = ft.state.write().await;
-            if let Some(session) = state.sessions.get_mut(guid) {
-                session.is_ringing_inaccurate = true;
-            }
-            true
-        }
-        Err(e) => {
-            warn!("pending ring: ft.ring failed for session {}: {:?}", guid, e);
-            false
-        }
-    };
-    if rang {
-        suppress_own_device_ring(ft, guid).await;
-
-        // Leave the session now that the user's device has joined AND the
-        // ring is on the wire. The bridge was only propped in the session
-        // to satisfy the OneOnOne-mode exit requirement (see
-        // facetime.rs:1071-1077 comment: "we solve this by
-        // 'joining' the call until the web client has an opportunity to
-        // join, and then leaving ASAP"). Staying propped makes peer's
-        // client and the user's Mac Continuity UI render the call as
-        // "{callee} and one other person" — that "other person" being
-        // the bridge's participant with video_enabled=Some(false). The
-        // user's device handles audio + video end-to-end; the bridge is
-        // only needed through session creation and ring dispatch.
-        //
-        // Safe to unprop here because the joiner that triggered
-        // maybe_fire_pending_ring is guaranteed to be a non-caller (filtered
-        // at line 3153), so at least one user-side participant is active
-        // before the bridge leaves. Callee's own join arrives over the
-        // wire when they answer and is processed by rustpush's handle()
-        // independently.
-        let mut state = ft.state.write().await;
-        if let Some(session) = state.sessions.get_mut(guid) {
-            if session.is_propped {
-                if let Err(e) = ft.unprop_conv(session).await {
-                    warn!("pending ring: unprop_conv failed for session {}: {:?}", guid, e);
-                } else {
-                    info!(
-                        "pending ring: unpropped bridge from session {} — web client carries the call from here",
-                        guid
-                    );
-                }
-            }
-        }
-    }
-}
-
-// Send a RespondedElsewhere FaceTime message scoped to the caller's own
-// handle, to silence Apple's server-side Continuity fanout on outgoing calls.
-//
-// Problem: when the bridge initiates an outgoing FT call (via
-// create_session_no_ring + pending-ring fire-on-join, or via respond_letmein
-// for web-link taps), Apple's Continuity layer sees "handle X initiated a
-// call via web/bridge" and rings handle X's OTHER registered devices (Mac,
-// iPad) to offer "join this call on your native device." Native iPhone FT
-// doesn't trip this because local CallKit registers the initiating device
-// as an active-call device; the bridge can't do that.
-//
-// Fix: mirror the pattern at facetime.rs:708-725, where
-// `prop_up_conv(ring=false)` sends RespondedElsewhere to own-devices when
-// the user picks up an incoming call. We emit the same wire after our
-// outgoing ring fires so the caller's MacBook/iPad stop ringing. The push
-// is scoped to the caller's own handle only — the target (callee) receives
-// no RespondedElsewhere, so their ring is unaffected.
-//
-// Reuses only public rustpush APIs (IdentityManager::cache_keys /
-// send_message, KeyCache::get_participants_targets, ConversationMessage
-// proto). No rustpush patching.
-async fn suppress_own_device_ring(ft: &rustpush::facetime::FTClient, guid: &str) {
-    use prost::Message as _;
-    use rustpush::facetime::facetimep::{ConversationMessage, ConversationMessageType};
-    use rustpush::ids::identity_manager::{IDSSendMessage, Raw};
-    use rustpush::ids::user::QueryOptions;
-
-    let handle = {
-        let state = ft.state.read().await;
-        let Some(session) = state.sessions.get(guid) else {
-            warn!("suppress_own_device_ring: session {} not found", guid);
-            return;
-        };
-        match session.my_handles.first().cloned() {
-            Some(h) => h,
-            None => {
-                warn!("suppress_own_device_ring: session {} has no my_handles", guid);
-                return;
-            }
-        }
-    };
-
-    let mut message = ConversationMessage::default();
-    message.set_type(ConversationMessageType::RespondedElsewhere);
-    message.conversation_group_uuid_string = guid.to_string();
-    message.disconnected_reason = 4;
-
-    let relevant_people = vec![handle.clone()];
-    let topic = "com.apple.private.alloy.facetime.multi";
-
-    if let Err(e) = ft
-        .identity
-        .cache_keys(
-            topic,
-            &relevant_people,
-            &handle,
-            false,
-            &QueryOptions { required_for_message: true, result_expected: true },
-        )
-        .await
-    {
-        warn!(
-            "suppress_own_device_ring: cache_keys failed for session {}: {:?}",
-            guid, e
-        );
-        return;
-    }
-
-    // Suppress the user's OTHER Apple devices (e.g. a MacBook in the same
-    // Apple ID) from ringing when the bridge places/answers a call — but never
-    // the bridge's OWN call-carrying leg. rustpush identifies the bridge's own
-    // participant by base64(conn.get_token()) (facetime.rs:730-748); excluding
-    // that token here keeps the RespondedElsewhere off the live leg (which
-    // would tear the call down) while still reaching genuine sibling devices.
-    let my_token = ft.conn.get_token().await;
-    let targets: Vec<_> = ft
-        .identity
-        .cache
-        .lock()
-        .await
-        .get_participants_targets(topic, &handle, &relevant_people)
-        .into_iter()
-        .filter(|t| t.delivery_data.push_token != my_token)
-        .collect();
-    if targets.is_empty() {
-        // Only the bridge's own leg was registered — nothing to suppress.
-        return;
-    }
-
-    let ids_send = IDSSendMessage {
-        sender: handle.clone(),
-        raw: Raw::Body(message.encode_to_vec()),
-        send_delivered: false,
-        command: 242,
-        no_response: false,
-        id: uuid::Uuid::new_v4().to_string().to_uppercase(),
-        scheduled_ms: None,
-        queue_id: None,
-        relay: None,
-        extras: Default::default(),
-    };
-
-    if let Err(e) = ft.identity.send_message(topic, ids_send, targets).await {
-        warn!(
-            "suppress_own_device_ring: send_message failed for session {}: {:?}",
-            guid, e
-        );
-    }
-}
-
-// Wrapper-side replacement for the prop_up_conv on the inbound
-// letmein path, with `video_enabled = Some(true)` instead of the
-// hardcoded `Some(false)` (facetime.rs:775).
-//
-// The bug: when the bridge approves an inbound LetMeIn, the
-// respond_letmein detects the OneOnOne-mode condition and calls
-// prop_up_conv(session, false). That sends a cmd 207 announcing the
-// bridge participant with video=Some(true), video_enabled=Some(false).
-// Wife's iPhone has no other IDS-visible participant for this call (the
-// webview joins through Apple's HTTPS relay, invisible at IDS), so it
-// reads the bridge ghost's video_enabled=false as the call's authoritative
-// video state and renders the call as "FaceTime Audio" — even though
-// she dialed FaceTime Video. The call connects, audio flows both ways,
-// but the webview's video stream never gets classified.
-//
-// Why post-letmein RequestVideoUpgrade didn't work: peer iOS caches the
-// first prop's classification on first-sighting (see memory:
-// project_relog_required_after_identity_changes); after-the-fact
-// upgrades are fragile against that cache. The fix has to land in the
-// first prop peer sees.
-//
-// We can't change line 775 without modifying rustpush source
-// (which the project's no-patch rule forbids). Instead: emit the same
-// cmd 207 ourselves with the corrected flag, then mark
-// `session.is_ringing_inaccurate = false` so the respond_letmein
-// skips its own auto-prop.
-//
-// Implementation notes:
-//  - Builds the wire payload as a raw plist::Dictionary instead of going
-//    through the `FTWireMessage` struct, because two of FTWireMessage's
-//    fields are typed Option<ParticipantID> and the ParticipantID enum is
-//    private to the facetime module. The kebab-case keys here mirror
-//    FTWireMessage's `#[serde(rename_all = "kebab-case")]` plus its explicit
-//    `#[serde(rename = ...)]` overrides for s / fanout-groupID-key /
-//    fanout-groupMembers-key. ParticipantID itself is `#[serde(untagged)]`
-//    so its wire form is just the integer — Value::Integer((u64).into()) is
-//    the same bytes the typed path produces.
-//  - sampleavcdata.bplist (participant-data-key) is included from
-//    third_party/ at compile time; rustpush uses include_bytes! against the
-//    same file from inside its own module. CARGO_MANIFEST_DIR is stable
-//    (relative to pkg/rustpushgo/Cargo.toml).
-//  - On success: sets is_propped=true and is_ringing_inaccurate=false on the
-//    session, so the respond_letmein needs_prop check fails and it
-//    skips. On failure: leaves session state untouched so the
-//    auto-prop runs as a fallback (audio-only call > broken call).
-// Hand-rolled cmd 207 prop with video_enabled=Some(true) instead of the
-// hardcoded Some(false) (facetime.rs:775). Mirrors prop_up_conv's
-// ring=false branch byte-for-byte except for the video_enabled flag and the
-// fact that we operate on &mut FTSession (caller's lock) so we can compose
-// with auto_approve_bridge_letmein's bridge+webview pre-stamp logic without
-// fighting locks.
-//
-// Originally added in 0f0cd0f3 (then encoded XML by mistake; the XML-vs-binary
-// fix landed in 7c41baf2; both were reverted in df77da71 after a falsified
-// theory). User's empirical recall: this manual construction was what made
-// inbound classify as Video on peer's end. Restored here on top of the
-// active-stamping work in 3842e830 / 8818ecdc.
-async fn prop_up_conv_inbound_video_on(
-    facetime: &rustpush::facetime::FTClient,
-    session: &mut rustpush::facetime::FTSession,
-) -> Result<(), rustpush::PushError> {
-    use prost::Message as _;
-    use rustpush::facetime::facetimep::{
-        ConversationInvitationPreference, ConversationMember, ConversationMessage,
-        ConversationParticipantDidJoinContext, ConversationReport, Handle, HandleType,
-    };
-    use rustpush::ids::identity_manager::{IDSSendMessage, Raw};
-    use rustpush::ids::user::QueryOptions;
-    use plist::{Dictionary, Value};
-
-    const UNIX_TO_2001_MS: u64 = 978_307_200_000;
-
-    // handle_from_ids reimplemented from facetime.rs:55-70 (private fn).
-    fn handle_from_ids(ids: &str) -> Handle {
-        let mut handle = Handle::default();
-        if let Some(rest) = ids.strip_prefix("mailto:") {
-            handle.set_type(HandleType::EmailAddress);
-            handle.value = rest.to_string();
-        } else if let Some(rest) = ids.strip_prefix("tel:") {
-            handle.set_type(HandleType::PhoneNumber);
-            handle.value = rest.to_string();
-            handle.iso_country_code = "us".to_string();
-        } else if ids.starts_with("temp:") {
-            handle.set_type(HandleType::Generic);
-            handle.value = ids.to_string();
-        }
-        handle
-    }
-
-    let group_id = session.group_id.clone();
-    let handle = session
-        .my_handles
-        .first()
-        .ok_or(rustpush::PushError::NoHandle)?
-        .clone();
-    let self_token = facetime.conn.get_token().await;
-    let base64_self_token = Some(base64_encode(&self_token));
-    let my_participant = session
-        .participants
-        .values()
-        .find(|p| &p.token == &base64_self_token)
-        .ok_or(rustpush::PushError::NoParticipantTokenIndex)?;
-    let my_participant_id = my_participant.participant_id;
-
-    let members: Vec<rustpush::facetime::FTMember> =
-        session.members.iter().cloned().collect();
-    let link = session.link.clone();
-    let start_time_ms = session
-        .start_time
-        .ok_or(rustpush::PushError::NoParticipantTokenIndex)?;
-    let timebase_secs =
-        (start_time_ms as f64 - UNIX_TO_2001_MS as f64) / 1000.0;
-    let report_data = ConversationReport {
-        conversation_id: session.report_id.clone(),
-        timebase: timebase_secs,
-    };
-
-    let mut participants_map: HashMap<String, Vec<u64>> = HashMap::new();
-    for p in session.participants.values() {
-        participants_map
-            .entry(p.handle.clone())
-            .or_default()
-            .push(p.participant_id);
-    }
-
-    let is_ringing_inaccurate = session.is_ringing_inaccurate;
-
-    let topic = "com.apple.private.alloy.facetime.multi";
-
-    // Mirrors prop_up_conv lines 707-726: when picking up an
-    // incoming call, fan a RespondedElsewhere out to our own handle so any
-    // other devices registered to it stop ringing.
-    if is_ringing_inaccurate {
-        let mut message = ConversationMessage::default();
-        message.set_type(rustpush::facetime::facetimep::ConversationMessageType::RespondedElsewhere);
-        message.conversation_group_uuid_string = group_id.clone();
-        message.disconnected_reason = 4;
-
-        let relevant_people = vec![handle.clone()];
-        facetime
-            .identity
-            .cache_keys(
-                topic,
-                &relevant_people,
-                &handle,
-                false,
-                &QueryOptions {
-                    required_for_message: true,
-                    result_expected: true,
-                },
-            )
-            .await?;
-
-        let targets = facetime
-            .identity
-            .cache
-            .lock()
-            .await
-            .get_participants_targets(topic, &handle, &relevant_people);
-
-        let _ = facetime
-            .identity
-            .send_message(
-                topic,
-                IDSSendMessage {
-                    sender: handle.clone(),
-                    raw: Raw::Body(message.encode_to_vec()),
-                    send_delivered: false,
-                    command: 242,
-                    no_response: false,
-                    id: uuid::Uuid::new_v4().to_string().to_uppercase(),
-                    scheduled_ms: None,
-                    queue_id: None,
-                    relay: None,
-                    extras: Default::default(),
-                },
-                targets,
-            )
-            .await;
-    }
-
-    // Cache keys for the prop fan-out (the actual peers).
-    let member_handles: Vec<String> =
-        members.iter().map(|m| m.handle.clone()).collect();
-    facetime
-        .identity
-        .cache_keys(
-            topic,
-            &member_handles,
-            &handle,
-            false,
-            &QueryOptions {
-                required_for_message: true,
-                result_expected: true,
-            },
-        )
-        .await?;
-
-    let prop_targets = facetime
-        .identity
-        .cache
-        .lock()
-        .await
-        .get_participants_targets(topic, &handle, &member_handles);
-
-    // Inner ConversationMessage: no Invitation here (the `ring=false`
-    // branch also skips Invitation; this is the post-letmein prop).
-    let mut inner_message = ConversationMessage::default();
-    inner_message.link = link;
-    inner_message.report_data = Some(report_data);
-    inner_message.invitation_preferences = vec![
-        ConversationInvitationPreference {
-            version: 0,
-            handle_type: HandleType::PhoneNumber as i32,
-            notification_styles: 1,
-        },
-        ConversationInvitationPreference {
-            version: 0,
-            handle_type: HandleType::Generic as i32,
-            notification_styles: 1,
-        },
-        ConversationInvitationPreference {
-            version: 0,
-            handle_type: HandleType::EmailAddress as i32,
-            notification_styles: 1,
-        },
-    ];
-
-    // The whole point of this function: video_enabled = Some(true).
-    let mut update_context = ConversationParticipantDidJoinContext::default();
-    update_context.members = members
-        .iter()
-        .map(|m| ConversationMember {
-            version: 0,
-            handle: Some(handle_from_ids(&m.handle)),
-            nickname: m.nickname.clone(),
-            lightweight_primary: None,
-            lightweight_primary_participant_id: 0,
-            validation_source: 0,
-        })
-        .collect();
-    update_context.message = Some(inner_message);
-    update_context.is_moments_available = true;
-    update_context.provider_identifier =
-        "com.apple.telephonyutilities.callservicesd.FaceTimeProvider".to_string();
-    update_context.video = Some(true);
-    update_context.video_enabled = Some(true);
-    update_context.is_gft_downgrade_to_one_to_one_available = Some(false);
-    update_context.is_u_plus_n_downgrade_available = Some(false);
-    update_context.is_u_plus_one_av_less_available = Some(false);
-    update_context.is_screen_sharing_available = true;
-    update_context.is_gondola_calling_available = true;
-    update_context.share_play_protocol_version = 4;
-
-    // Build the cmd 207 wire payload as a raw plist Dictionary. Field names
-    // match FTWireMessage: kebab-case for everything except the
-    // explicit serde renames.
-    let is_initiator = true;
-    let is_u_plus_one = false;
-
-    let mut wire_dict = Dictionary::new();
-    wire_dict.insert("s".to_string(), Value::String(group_id.clone()));
-    wire_dict.insert(
-        "fanout-groupID-key".to_string(),
-        Value::String(group_id.clone()),
-    );
-    wire_dict.insert(
-        "client-context-data-key".to_string(),
-        Value::Data(update_context.encode_to_vec()),
-    );
-    wire_dict.insert(
-        "participant-data-key".to_string(),
-        Value::Data(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../third_party/rustpush-upstream/src/sampleavcdata.bplist"
-            ))
-            .to_vec(),
-        ),
-    );
-    wire_dict.insert(
-        "is-initiator-key".to_string(),
-        Value::Boolean(is_initiator),
-    );
-    wire_dict.insert(
-        "fanout-groupMembers-key".to_string(),
-        Value::Array(
-            members
-                .iter()
-                .map(|m| Value::String(m.handle.clone()))
-                .collect(),
-        ),
-    );
-    wire_dict.insert(
-        "is-u-plus-one-key".to_string(),
-        Value::Boolean(is_u_plus_one),
-    );
-    wire_dict.insert(
-        "join-notification-key".to_string(),
-        Value::Integer(1u32.into()),
-    );
-    wire_dict.insert(
-        "participant-id-key".to_string(),
-        Value::Integer(my_participant_id.into()),
-    );
-
-    let mut uri_to_pid_dict = Dictionary::new();
-    for (h, ids) in participants_map.iter() {
-        let arr: Vec<Value> = ids
-            .iter()
-            .map(|id| Value::Integer((*id).into()))
-            .collect();
-        uri_to_pid_dict.insert(h.clone(), Value::Array(arr));
-    }
-    wire_dict.insert(
-        "uri-to-participant-id-key".to_string(),
-        Value::Dictionary(uri_to_pid_dict),
-    );
-
-    // Apple's FT cmd 207 wire is a binary plist (matches the
-    // plist_to_bin at facetime.rs:805). util::plist_to_buf writes XML —
-    // peer iOS silently drops it, classification falls back to audio.
-    let mut wire_payload: Vec<u8> = Vec::new();
-    plist::to_writer_binary(&mut wire_payload, &Value::Dictionary(wire_dict))
-        .map_err(|_| rustpush::PushError::BadMsg)?;
-
-    let mut extras = Dictionary::new();
-    extras.insert("is-initiator-key".to_string(), Value::Boolean(is_initiator));
-    extras.insert("up1".to_string(), Value::Boolean(is_u_plus_one));
-
-    facetime
-        .identity
-        .send_message(
-            topic,
-            IDSSendMessage {
-                sender: handle.clone(),
-                raw: Raw::Body(wire_payload),
-                send_delivered: false,
-                command: 207,
-                no_response: false,
-                id: uuid::Uuid::new_v4().to_string().to_uppercase(),
-                scheduled_ms: None,
-                queue_id: None,
-                relay: None,
-                extras,
-            },
-            prop_targets,
-        )
-        .await?;
-
-    // Send succeeded — mark session as propped and clear
-    // is_ringing_inaccurate so the respond_letmein needs_prop check
-    // fails and it skips its own video_enabled=false prop. Caller already
-    // holds a write lock on facetime.state; just mutate session in place.
-    session.is_propped = true;
-    session.is_ringing_inaccurate = false;
-
-    info!(
-        "prop_up_conv_inbound_video_on: cmd 207 sent for session {} with video_enabled=true",
-        group_id
-    );
-    Ok(())
-}
-
-// Overlay around FTClient::handle that tolerates Apple sending cmd 207/209
-// wire messages with `ConversationParticipantDidJoinContext.message = None`.
-// The handler at facetime.rs:1272/1344 hard-requires that field and
-// returns PushError::BadMsg when it's missing, which means the bridge never
-// records the joiner in session.participants. When wife answers an
-// outbound call (or when a link-tap joiner completes), her device's
-// server-originated 207 trips this path and the session state diverges
-// from Apple's — symptom is "this call is not available" on the callee.
-//
-// Strategy: always try rustpush's handler first so successful paths stay on the
-// standard path. Only on BadMsg do we re-decode the wire
-// message locally (using rustpush's pub types: FTWireMessage +
-// facetimep::ConversationParticipantDidJoinContext) and register the
-// joiner ourselves. No rustpush source changes — see feedback_no_patch_rustpush.
-async fn ft_handle_with_join_recovery(
-    ft: &rustpush::facetime::FTClient,
-    msg: rustpush::APSMessage,
-) -> Result<Option<rustpush::facetime::FTMessage>, rustpush::PushError> {
-    // Locally-mirrored wire-message shape. FTWireMessage's fields are
-    // private to rustpush, so we can't deserialize into it directly — but the
-    // plist schema is stable (same serde rename attrs as rustpush), so a
-    // parallel struct here gives us the fields we need without touching
-    // rustpush source.
-    #[derive(serde::Deserialize, Debug)]
-    #[serde(crate = "serde", rename_all = "kebab-case")]
-    struct LocalFTWire {
-        #[serde(rename = "s")]
-        session: String,
-        #[serde(default)]
-        client_context_data_key: Option<plist::Value>,
-        #[serde(default)]
-        participant_id_key: Option<LocalParticipantId>,
-    }
-
-    #[derive(serde::Deserialize, Debug, Clone, Copy)]
-    #[serde(crate = "serde", untagged)]
-    enum LocalParticipantId {
-        Signed(i64),
-        Unsigned(u64),
-    }
-    impl LocalParticipantId {
-        fn as_u64(self) -> u64 {
-            match self {
-                Self::Signed(i) => i as u64,
-                Self::Unsigned(i) => i,
-            }
-        }
-    }
-
-    // Try rustpush's handler first.
-    let upstream_result = ft.handle(msg.clone()).await;
-    if !matches!(&upstream_result, Err(rustpush::PushError::BadMsg)) {
-        return upstream_result;
-    }
-
-    // Re-decrypt to inspect cmd and payload. identity.receive_message has
-    // no side effects beyond decryption, so a second call is safe.
-    let recv = match ft
-        .identity
-        .receive_message(
-            msg,
-            &[
-                "com.apple.private.alloy.facetime.multi",
-                "com.apple.private.alloy.facetime.video",
-            ],
-        )
-        .await
-    {
-        Ok(Some(r)) => r,
-        _ => return upstream_result,
-    };
-
-    // Only recover 207 (JoinEvent) and 209 (GroupUpdate).
-    if recv.command != 207 && recv.command != 209 {
-        return upstream_result;
-    }
-
-    let Some(message_unenc) = recv.message_unenc else { return upstream_result };
-    let Some(sender) = recv.sender.clone() else { return upstream_result };
-    let Some(target) = recv.target.clone() else { return upstream_result };
-    let Some(token_bytes) = recv.token.clone() else { return upstream_result };
-    let Some(ns_since_epoch) = recv.ns_since_epoch else { return upstream_result };
-
-    let payload_value: plist::Value = match message_unenc.plist() {
-        Ok(v) => v,
-        Err(_) => return upstream_result,
-    };
-    let wire: LocalFTWire = match plist::from_value(&payload_value) {
-        Ok(w) => w,
-        Err(_) => return upstream_result,
-    };
-
-    // Apply minimal state mutation: session lookup/creation + joiner
-    // registration. We intentionally skip session.unpack_members (that
-    // helper is private) — member-list drift is cosmetic; the
-    // load-bearing piece is session.participants so Apple-side state
-    // lines up when Apple retries delivery or the callee's device
-    // queries participant tokens.
-    let mut state = ft.state.write().await;
-    let session = state.sessions.entry(wire.session.clone()).or_default();
-    session.group_id = wire.session.clone();
-    if !session.my_handles.contains(&target) {
-        session.my_handles.push(target.clone());
-    }
-    let guid = session.group_id.clone();
-
-    let emitted = if recv.command == 207 {
-        let participant_id = match wire.participant_id_key {
-            Some(id) => id.as_u64(),
-            None => return upstream_result,
-        };
-        session.participants.insert(
-            participant_id.to_string(),
-            rustpush::facetime::FTParticipant {
-                token: Some(base64_encode(&token_bytes)),
-                participant_id,
-                last_join_date: Some(ns_since_epoch / 1_000_000),
-                handle: sender.clone(),
-                active: None,
-            },
-        );
-
-        if session.is_propped && sender.starts_with("temp:") {
-            // Matches the behavior at facetime.rs:1315 — once someone
-            // has joined via link tap, the call is live and the propped-up
-            // invitation can retire.
-            let _ = ft.unprop_conv(session).await;
-        }
-
-        Some(rustpush::facetime::FTMessage::JoinEvent {
-            guid: guid.clone(),
-            participant: participant_id,
-            handle: sender.clone(),
-            // ring=false: without the message field we can't tell whether
-            // Apple's carrying an Invitation type. Missing the ring flag
-            // is strictly better than failing the handshake entirely.
-            ring: false,
-        })
-    } else {
-        // 209 (GroupUpdate) — nothing to emit; local state is best-effort.
-        None
-    };
-
-    info!(
-        "FaceTime cmd={} BadMsg recovery: session={} sender={} target={} participant={:?}",
-        recv.command, guid, sender, target, wire.participant_id_key,
-    );
-
-    Ok(emitted)
-}
-
-// Bridge user's FaceTime display name (resolved Go-side: facetime_display_name
-// config override → Apple SPD name → handle), set via set_self_display_name.
-// Stamped onto the bridge webview's LetMeIn nickname so the peer sees the
-// user's name instead of the raw temp:<uuid> pseud — the URL &n= pre-fill only
-// fills Apple's join-page name box client-side and never reaches the wire.
-static FACETIME_SELF_DISPLAY_NAME: std::sync::RwLock<Option<String>> =
-    std::sync::RwLock::new(None);
-
-fn facetime_self_display_name() -> Option<String> {
-    FACETIME_SELF_DISPLAY_NAME
-        .read()
-        .ok()
-        .and_then(|g| g.clone())
-        .filter(|s| !s.trim().is_empty())
-}
-
-async fn auto_approve_bridge_letmein(
-    facetime: &rustpush::facetime::FTClient,
-    request: &rustpush::facetime::LetMeInRequest,
-) -> Result<(), rustpush::PushError> {
-    // Only auto-approve for links owned by this bridge. We now use the
-    // rustpush-style rotating usage slots ("next" / "current" /
-    // "current-old" for outbound; "nextincomingcall" / "incomingcall" /
-    // "incomingcall-old" for inbound). Session-specific links (from
-    // get_session_link) have usage=None but session_link=Some. All are
-    // bridge-created and safe to auto-approve.
-    let (link_handle, linked_group, member_group, ringing_group, inbound_session) = {
-        let state = facetime.state.read().await;
-        let Some(link) = state.links.get(&request.pseud) else {
-            return Ok(());
-        };
-        let is_bridge_usage = matches!(
-            link.usage.as_deref(),
-            Some("next")
-                | Some("current")
-                | Some("current-old")
-                | Some("nextincomingcall")
-                | Some("incomingcall")
-                | Some("incomingcall-old")
-        );
-        let is_session_link = link.session_link.is_some();
-        if !is_bridge_usage && !is_session_link {
-            return Ok(());
-        }
-
-        let linked_group = link
-            .session_link
-            .clone()
-            .filter(|group| state.sessions.contains_key(group));
-
-        let member_group = state.sessions.iter().find_map(|(group, session)| {
-            if !session.my_handles.iter().any(|h| h == &link.handle) {
-                return None;
-            }
-            if session.members.iter().any(|member| member.handle == request.requestor) {
-                Some(group.clone())
-            } else {
-                None
-            }
-        });
-
-        let ringing_group = state.sessions.iter().find_map(|(group, session)| {
-            if !session.my_handles.iter().any(|h| h == &link.handle) {
-                return None;
-            }
-            if session.is_ringing_inaccurate {
-                Some(group.clone())
-            } else {
-                None
-            }
-        });
-
-        // Check the candidate session's mode. Peer-initiated (Incoming)
-        // sessions must not be joined by the bridge — even if `linked`
-        // matches, because get_session_link auto-creates a bridge-owned
-        // link pinned to the inbound session when Go's handleFaceTimeRingNotice
-        // builds the Matrix-side "Answer" link. That pins session_link →
-        // inbound session, which makes `linked_group` match on pure
-        // inbound calls. `session.mode` is the authoritative discriminator:
-        // rustpush sets mode=Incoming on inbound Invitation wire handling
-        // (facetime.rs:1236) and mode=Outgoing when the bridge creates
-        // the session (facetime.rs:607).
-        let candidate_group = linked_group
-            .as_ref()
-            .or(member_group.as_ref())
-            .or(ringing_group.as_ref());
-        let inbound_session = candidate_group
-            .and_then(|g| state.sessions.get(g))
-            .map(|s| matches!(s.mode, Some(rustpush::facetime::FTMode::Incoming)))
-            .unwrap_or(false);
-
-        (link.handle.clone(), linked_group, member_group, ringing_group, inbound_session)
-    };
-
-    // Priority: linked > member > ringing.
-    let match_kind = if inbound_session {
-        "inbound-peer-initiated"
-    } else if linked_group.is_some() {
-        "linked"
-    } else if member_group.is_some() {
-        "member"
-    } else if ringing_group.is_some() {
-        "ringing-inbound-only"
-    } else {
-        "cold-start"
-    };
-    info!(
-        "FaceTime letmein approve: match_kind={} pseud={} requestor={} link_handle={}",
-        match_kind, request.pseud, request.requestor, link_handle,
-    );
-
-    let approved_group = if let Some(group) = linked_group.or(member_group).or(ringing_group) {
-        group
-    } else {
-        let group = uuid::Uuid::new_v4().to_string().to_uppercase();
-        // Cold-start fallback: the tap request doesn't map to any known
-        // session via linked/member/ringing. Call rustpush's handler directly — the
-        // strip-own-devices wrapper caused the callee not to ring (see
-        // WrappedFaceTimeClient::create_session for the full writeup).
-        facetime
-            .create_session(group.clone(), link_handle.clone(), &[request.requestor.clone()])
-            .await?;
-        group
-    };
-
-    {
-        let mut state = facetime.state.write().await;
-        if let Some(link) = state.links.get_mut(&request.pseud) {
-            if link.session_link.as_deref() != Some(approved_group.as_str()) {
-                link.session_link = Some(approved_group.clone());
-            }
-        }
-    }
-
-    // Inbound parity with outbound: pre-prop + pre-stamp bridge.active=Some
-    // BEFORE respond_letmein runs. Without this, respond_letmein's needs_prop
-    // branch (facetime.rs:1078) gates on `is_ringing_inaccurate && active_count==1`
-    // — true on inbound when only the peer is active — so it runs its own
-    // prop_up_conv. The prop_up_conv leaves our own .active=None
-    // locally (facetime.rs:820), then the immediate add_members(webview)
-    // fans cmd 209 with active_participants=[peer.active] only. By
-    // pre-ensuring bridge is propped + stamped active here, needs_prop flips
-    // to false → respond_letmein skips its internal prop → add_members fans
-    // with [bridge.active, peer.active]. Mirrors outbound's create_session_no_ring
-    // bridge stamp (9b9c5784).
-    //
-    // We deliberately do NOT pre-stamp webview.active here. The synthetic
-    // avc_data (sampleavcdata.bplist = iMac19,2 hardware H.264 codec
-    // descriptors) declares Mac-style media capabilities. Bridge's own
-    // pseud is registered for the full FT topic bundle including
-    // `facetime.video`, so peer's CallKit can negotiate media against it;
-    // the webview's `temp:UUID` pseud is registered ONLY for `facetime.multi`.
-    // Stamping webview.active with synthetic Mac avc_data on inbound caused
-    // peer's unpack_participants (facetime.rs:245) to write that synthetic
-    // blob into peer's `participants[webview_pid].active`. Peer's CallKit
-    // then attempted Mac-style negotiation on the webview pseud, failed
-    // (temp:UUID not on .video topic), and downgraded the call display
-    // to "FaceTime Audio." Letting webview's own subsequent cmd 207
-    // populate peer's webview entry — with real WebRTC-shaped avc_data —
-    // is what keeps peer's classification on Video. (Outbound has never
-    // pre-stamped webview for the same reason; that path works.)
-    if inbound_session {
-        use rustpush::facetime::facetimep::{ConversationParticipant, Handle, HandleType};
-        fn handle_from_ids(ids: &str) -> Handle {
-            let mut h = Handle::default();
-            if let Some(addr) = ids.strip_prefix("mailto:") {
-                h.set_type(HandleType::EmailAddress);
-                h.value = addr.to_string();
-            } else if let Some(phone) = ids.strip_prefix("tel:") {
-                h.set_type(HandleType::PhoneNumber);
-                h.value = phone.to_string();
-                h.iso_country_code = "us".to_string();
-            } else {
-                h.set_type(HandleType::Generic);
-                h.value = ids.to_string();
-            }
-            h
-        }
-        fn synthesize_active(handle: &str, participant_id: u64) -> ConversationParticipant {
-            ConversationParticipant {
-                version: 0,
-                identifier: participant_id,
-                handle: Some(handle_from_ids(handle)),
-                avc_data: include_bytes!(
-                    "../../../third_party/rustpush-upstream/src/sampleavcdata.bplist"
-                )
-                .to_vec(),
-                is_moments_available: Some(true),
-                is_screen_sharing_available: Some(true),
-                is_gondola_calling_available: Some(true),
-                is_mirage_available: None,
-                is_lightweight: None,
-                share_play_protocol_version: 4,
-                options: 0,
-                is_gft_downgrade_to_one_to_one_available: Some(false),
-                guest_mode_enabled: None,
-                association: None,
-                is_u_plus_n_downgrade_available: Some(false),
-            }
-        }
-
-        let my_token_b64 = base64_encode(&facetime.conn.get_token().await);
-        let mut state = facetime.state.write().await;
-        if let Some(session) = state.sessions.get_mut(&approved_group) {
-            if !session.is_propped {
-                let prop_outcome = async {
-                    facetime.ensure_allocations(session, &[]).await?;
-                    // Hand-rolled prop with video_enabled=Some(true) instead of
-                    // the hardcoded Some(false). User's empirical recall:
-                    // this manual construction was what made inbound classify
-                    // as Video on peer's end. Restored from 0f0cd0f3 + 7c41baf2
-                    // (XML→binary plist fix), this time with the active-stamping
-                    // from 3842e830 / 8818ecdc layered on top.
-                    prop_up_conv_inbound_video_on(facetime, session).await?;
-                    Ok::<(), rustpush::PushError>(())
-                }
-                .await;
-                match prop_outcome {
-                    Ok(()) => {
-                        if let Some(my_participant) = session
-                            .participants
-                            .values_mut()
-                            .find(|p| p.token.as_deref() == Some(my_token_b64.as_str()))
-                        {
-                            let pid = my_participant.participant_id;
-                            let h = my_participant.handle.clone();
-                            my_participant.active = Some(synthesize_active(&h, pid));
-                        }
-                        info!(
-                            "FaceTime inbound letmein: pre-propped + stamped bridge active locally for session {} so respond_letmein's add_members fans active_participants including bridge",
-                            approved_group,
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "FaceTime inbound letmein: pre-prop failed for session {} ({:?}) — falling through to respond_letmein's internal prop",
-                            approved_group, e,
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // respond_letmein: sends LetMeInResponse then add_members/ring over APNs.
-    // APNs can flap (early eof → SendTimedOut) especially right after boot.
-    //
-    // Subtlety: respond_letmein's first action for delegated requests is
-    // removing the delegation_uuid from delegated_requests. If the later
-    // send fails and we retry with the same request, it hits "Already
-    // responded" and no-ops silently — member never added. Strip
-    // delegation_uuid on retries so the check is skipped; duplicate
-    // LetMeInResponse sends are harmless (web client decrypts the first),
-    // and add_members is idempotent (already-present member triggers ring
-    // instead of re-add).
-    let mut last_err: Option<rustpush::PushError> = None;
-    for attempt in 0..3u32 {
-        let mut retry_request = request.clone();
-        if attempt > 0 {
-            retry_request.delegation_uuid = None;
-        }
-        // Stamp the bridge user's display name onto the webview's nickname so
-        // the peer sees a name (FTMember.nickname → ConversationMember on the
-        // wire, facetime.rs:127-131) instead of the raw temp:<uuid> pseud. The
-        // webview's own LetMeIn carries no usable nickname (Apple's &n= join-
-        // page pre-fill stays client-side), so we set it bridge-side.
-        if retry_request.nickname.as_deref().unwrap_or("").trim().is_empty() {
-            if let Some(name) = facetime_self_display_name() {
-                retry_request.nickname = Some(name);
-            }
-        }
-        match facetime.respond_letmein(retry_request, Some(&approved_group)).await {
-            Ok(()) => {
-                info!(
-                    "FaceTime auto-approved LetMeIn request for bridge link: requestor={} group={} inbound={}",
-                    request.requestor,
-                    approved_group,
-                    inbound_session,
-                );
-                suppress_own_device_ring(facetime, &approved_group).await;
-                // Match the answerFtRequest
-                // (rustpush_service.dart:3347): approve the letmein and
-                // return. No unprop_conv, no RemoveMember. Previous
-                // attempts to strip the bridge post-letmein all regressed
-                // the call (see TPP _todo/TPP-facetime-bridge-participant.md
-                // failed approaches 1-5).
-                return Ok(());
-            }
-            Err(e) => {
-                let is_timeout = matches!(&e, rustpush::PushError::SendTimedOut);
-                last_err = Some(e);
-                if !is_timeout || attempt >= 2 {
-                    break;
-                }
-                warn!(
-                    "FaceTime letmein respond_letmein timed out (attempt {}), retrying in {}s",
-                    attempt + 1,
-                    attempt + 1
-                );
-                tokio::time::sleep(std::time::Duration::from_secs((attempt + 1) as u64)).await;
-            }
-        }
-    }
-    Err(last_err.unwrap_or(rustpush::PushError::SendTimedOut))
-}
-
+/// Map an inbound FaceTime event to the synthetic message Go turns into a
+/// notice: someone is calling, or the call went unanswered. Every other
+/// FTMessage is session state we no longer act on — including
+/// RespondedElsewhere, which a notify-only bridge would emit for every single
+/// answered call, since the answering device is always another one.
 async fn facetime_event_to_wrapped(
     facetime: &rustpush::facetime::FTClient,
     event: &rustpush::facetime::FTMessage,
@@ -4320,30 +3393,26 @@ async fn facetime_event_to_wrapped(
             (guid.clone(), Some(handle.clone()), FACETIME_RING_MARKER)
         }
         rustpush::facetime::FTMessage::AddMembers { guid, members, ring } if *ring => {
-            let fallback = members.iter().next().map(|member| member.handle.clone());
-            (guid.clone(), fallback, FACETIME_RING_MARKER)
+            (
+                guid.clone(),
+                members.iter().next().map(|member| member.handle.clone()),
+                FACETIME_RING_MARKER,
+            )
         }
         rustpush::facetime::FTMessage::Decline { guid } => {
             (guid.clone(), None, FACETIME_MISSED_MARKER)
         }
-        rustpush::facetime::FTMessage::RespondedElsewhere { guid } => {
-            (guid.clone(), None, FACETIME_ANSWERED_ELSEWHERE_MARKER)
-        }
         _ => return None,
     };
 
+    // The caller's handle is what names the notice. When the event doesn't
+    // carry one, fall back to the first session member that is neither one of
+    // our own handles nor an Apple temp pseudonym.
     let state = facetime.state.read().await;
-    let (participants, my_handles, link) = state
+    let (participants, my_handles) = state
         .sessions
         .get(&guid)
         .map(|session| {
-            // Mirror the temp-pseud filter
-            // (intents_service.dart:68): the webview joins under a fresh
-            // temp:UUID generated client-side by Apple's main.js. Surfacing
-            // those to Matrix creates a ghost-per-call in the user's room.
-            // Drop them before they reach bridgev2's portal-membership
-            // pipeline; peer-side state is unaffected (this is purely a
-            // local rendering filter).
             let participants = session
                 .members
                 .iter()
@@ -4352,17 +3421,9 @@ async fn facetime_event_to_wrapped(
                 .collect::<Vec<_>>();
             let my_handles: std::collections::HashSet<String> =
                 session.my_handles.iter().cloned().collect();
-            let link = session.link.as_ref().map(|link| {
-                let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&link.public_key);
-                let pseud = link
-                    .pseudonym
-                    .strip_prefix("temp:")
-                    .unwrap_or(&link.pseudonym);
-                format!("https://facetime.apple.com/join#v=1&p={pseud}&k={encoded}")
-            });
-            (participants, my_handles, link)
+            (participants, my_handles)
         })
-        .unwrap_or_else(|| (Vec::new(), std::collections::HashSet::new(), None));
+        .unwrap_or_else(|| (Vec::new(), std::collections::HashSet::new()));
     drop(state);
 
     if sender.is_none() {
@@ -4378,14 +3439,11 @@ async fn facetime_event_to_wrapped(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let event_kind = marker.trim_matches('[').trim_matches(']').to_lowercase();
+    let event_kind = marker.trim_matches('[').trim_matches(']');
     let mut wrapped = WrappedMessage::default();
-    wrapped.uuid = format!("FACETIME_{}_{}_{}", event_kind.to_uppercase(), guid, now_ms);
+    wrapped.uuid = format!("{}_{}_{}", event_kind, guid, now_ms);
     wrapped.sender = sender;
-    wrapped.text = Some(match link {
-        Some(link) if marker == FACETIME_RING_MARKER => format!("{marker} guid={guid} {link}"),
-        _ => format!("{marker} guid={guid}"),
-    });
+    wrapped.text = Some(format!("{marker} guid={guid}"));
     wrapped.participants = participants;
     wrapped.timestamp_ms = now_ms;
     wrapped.is_notify_anyways = true;
@@ -4863,13 +3921,33 @@ pub fn init_logger() {
             // Match both Unix and Windows path separators. Files listed
             // here are ones whose panics are intercepted by
             // catch_unwind in pkg/rustpushgo/src/lib.rs download recovery.
-            let noisy = [
+            let guarded = [
                 "icloud/mmcs.rs",
                 "icloud\\mmcs.rs",
                 "icloud/cloudkit.rs",
                 "icloud\\cloudkit.rs",
             ];
-            if noisy.iter().any(|p| file.ends_with(p)) {
+            // Subsystems this bridge does not drive. Upstream's FaceTime
+            // rewrite brought in a large AV/QUIC surface — avconference.rs,
+            // ids/link.rs, and the FaceTime session machinery — that is dense
+            // with unwrap/assert on call paths we never take: FaceTime here is
+            // notify-only, so the only thing we do with that code is let
+            // handle() decode an incoming ring. A panic in there is not a
+            // bridge fault, and a raw backtrace for a feature the user does not
+            // have would read like one. The call site is wrapped in
+            // catch_unwind, so this only silences the hook's stderr flood; the
+            // rate-limited breadcrumb below still names it.
+            let unused = [
+                "src/avconference.rs",
+                "src\\avconference.rs",
+                "src/facetime.rs",
+                "src\\facetime.rs",
+                "ids/link.rs",
+                "ids\\link.rs",
+            ];
+            let is_guarded = guarded.iter().any(|p| file.ends_with(p));
+            let is_unused = unused.iter().any(|p| file.ends_with(p));
+            if is_guarded || is_unused {
                 // Suppress the flood, but never go completely silent. This
                 // filter matches by FILE, not by "is anyone actually catching
                 // this" — so it erased UNCAUGHT panics from these files just
@@ -4961,17 +4039,31 @@ pub fn init_logger() {
                     // This panic is itself counted and is the latest of them,
                     // so the location below really is the most recent one.
                     let swallowed = SUPPRESSED_COUNT.swap(0, Ordering::Relaxed);
-                    warn!(
-                        "suppressed {} rustpush MMCS/CloudKit panic(s) since the last breadcrumb; \
-                         most recent at {}:{} (this summary is rate-limited to one line per {}s). \
-                         These are EXPECTED for the catch_unwind-guarded recovery paths. If one \
-                         shows up next to a receive stall or a 'process task' line, an UNGUARDED \
-                         call site is unwinding its task.",
-                        swallowed,
-                        file,
-                        loc.line(),
-                        BREADCRUMB_INTERVAL_SECS
-                    );
+                    if is_unused {
+                        warn!(
+                            "suppressed {} panic(s) from rustpush subsystems this bridge does not \
+                             drive (FaceTime/AV); most recent at {}:{} (rate-limited to one line \
+                             per {}s). Nothing is broken for you: FaceTime here only posts an \
+                             incoming-call notice, and the call site is inside a catch_unwind, so \
+                             the bridge carries on. No action needed.",
+                            swallowed,
+                            file,
+                            loc.line(),
+                            BREADCRUMB_INTERVAL_SECS
+                        );
+                    } else {
+                        warn!(
+                            "suppressed {} rustpush MMCS/CloudKit panic(s) since the last breadcrumb; \
+                             most recent at {}:{} (this summary is rate-limited to one line per {}s). \
+                             These are EXPECTED for the catch_unwind-guarded recovery paths. If one \
+                             shows up next to a receive stall or a 'process task' line, an UNGUARDED \
+                             call site is unwinding its task.",
+                            swallowed,
+                            file,
+                            loc.line(),
+                            BREADCRUMB_INTERVAL_SECS
+                        );
+                    }
                 } else if !REPORTED_SITES
                     .iter()
                     .any(|slot| slot.load(Ordering::Relaxed) == site)
@@ -4987,17 +4079,28 @@ pub fn init_logger() {
                             Ordering::Relaxed,
                             |n| Some(n.saturating_sub(1)),
                         );
-                        warn!(
-                            "suppressed rustpush panic at a site not yet reported this window: \
-                             {}:{}. Printed immediately rather than waiting for the {}s summary, \
-                             because a new site is the interesting case — check whether this call \
-                             site is actually inside a catch_unwind. At most {} distinct sites are \
-                             reported per window.",
-                            file,
-                            loc.line(),
-                            BREADCRUMB_INTERVAL_SECS,
-                            REPORTED_SLOTS
-                        );
+                        if is_unused {
+                            warn!(
+                                "suppressed a panic from a rustpush subsystem this bridge does not \
+                                 drive (FaceTime/AV) at {}:{}. Logged once per site so the log \
+                                 shows what happened without a backtrace for a feature you are not \
+                                 using. No action needed.",
+                                file,
+                                loc.line()
+                            );
+                        } else {
+                            warn!(
+                                "suppressed rustpush panic at a site not yet reported this window: \
+                                 {}:{}. Printed immediately rather than waiting for the {}s summary, \
+                                 because a new site is the interesting case — check whether this call \
+                                 site is actually inside a catch_unwind. At most {} distinct sites are \
+                                 reported per window.",
+                                file,
+                                loc.line(),
+                                BREADCRUMB_INTERVAL_SECS,
+                                REPORTED_SLOTS
+                            );
+                        }
                     }
                 }
                 return;
@@ -6493,298 +5596,6 @@ async fn download_icon_change_photo(
     }
 }
 
-#[derive(uniffi::Object)]
-pub struct WrappedFaceTimeClient {
-    inner: Arc<rustpush::facetime::FTClient>,
-}
-
-#[uniffi::export(async_runtime = "tokio")]
-impl WrappedFaceTimeClient {
-    pub async fn export_state_json(&self) -> Result<String, WrappedError> {
-        let state = self.inner.state.read().await;
-        serialize_state_json(&*state)
-    }
-
-    /// Set the bridge user's FaceTime display name (resolved Go-side:
-    /// facetime_display_name override → Apple SPD name → handle). Stamped onto
-    /// the bridge webview's LetMeIn nickname in auto_approve_bridge_letmein so
-    /// peers see the user's name instead of the raw temp:<uuid> pseud.
-    pub fn set_self_display_name(&self, name: String) {
-        if let Ok(mut g) = FACETIME_SELF_DISPLAY_NAME.write() {
-            *g = if name.trim().is_empty() { None } else { Some(name) };
-        }
-    }
-
-    pub async fn use_link_for(&self, old_usage: String, usage: String) -> Result<(), WrappedError> {
-        self.inner.use_link_for(&old_usage, &usage).await?;
-        Ok(())
-    }
-
-    pub async fn get_link_for_usage(&self, handle: String, usage: String) -> Result<String, WrappedError> {
-        Ok(self.inner.get_link_for_usage(&handle, &usage).await?)
-    }
-
-    pub async fn clear_links(&self) -> Result<(), WrappedError> {
-        self.inner.clear_links().await?;
-        Ok(())
-    }
-
-    pub async fn delete_link(&self, pseud: String) -> Result<(), WrappedError> {
-        self.inner.delete_link(&pseud).await?;
-        Ok(())
-    }
-
-    pub async fn get_session_link(&self, guid: String) -> Result<String, WrappedError> {
-        Ok(self.inner.get_session_link(&guid).await?)
-    }
-
-    // Deterministically binds the FTLink (matched by handle + usage) to a
-    // session group_id by setting link.session_link. Without this, the
-    // rotation-slot links (e.g. "next", "nextincomingcall") have
-    // session_link=None until the first letmein-tap, and
-    // auto_approve_bridge_letmein falls through to member/ringing heuristics.
-    // Under cold-start or stale-state conditions those heuristics miss and
-    // the approver creates a fresh empty session, producing the "0 people"
-    // symptom.
-    pub async fn bind_bridge_link_to_session(
-        &self,
-        handle: String,
-        usage: String,
-        group_id: String,
-    ) -> Result<(), WrappedError> {
-        let mut state = self.inner.state.write().await;
-        let pseud = state
-            .links
-            .iter()
-            .find(|(_, link)| link.handle == handle && link.usage.as_deref() == Some(&usage))
-            .map(|(pseud, _)| pseud.clone())
-            .ok_or_else(|| WrappedError::GenericError {
-                msg: format!("No FaceTime link found for handle={} usage={}", handle, usage),
-            })?;
-        if let Some(link) = state.links.get_mut(&pseud) {
-            link.session_link = Some(group_id);
-        }
-        Ok(())
-    }
-
-    pub async fn create_session(&self, group_id: String, handle: String, participants: Vec<String>) -> Result<(), WrappedError> {
-        // Call rustpush directly. We previously wrapped this with a
-        // strip-own-from-session.members pattern to stop the wire ring from
-        // fanning out to the owner's other Apple devices (Mac, iPad). The
-        // motivation was tap-routing fragility: when the Mac auto-answered
-        // via Continuity, it sent RespondedElsewhere back to the bridge,
-        // which cleared is_ringing_inaccurate, which broke the
-        // auto_approve_bridge_letmein ringing-group fallback for link taps.
-        //
-        // bind_bridge_link_to_session (added alongside this change) pins the
-        // bridge FaceTime link's session_link to the outgoing session the
-        // moment it's created, so the letmein approver's linked_group branch
-        // matches deterministically regardless of is_ringing_inaccurate. The
-        // strip's original justification is moot.
-        //
-        // Empirically the strip also correlated with the callee not ringing
-        // (own was absent from update_context.members and fanout_groupmembers
-        // in the Invitation wire, which we suspect Apple's FT routing
-        // rejected). Straight rustpush sends a well-formed Invitation. Side
-        // effect: owner's devices ring too; caller dismisses on the device
-        // they don't want. Future: suppress own-device ring via a follow-up
-        // RespondedElsewhere once we've confirmed the callee ring is stable.
-        self.inner
-            .create_session(group_id, handle, &participants)
-            .await
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("FTClient::create_session failed: {:?}", e),
-            })?;
-        Ok(())
-    }
-
-    // Create a FaceTime session without ringing any participant. Used by the
-    // portal-room !im facetime flow: session is allocated + registered with
-    // Apple's relay (so the join link is valid), but no Invitation wire is
-    // fanned out. The contact's phone rings only when the caller taps the
-    // link — that JoinEvent triggers maybe_fire_pending_ring which calls
-    // ft.ring() with the queued targets.
-    //
-    // Difference from create_session:
-    // - is_ringing_inaccurate starts false, so prop_up_conv's !ring branch
-    //   doesn't divert into RespondedElsewhere (facetime.rs:708).
-    // - prop_up_conv(session, false) so the wire message carries no
-    //   ConversationMessageType::Invitation on any target (facetime.rs:759).
-    //
-    // Net effect on Apple's side: session allocated + propped (state=live)
-    // but nobody's device rings.
-    pub async fn create_session_no_ring(
-        &self,
-        group_id: String,
-        handle: String,
-        participants: Vec<String>,
-    ) -> Result<(), WrappedError> {
-        use rustpush::facetime::{FTMember, FTMode, FTSession};
-        use std::collections::HashMap;
-
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let members = participants
-            .iter()
-            .chain(std::iter::once(&handle))
-            .map(|p| FTMember {
-                nickname: None,
-                handle: p.clone(),
-            })
-            .collect();
-
-        let session = FTSession {
-            group_id: group_id.clone(),
-            my_handles: vec![handle.clone()],
-            participants: HashMap::new(),
-            link: None,
-            members,
-            report_id: uuid::Uuid::new_v4().to_string().to_uppercase(),
-            start_time: Some(now_ms),
-            last_rekey: None,
-            is_propped: false,
-            is_ringing_inaccurate: false,
-            mode: Some(FTMode::Outgoing),
-            recent_member_adds: HashMap::new(),
-        };
-
-        let mut state = self.inner.state.write().await;
-        state.sessions.insert(group_id.clone(), session);
-        let session = state.sessions.get_mut(&group_id).expect("just inserted");
-
-        self.inner
-            .ensure_allocations(session, &[])
-            .await
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("ensure_allocations failed: {:?}", e),
-            })?;
-        self.inner
-            .prop_up_conv(session, false)
-            .await
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("prop_up_conv(ring=false) failed: {:?}", e),
-            })?;
-        Ok(())
-    }
-
-    pub async fn add_members(
-        &self,
-        session_id: String,
-        handles: Vec<String>,
-        letmein: bool,
-        to_members: Option<Vec<String>>,
-    ) -> Result<(), WrappedError> {
-        let mut session = {
-            let state = self.inner.state.read().await;
-            state.sessions.get(&session_id).cloned().ok_or(WrappedError::GenericError {
-                msg: format!("FaceTime session not found: {}", session_id),
-            })?
-        };
-
-        let members = handles
-            .into_iter()
-            .map(|handle| rustpush::facetime::FTMember {
-                nickname: None,
-                handle,
-            })
-            .collect::<Vec<_>>();
-
-        self.inner.add_members(&mut session, members, letmein, to_members).await?;
-
-        let mut state = self.inner.state.write().await;
-        state.sessions.insert(session_id, session);
-        Ok(())
-    }
-
-    pub async fn remove_members(&self, session_id: String, handles: Vec<String>) -> Result<(), WrappedError> {
-        let mut session = {
-            let state = self.inner.state.read().await;
-            state.sessions.get(&session_id).cloned().ok_or(WrappedError::GenericError {
-                msg: format!("FaceTime session not found: {}", session_id),
-            })?
-        };
-
-        let members = handles
-            .into_iter()
-            .map(|handle| rustpush::facetime::FTMember {
-                nickname: None,
-                handle,
-            })
-            .collect::<Vec<_>>();
-
-        self.inner.remove_members(&mut session, members).await?;
-
-        let mut state = self.inner.state.write().await;
-        state.sessions.insert(session_id, session);
-        Ok(())
-    }
-
-    pub async fn ring(&self, session_id: String, targets: Vec<String>, letmein: bool) -> Result<(), WrappedError> {
-        let session = {
-            let state = self.inner.state.read().await;
-            state.sessions.get(&session_id).cloned().ok_or(WrappedError::GenericError {
-                msg: format!("FaceTime session not found: {}", session_id),
-            })?
-        };
-        self.inner.ring(&session, &targets, letmein).await?;
-        Ok(())
-    }
-
-    // Queue a ring that fires as soon as a participant *other than the
-    // caller* joins this session. The portal !facetime command uses this so
-    // the contact's phone doesn't ring until the caller has actually tapped
-    // the join link. caller_handle is the session creator's own handle;
-    // join events from that handle are ignored so the implicit self-join
-    // from create_session does not fire the ring immediately. Entries
-    // self-expire after ttl_secs to avoid orphan rings.
-    pub async fn register_pending_ring(
-        &self,
-        session_id: String,
-        caller_handle: String,
-        targets: Vec<String>,
-        ttl_secs: u64,
-    ) -> Result<(), WrappedError> {
-        let mut map = pending_ft_rings().lock().await;
-        map.insert(session_id, PendingFTRing {
-            caller_handle,
-            targets,
-            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ttl_secs),
-        });
-        Ok(())
-    }
-
-    pub async fn list_delegated_letmein_requests(&self) -> Vec<WrappedLetMeInRequest> {
-        let delegated = self.inner.delegated_requests.lock().await;
-        delegated
-            .iter()
-            .map(|(uuid, request)| WrappedLetMeInRequest {
-                delegation_uuid: uuid.clone(),
-                pseud: request.pseud.clone(),
-                requestor: request.requestor.clone(),
-                nickname: request.nickname.clone(),
-                usage: request.usage.clone(),
-            })
-            .collect()
-    }
-
-    pub async fn respond_delegated_letmein(
-        &self,
-        delegation_uuid: String,
-        approved_group: Option<String>,
-    ) -> Result<(), WrappedError> {
-        let request = {
-            let delegated = self.inner.delegated_requests.lock().await;
-            delegated.get(&delegation_uuid).cloned().ok_or(WrappedError::GenericError {
-                msg: format!("Delegated LetMeIn request not found: {}", delegation_uuid),
-            })?
-        };
-        self.inner.respond_letmein(request, approved_group.as_deref()).await?;
-        Ok(())
-    }
-}
 
 #[derive(uniffi::Object)]
 pub struct WrappedPasswordsClient {
@@ -7142,7 +5953,12 @@ pub struct Client {
     token_provider: Option<Arc<WrappedTokenProvider>>,
     cloud_messages_client: tokio::sync::Mutex<Option<Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>>>,
     cloud_keychain_client: tokio::sync::Mutex<Option<Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>>>,
-    facetime_client: tokio::sync::Mutex<Option<Arc<WrappedFaceTimeClient>>>,
+    // Notify-only FaceTime: held so the client (and its APNs topic
+    // interest) lives as long as the bridge session. Never read back — the
+    // receive loop owns the clone it actually drives — so this is purely an
+    // ownership anchor, kept in the same shape as the other subsystem handles.
+    #[allow(dead_code)]
+    facetime_client: tokio::sync::Mutex<Option<Arc<rustpush::facetime::FTClient>>>,
     passwords_client: tokio::sync::Mutex<Option<Arc<WrappedPasswordsClient>>>,
     statuskit_client: tokio::sync::Mutex<Option<Arc<WrappedStatusKitClient>>>,
     sharedstreams_client: tokio::sync::Mutex<Option<Arc<WrappedSharedStreamsClient>>>,
@@ -7294,18 +6110,16 @@ pub async fn new_client(
     let facetime_state_path = subsystem_state_path("facetime-state.plist");
     let facetime_state = read_plist_state::<rustpush::facetime::FTState>(&facetime_state_path).unwrap_or_default();
     let facetime_state_path_for_closure = facetime_state_path.clone();
-    let prewarmed_facetime = Arc::new(WrappedFaceTimeClient {
-        inner: Arc::new(
-            rustpush::facetime::FTClient::new(
-                facetime_state,
-                Box::new(move |state| persist_plist_state(&facetime_state_path_for_closure, state)),
-                conn.clone(),
-                client.identity.clone(),
-                config_clone.clone(),
-            )
-            .await,
-        ),
-    });
+    let prewarmed_facetime = Arc::new(
+        rustpush::facetime::FTClient::new(
+            facetime_state,
+            Box::new(move |state| persist_plist_state(&facetime_state_path_for_closure, state)),
+            conn.clone(),
+            client.identity.clone(),
+            config_clone.clone(),
+        )
+        .await,
+    );
 
     // Shared StatusKit state: init_statuskit() populates these Arc<RwLock>s,
     // and the receive loop below reads them on every message. The raw
@@ -7341,7 +6155,7 @@ pub async fn new_client(
         let reconnected_at = reconnected_at.clone();
         let sk_for_recv = shared_statuskit_for_recv.clone();
         let status_cb_for_recv = status_callback_for_recv.clone();
-        let ft_for_recv = prewarmed_facetime.inner.clone();
+        let ft_for_recv = prewarmed_facetime.clone();
         let client_weak_for_loop = client_weak_for_loop.clone();
         async move {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(rustpush::APSMessage, u64)>();
@@ -8247,38 +7061,50 @@ pub async fn new_client(
                     }
                 }
 
-                // Consume FaceTime APNs events to keep FT state live and
-                // surface incoming-call attempts to Go as synthetic notice
-                // triggers. ft_handle_with_join_recovery wraps the rustpush
-                // handle() and falls back to local decoding for cmd 207/209
-                // when Apple sends them without the context.message field —
-                // see the helper's docstring for why.
+                // Consume FaceTime APNs events so rustpush keeps its session
+                // state coherent, and turn ring-bearing ones into the
+                // incoming-call notice. Nothing here answers, joins, or
+                // replies — FaceTime is notify-only.
                 //
-                // Retry on SendTimedOut: the rustpush handle_letmein sends a
-                // delegation message_session INSIDE handle() — if APNs flaps
-                // at that moment, the entire LetMeIn is dropped before our
-                // auto_approve even runs. A single retry after 2s usually
-                // lands on the reconnected APNs.
+                // Retry on SendTimedOut: rustpush's handle() sends on the wire
+                // for some event types, so an APNs flap at that moment drops
+                // the event entirely. One retry after 2s usually lands on the
+                // reconnected APNs.
+                //
+                // handle() is also the only place this bridge enters upstream's
+                // FaceTime code, and 0e0f13c grew that into a large AV/QUIC
+                // surface with plenty of unwrap/assert on paths a notify-only
+                // bridge never drives. Catch the unwind so somebody else's
+                // subsystem cannot take down message receiving; the panic hook
+                // in init_logger keeps the log to one calm rate-limited line.
+                use futures::FutureExt;
+                let ft_handle = |m: rustpush::APSMessage| {
+                    let ft = ft_for_recv.clone();
+                    async move {
+                        match std::panic::AssertUnwindSafe(ft.handle(m)).catch_unwind().await {
+                            Ok(res) => res,
+                            Err(_) => {
+                                debug!(
+                                    "FaceTime handle() panicked — ignoring the event. FaceTime is \
+                                     notify-only here, so nothing the bridge does depends on it."
+                                );
+                                Ok(None)
+                            }
+                        }
+                    }
+                };
                 let ft_result = {
-                    let first = ft_handle_with_join_recovery(ft_for_recv.as_ref(), msg.clone()).await;
+                    let first = ft_handle(msg.clone()).await;
                     if matches!(&first, Err(rustpush::PushError::SendTimedOut)) {
                         warn!("FaceTime handle SendTimedOut, retrying in 2s");
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        ft_handle_with_join_recovery(ft_for_recv.as_ref(), msg.clone()).await
+                        ft_handle(msg.clone()).await
                     } else {
                         first
                     }
                 };
                 match ft_result {
                     Ok(Some(ft_message)) => {
-                        if let rustpush::facetime::FTMessage::LetMeInRequest(request) = &ft_message {
-                            if let Err(e) = auto_approve_bridge_letmein(ft_for_recv.as_ref(), request).await {
-                                warn!("FaceTime auto-approve LetMeIn failed: {:?}", e);
-                            }
-                        }
-                        if let rustpush::facetime::FTMessage::JoinEvent { guid, handle, .. } = &ft_message {
-                            maybe_fire_pending_ring(ft_for_recv.as_ref(), guid, handle).await;
-                        }
                         if let Some(wrapped) = facetime_event_to_wrapped(ft_for_recv.as_ref(), &ft_message).await {
                             callback.on_message(wrapped);
                         }
@@ -8756,32 +7582,6 @@ impl Client {
                 );
             }
         }
-    }
-
-    async fn get_or_init_facetime_client(&self) -> Result<Arc<WrappedFaceTimeClient>, WrappedError> {
-        let mut locked = self.facetime_client.lock().await;
-        if let Some(client) = &*locked {
-            return Ok(client.clone());
-        }
-
-        let state_path = subsystem_state_path("facetime-state.plist");
-        let state = read_plist_state::<rustpush::facetime::FTState>(&state_path).unwrap_or_default();
-        let state_path_for_closure = state_path.clone();
-
-        let wrapped = Arc::new(WrappedFaceTimeClient {
-            inner: Arc::new(
-                rustpush::facetime::FTClient::new(
-                    state,
-                    Box::new(move |state| persist_plist_state(&state_path_for_closure, state)),
-                    self.conn.clone(),
-                    self.client.identity.clone(),
-                    self.os_config.clone(),
-                )
-                .await,
-            ),
-        });
-        *locked = Some(wrapped.clone());
-        Ok(wrapped)
     }
 
     async fn get_or_init_passwords_client(&self) -> Result<Arc<WrappedPasswordsClient>, WrappedError> {
@@ -10001,10 +8801,6 @@ impl Client {
         }
     }
 
-    pub async fn get_facetime_client(&self) -> Result<Arc<WrappedFaceTimeClient>, WrappedError> {
-        self.get_or_init_facetime_client().await
-    }
-
     pub async fn get_passwords_client(&self) -> Result<Arc<WrappedPasswordsClient>, WrappedError> {
         self.get_or_init_passwords_client().await
     }
@@ -10773,7 +9569,7 @@ impl Client {
         use std::collections::HashSet;
         use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
         use rustpush::cloudkit_proto::CloudKitRecord;
-        use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudMessage};
+        use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudMessage, RemoteCloudMessage};
 
         info!("list_recoverable_message_guids: starting");
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
@@ -10848,8 +9644,15 @@ impl Client {
                         Ok(k) => k,
                         Err(_) => continue,
                     };
+                    // Two steps since 0e0f13c: the CloudKit record is
+                    // RemoteCloudMessage, and Into<CloudMessage> is what decodes
+                    // its protos — unwrapping as it goes, so it belongs inside
+                    // the same catch_unwind as the record decode.
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        CloudMessage::from_record_encrypted(&record.record_field, Some(&pcskey))
+                        CloudMessage::from(RemoteCloudMessage::from_record_encrypted(
+                            &record.record_field,
+                            Some(&pcskey),
+                        ))
                     }));
                     if let Ok(msg) = result {
                         if !msg.guid.is_empty() && seen.insert(msg.guid.clone()) {
@@ -11857,45 +10660,7 @@ impl Client {
                     } else {
                         msg.guid.clone()
                     };
-                    let text = msg.msg_proto.text.clone();
-                    let subject = msg.msg_proto.subject.clone();
-
-                    // Extract tapback/reaction info from proto fields
-                    let tapback_type = msg.msg_proto.associated_message_type;
-                    let tapback_target_guid = msg.msg_proto.associated_message_guid.clone();
-                    let tapback_emoji = msg.msg_proto_4.as_ref()
-                        .and_then(|p4| p4.associated_message_emoji.clone());
-
-                    // Extract attachment GUIDs from attributedBody
-                    let mut attachment_guids: Vec<String> = msg.msg_proto.attributed_body
-                        .as_ref()
-                        .map(|body| extract_attachment_guids_from_attributed_body(body))
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|g| !g.is_empty() && g.len() <= 256 && g.is_ascii())
-                        .collect();
-
-                    // Also extract from messageSummaryInfo to capture companion
-                    // transfers (e.g. Live Photo MOV) not in attributedBody.
-                    if let Some(ref summary) = msg.msg_proto.message_summary_info {
-                        for sg in extract_attachment_guids_from_summary_info(summary) {
-                            if !sg.is_empty() && sg.len() <= 256 && sg.is_ascii()
-                                && !attachment_guids.contains(&sg)
-                            {
-                                attachment_guids.push(sg);
-                            }
-                        }
-                    }
-
-                    let date_read_ms = msg.msg_proto.date_read
-                        .map(|dr| apple_timestamp_ns_to_unix_ms(dr as i64))
-                        .unwrap_or(0);
-
-                    let has_body = msg.msg_proto.attributed_body.is_some();
-
-                    let (reply_guid, reply_part) = parse_cloud_reply(
-                        msg.msg_proto_2.as_ref().and_then(|p| p.reply.as_deref()),
-                    );
+                    let f = cloud_message_fields(&msg);
 
                     WrappedCloudSyncMessage {
                         record_name: rn,
@@ -11905,20 +10670,20 @@ impl Client {
                         is_from_me: msg
                             .flags
                             .contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME),
-                        text,
-                        subject,
+                        text: f.text,
+                        subject: f.subject,
                         service: msg.service.clone(),
                         timestamp_ms: apple_timestamp_ns_to_unix_ms(msg.time),
                         deleted: false,
-                        tapback_type,
-                        tapback_target_guid,
-                        tapback_emoji,
-                        attachment_guids,
-                        date_read_ms,
-                        msg_type: msg.r#type,
-                        has_body,
-                        reply_guid,
-                        reply_part,
+                        tapback_type: f.tapback_type,
+                        tapback_target_guid: f.tapback_target_guid,
+                        tapback_emoji: f.tapback_emoji,
+                        attachment_guids: f.attachment_guids,
+                        date_read_ms: f.date_read_ms,
+                        msg_type: f.msg_type,
+                        has_body: f.has_body,
+                        reply_guid: f.reply_guid,
+                        reply_part: f.reply_part,
                     }
                 }));
 
@@ -13337,36 +12102,7 @@ impl Client {
                     msg.guid.clone()
                 };
 
-                let tapback_type = msg.msg_proto.associated_message_type;
-                let tapback_target_guid = msg.msg_proto.associated_message_guid.clone();
-                let tapback_emoji = msg.msg_proto_4.as_ref()
-                    .and_then(|p4| p4.associated_message_emoji.clone());
-
-                let date_read_ms = msg.msg_proto.date_read
-                    .map(|dr| apple_timestamp_ns_to_unix_ms(dr as i64))
-                    .unwrap_or(0);
-
-                // Extract attachment GUIDs from attributedBody + messageSummaryInfo
-                let mut attachment_guids: Vec<String> = msg.msg_proto.attributed_body
-                    .as_ref()
-                    .map(|body| extract_attachment_guids_from_attributed_body(body))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|g| !g.is_empty() && g.len() <= 256 && g.is_ascii())
-                    .collect();
-                if let Some(ref summary) = msg.msg_proto.message_summary_info {
-                    for sg in extract_attachment_guids_from_summary_info(summary) {
-                        if !sg.is_empty() && sg.len() <= 256 && sg.is_ascii()
-                            && !attachment_guids.contains(&sg)
-                        {
-                            attachment_guids.push(sg);
-                        }
-                    }
-                }
-
-                let (reply_guid, reply_part) = parse_cloud_reply(
-                    msg.msg_proto_2.as_ref().and_then(|p| p.reply.as_deref()),
-                );
+                let f = cloud_message_fields(&msg);
 
                 deduped.insert(
                     guid.clone(),
@@ -13378,20 +12114,20 @@ impl Client {
                         is_from_me: msg
                             .flags
                             .contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME),
-                        text: msg.msg_proto.text.clone(),
-                        subject: msg.msg_proto.subject.clone(),
+                        text: f.text,
+                        subject: f.subject,
                         service: msg.service,
                         timestamp_ms,
                         deleted: false,
-                        tapback_type,
-                        tapback_target_guid,
-                        tapback_emoji,
-                        attachment_guids,
-                        date_read_ms,
-                        msg_type: msg.r#type,
-                        has_body: msg.msg_proto.attributed_body.is_some(),
-                        reply_guid,
-                        reply_part,
+                        tapback_type: f.tapback_type,
+                        tapback_target_guid: f.tapback_target_guid,
+                        tapback_emoji: f.tapback_emoji,
+                        attachment_guids: f.attachment_guids,
+                        date_read_ms: f.date_read_ms,
+                        msg_type: f.msg_type,
+                        has_body: f.has_body,
+                        reply_guid: f.reply_guid,
+                        reply_part: f.reply_part,
                     },
                 );
 
@@ -13921,7 +12657,7 @@ async fn fetch_main_zone_page_newest_first(
 ) -> Result<(Vec<u8>, HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>, i32), rustpush::PushError> {
     use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
     use rustpush::cloudkit_proto::CloudKitRecord;
-    use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudMessage};
+    use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudMessage, RemoteCloudMessage};
 
     let container = cloud_messages.get_container().await?;
     let zone_id = container.private_zone("messageManateeZone".to_string());
@@ -13945,7 +12681,7 @@ async fn fetch_main_zone_page_newest_first(
             results.insert(identifier, None);
             continue;
         };
-        if record.r#type.as_ref().unwrap().name() != CloudMessage::record_type() {
+        if record.r#type.as_ref().unwrap().name() != RemoteCloudMessage::record_type() {
             continue;
         }
         let pcskey = match pcs_keys_for_record(record, &key) {
@@ -13975,11 +12711,24 @@ async fn fetch_main_zone_page_newest_first(
             Err(e) => return Err(e),
         };
         let Some(pcskey) = pcskey else { continue };
-        let item = CloudMessage::from_record_encrypted(
-            &record.record_field,
-            Some(&pcskey),
-        );
-        results.insert(identifier, Some(item));
+        // Into<CloudMessage> unwraps every proto decode, so a corrupt record
+        // panics here rather than erroring. Skip it like sync_messages_fallback
+        // does instead of losing the whole page.
+        let item = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            CloudMessage::from(RemoteCloudMessage::from_record_encrypted(
+                &record.record_field,
+                Some(&pcskey),
+            ))
+        }));
+        match item {
+            Ok(item) => { results.insert(identifier, Some(item)); }
+            Err(e) => {
+                let panic_msg = if let Some(s) = e.downcast_ref::<String>() { s.clone() }
+                                else if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
+                                else { "unknown panic".to_string() };
+                warn!("fetch_main_zone_page_newest_first: skipping record {}: deserialization panic: {}", identifier, panic_msg);
+            }
+        }
     }
     Ok((response.sync_continuation_token().to_vec(), results, response.status()))
 }
@@ -14003,7 +12752,7 @@ async fn sync_messages_fallback(
 ) -> Result<(Vec<u8>, HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>, i32), rustpush::PushError> {
     use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
     use rustpush::cloudkit_proto::CloudKitRecord;
-    use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudMessage};
+    use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudMessage, RemoteCloudMessage};
 
     let container = cloud_messages.get_container().await?;
     let zone_id = container.private_zone("messageManateeZone".to_string());
@@ -14039,7 +12788,7 @@ async fn sync_messages_fallback(
         };
 
         // Graceful type check — no .unwrap()
-        if record.r#type.as_ref().map_or(true, |t| t.name() != CloudMessage::record_type()) {
+        if record.r#type.as_ref().map_or(true, |t| t.name() != RemoteCloudMessage::record_type()) {
             continue;
         }
 
@@ -14054,7 +12803,10 @@ async fn sync_messages_fallback(
 
         // from_record_encrypted may panic on corrupt field data — catch it
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            CloudMessage::from_record_encrypted(&record.record_field, Some(&pcskey))
+            CloudMessage::from(RemoteCloudMessage::from_record_encrypted(
+                &record.record_field,
+                Some(&pcskey),
+            ))
         }));
 
         match result {

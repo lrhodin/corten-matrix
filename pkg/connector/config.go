@@ -1,10 +1,9 @@
 // corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package connector
 
@@ -77,19 +76,21 @@ type IMConfig struct {
 	// If empty, the handle chosen during login is used.
 	PreferredHandle string `yaml:"preferred_handle"`
 
-	// FaceTimeDisplayName overrides the display name pre-filled on the
-	// FaceTime web join page (the value attached to `#n=…` in the ring-
-	// notice link). If empty, the bridge reads the user's "First Last"
-	// from the cached Apple Account SPD; if that's also unavailable it
-	// falls back to the bare iMessage handle.
-	FaceTimeDisplayName string `yaml:"facetime_display_name"`
+	// BridgeFilteredChats bridges chats iCloud has filtered into its
+	// unknown-sender bucket instead of leaving them out.
+	//
+	// The filtering is inherited from the user's iCloud settings, not a bridge
+	// decision, and Apple's bucket catches plenty of real conversation —
+	// delivery notifications, 2FA codes, a business replying to you. Off by
+	// default because that is the behavior every existing install already has.
+	BridgeFilteredChats bool `yaml:"bridge_filtered_chats"`
 
-	// DisableFaceTime turns off all bridge FaceTime integration: the
-	// !facetime* slash commands aren't registered, inbound ring / missed /
-	// answered-elsewhere notices aren't posted, and inbound peer-invite
-	// notices are suppressed. Intended for users who own an Apple device
-	// and answer FaceTime calls natively — the bridge wrapper adds nothing
-	// in that case and just clutters the chat.
+	// DisableFaceTime suppresses the FaceTime call notices.
+	//
+	// FaceTime is notify-only: the bridge stays registered for the FaceTime
+	// IDS service either way, and all it does with a call is post an m.notice
+	// — incoming or missed. Set this if you answer on an Apple device and
+	// don't want those lines in the chat.
 	DisableFaceTime bool `yaml:"disable_facetime"`
 
 	// StatusKitShareOnStartup publishes share_status(available) once after
@@ -243,8 +244,8 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Int, "max_attachment_size_mb")
 	helper.Copy(up.Bool, "url_previews_in_backfill")
 	helper.Copy(up.Str, "preferred_handle")
-	helper.Copy(up.Str, "facetime_display_name")
 	helper.Copy(up.Bool, "disable_facetime")
+	helper.Copy(up.Bool, "bridge_filtered_chats")
 	helper.Copy(up.Bool, "statuskit_share_on_startup")
 	helper.Copy(up.Bool, "statuskit_notifications")
 	helper.Copy(up.Bool, "read_receipts")

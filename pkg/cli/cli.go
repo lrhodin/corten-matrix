@@ -1111,6 +1111,7 @@ func PrintHelp() {
 		{"restart", "restart the bridge"},
 		{"status", "show service status"},
 		{"logs 1", "tail a bridge log (1 = second account)"},
+		{"sync-status", "report backfill progress (1 = second account)"},
 		{"install-service", "install + start the background service"},
 		{"uninstall-service", "stop + remove the background service"},
 		{"reset", "reset bridge state"},
@@ -1136,7 +1137,7 @@ func IsManagementCommand(cmd string) bool {
 	switch cmd {
 	case "setup", "setup-beeper", "start", "stop", "restart",
 		"status", "logs", "bbctl", "reset", "uninstall",
-		"install-service", "uninstall-service":
+		"install-service", "uninstall-service", "sync-status":
 		return true
 	}
 	return false
@@ -1178,6 +1179,10 @@ func RunManagement(cmd string, args []string) {
 		tailLogs(args)
 	case "bbctl":
 		runBbctl(args)
+	case "sync-status":
+		// Read-only backfill report, straight from the account's database —
+		// no daemon needed, which is the point (see pkg/cli/sync_status.go).
+		runSyncStatus(args)
 	}
 	os.Exit(0)
 }

@@ -1,10 +1,9 @@
 // corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package connector
 
@@ -177,6 +176,35 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 		if lastErr == nil {
 			messages = append(messages, msgs...)
 		}
+	}
+
+	// One message can legitimately appear under more than one of the chat
+	// GUIDs above — chat.db joins messages to chats many-to-many, so a handle
+	// with both an iMessage and an SMS chat returns the same row twice. Two
+	// BackfillMessages with the same ID make the Matrix batch send reject the
+	// entire batch ("Event #N has same ID as previous event"), and a rejected
+	// batch means the forward backfill's CompleteCallback never runs, which
+	// leaves the portal empty for good. Keep the first sighting of each GUID.
+	if len(chatGUIDs) > 1 && len(messages) > 0 {
+		seenGUID := make(map[string]bool, len(messages))
+		deduped := messages[:0]
+		for _, msg := range messages {
+			if msg == nil || (msg.GUID != "" && seenGUID[msg.GUID]) {
+				continue
+			}
+			if msg.GUID != "" {
+				seenGUID[msg.GUID] = true
+			}
+			deduped = append(deduped, msg)
+		}
+		if dropped := len(messages) - len(deduped); dropped > 0 {
+			log.Info().
+				Int("dropped", dropped).
+				Int("kept", len(deduped)).
+				Strs("chat_guids", chatGUIDs).
+				Msg("chat.db backfill: dropped duplicate messages shared across chat GUIDs")
+		}
+		messages = deduped
 	}
 
 	if len(messages) == 0 && lastErr != nil {

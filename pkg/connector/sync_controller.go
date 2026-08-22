@@ -114,6 +114,21 @@ func (c *IMClient) setCloudSyncDone() {
 	c.cloudSyncDone = true
 	c.cloudSyncDoneLock.Unlock()
 
+	// Start the backward-backfill drain loop on homeservers that can't batch
+	// send. bridgev2's RunBackfillQueue returns immediately on those (Synapse
+	// and every other non-Beeper server), so the backfill_task rows queued by
+	// createPortalsFromCloudSync — and by bridgev2 itself on room creation —
+	// are never dispatched and deep history never arrives. See
+	// synapse_backfill.go; the call is bridge-scoped and idempotent, so every
+	// login may make it on every connect.
+	//
+	// Here rather than in Connect because this is the one point every backfill
+	// mode passes through (chat.db, CloudKit and backfill-disabled all reach
+	// it), and because in CloudKit mode it fires after the bootstrap sync
+	// instead of before it — deep history is the last thing that should be
+	// competing for the single SQLite writer.
+	c.startSynapseBackfillDrainIfNeeded()
+
 	// Flush the APNs reorder buffer once all forward backfills are complete.
 	// Messages accumulated during CloudKit sync to avoid interleaving APNs
 	// messages before older CloudKit messages in Matrix.
@@ -3935,7 +3950,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	// from cloud_chat (with 0 messages). Chat-only portals are included so
 	// conversations synced from CloudKit without any resolved messages still
 	// get bridge portals created.
-	portalInfos, err := c.cloudStore.listPortalIDsWithNewestTimestamp(ctx)
+	portalInfos, err := c.cloudStore.listPortalIDsWithNewestTimestamp(ctx, c.Main.Config.BridgeFilteredChats)
 	if err != nil {
 		log.Err(err).Msg("Failed to list cloud portal IDs with timestamps")
 		return

@@ -69,8 +69,8 @@ uniffi = { version = "0.25.0", features = ["tokio"] }
 pretty_env_logger = "0.5.0"
 log = "0.4.20"
 rustpush = { path = "../../third_party/rustpush-upstream", default-features = false, features = ["macos-validation-data"] }
-icloud_auth = { path = "../../third_party/rustpush-upstream/apple-private-apis/icloud-auth", default-features = false }
-omnisette = { path = "../../third_party/rustpush-upstream/apple-private-apis/omnisette", default-features = false }
+icloud_auth = { path = "../../third_party/rustpush-upstream/third_party/apple-private-apis/icloud-auth", default-features = false }
+omnisette = { path = "../../third_party/rustpush-upstream/third_party/apple-private-apis/omnisette", default-features = false }
 # Direct path dep on cloudkit-proto so the `CloudKitRecord` derive macro (which
 # emits `cloudkit_proto::*` references in its generated code) can resolve the
 # crate name inside our wrapper. Without this, defining a local CloudKitRecord
@@ -126,3 +126,14 @@ rand = { version = "0.8.5", features = ["min_const_gen"] }
 [build-dependencies]
 uniffi = { version = "0.25.0", features = ["build"] }
 cc = "1.0"
+
+# Upstream rustpush pulls quinn from its own vendored fork
+# (third_party/quinn), while h3-quinn pulls quinn from crates.io. Upstream
+# unifies the two with a [patch.crates-io] block in its own Cargo.toml, but
+# cargo only honors [patch] in the workspace ROOT manifest — and the root here
+# is this crate, not rustpush. Without the same patch, both quinn crates land
+# in the graph and rustpush fails to compile with "expected
+# h3_quinn::quinn::Connection, found quinn::Connection" (src/ids/link.rs).
+# Mirror upstream's patch so the fork is the only quinn in the graph.
+[patch.crates-io]
+quinn = { path = "../../third_party/rustpush-upstream/third_party/quinn/quinn" }

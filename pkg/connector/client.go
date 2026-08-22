@@ -1,10 +1,9 @@
 // corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package connector
 
@@ -515,6 +514,16 @@ type IMClient struct {
 	// forwardBackfillSem limits concurrent forward backfills to avoid
 	// overwhelming CloudKit/Matrix with simultaneous attachment downloads.
 	forwardBackfillSem chan struct{}
+
+	// backwardDeferCounts bounds how long a backward-backfill task waits for
+	// forward backfill to produce an anchor. Forward backfill runs once, at
+	// portal creation; if its send fails, CompleteCallback never fires,
+	// markForwardBackfillDone never runs, and the no-anchor branch below would
+	// otherwise defer for the life of the process. Counting consecutive
+	// deferrals per portal lets it give up and self-heal through the recovery
+	// backfill instead of waiting for a restart.
+	backwardDeferMu     sync.Mutex
+	backwardDeferCounts map[string]int
 
 	// attachmentContentCache maps CloudKit record_name → *event.MessageEventContent.
 	// Populated by preUploadCloudAttachments, which runs in the cloud sync
@@ -1179,15 +1188,8 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	log.Info().Str("selected_handle", logSafeHandle(c.handle)).Strs("handles", logSafeHandles(handles)).Msg("Connected to iMessage")
 
-	// Pre-mint the OpenBubbles-style rotating FaceTime link slots ("next"
-	// for outbound, "nextincomingcall" for inbound). Done in the
-	// background because it's network-dependent and not load-bearing for
-	// connect; a failed pre-mint means the first outbound/inbound call
-	// mints on-demand (same as legacy behavior). With the bridge's long
-	// uptime, pre-minting here gives Apple's FT server days of
-	// identity-propagation time before the link is actually used.
-	// See lastFullConnectKVKey: skip the Apple-heavy IDS sweep (FT pre-mint +
-	// StatusKit contact invites) when a full connect happened within the
+	// See lastFullConnectKVKey: skip the Apple-heavy IDS sweep (the StatusKit
+	// contact-invite burst) when a full connect happened within the
 	// cooldown — a reconnect/rebuild must not re-fire that burst at Apple
 	// mid-storm. Degrades safe: any KV/parse miss → treated as "not recent" →
 	// runs exactly as before. Receiving is unaffected (handled by the APS
@@ -1201,18 +1203,6 @@ func (c *IMClient) Connect(ctx context.Context) {
 	}
 	if !skipHeavyIDSSweep {
 		c.Main.Bridge.DB.KV.Set(context.Background(), lastFullConnectKVKey, time.Now().Format(time.RFC3339))
-	}
-
-	if c.handle != "" && !skipHeavyIDSSweep {
-		go func(handle string) {
-			ft, ftErr := c.client.GetFacetimeClient()
-			if ftErr != nil {
-				log.Warn().Err(ftErr).Msg("Pre-mint FaceTime links: GetFacetimeClient failed; links will be minted on demand")
-				return
-			}
-			premintFaceTimeLinks(ft, handle)
-			log.Info().Str("handle", logSafeHandle(handle)).Msg("Pre-minted FaceTime link slots (next, nextincomingcall)")
-		}(c.handle)
 	}
 
 	if c.Main.Config.VideoTranscoding {
@@ -1483,6 +1473,18 @@ func (c *IMClient) Connect(ctx context.Context) {
 		} else if healed > 0 {
 			log.Info().Int("healed", healed).Msg("Healed mis-routed group messages at startup")
 		}
+
+		// Re-arm portals whose backfill was marked complete but which never
+		// received a single message — the permanent-empty-room state a failed
+		// batch send used to leave behind. Runs before the CloudKit sync pass
+		// so a re-armed portal is picked up by this startup's ChatResync
+		// sweep rather than waiting for the next one.
+		if repaired, reconErr := c.cloudStore.reconcileStrandedBackfills(context.Background()); reconErr != nil {
+			log.Warn().Err(reconErr).Msg("Failed to reconcile stranded backfill tasks")
+		} else if repaired > 0 {
+			log.Info().Int("repaired", repaired).
+				Msg("Re-armed backfill for portals that were marked done with no bridged messages")
+		}
 	}
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 
@@ -1639,12 +1641,12 @@ You're signed in. This is your **management room** — the bot uses it to delive
 #### Where to type commands
 
 - **Here in the management room**: type the command bare — ` + "`start-chat`" + `, ` + "`help`" + `, ` + "`logout`" + `.
-- **Inside a chat room** (a DM or group): prefix with ` + "`%[1]s`" + ` — e.g. ` + "`%[1]s facetime`" + ` to start a call from a DM.
+- **Inside a chat room** (a DM or group): prefix with ` + "`%[1]s`" + ` — e.g. ` + "`%[1]s help`" + ` to list the commands available there.
 - To abort an interactive command (like the ` + "`start-chat`" + ` picker): type ` + "`cancel`" + ` here, or ` + "`%[1]s cancel`" + ` from a portal room.
 
 #### Notices the bot will post here
 
-- FaceTime invites, missed-call notices, and "answered elsewhere" updates when there's no portal yet
+- Incoming FaceTime call notices when there's no portal yet
 - Chat-restore confirmations and recycle-bin activity
 - StatusKit / presence updates
 - Shared-album / Shared Streams activity
@@ -1715,8 +1717,7 @@ func (c *IMClient) IsLoggedIn() bool {
 const receiveWedgeRecoverySecs uint64 = 600
 
 // A reconnect/rebuild re-runs Connect, which re-fires the Apple-heavy IDS work:
-// the FaceTime link pre-mint and the StatusKit contact-invite sweep (a 20+-handle
-// per-handle IDS query burst). Mid-reconnect-storm that burst has been observed
+// the StatusKit contact-invite sweep (a 20+-handle per-handle IDS query burst). Mid-reconnect-storm that burst has been observed
 // escalating to a temporary Apple account disable. Gate it behind a cooldown so a
 // Connect within this window of the last full one reuses the recent sweep instead
 // of re-querying Apple. Receive recovery (APS reconnect + StatusKit subscribe) is
@@ -3356,7 +3357,6 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist message UUID; duplicates may occur on restart")
 		}
 	}
-	c.maybeNotifyIncomingFaceTimeInvite(log, &msg, portalKey, sender.IsFromMe, createPortal)
 	if createPortal || sender.IsFromMe {
 		log.Info().
 			Bool("create_portal", createPortal).
@@ -4031,7 +4031,6 @@ func (c *IMClient) handleIconChange(log zerolog.Logger, msg rustpushgo.WrappedMe
 
 const faceTimeRingMarker = "[[FACETIME_RING]]"
 const faceTimeMissedMarker = "[[FACETIME_MISSED]]"
-const faceTimeAnsweredElsewhereMarker = "[[FACETIME_ANSWERED_ELSEWHERE]]"
 
 // handleNotifyAnyways posts a silent bot notice when a contact deliberately
 // breaks through our Focus / Do Not Disturb by tapping "Notify Anyway" on their
@@ -4045,18 +4044,15 @@ func (c *IMClient) handleNotifyAnyways(log zerolog.Logger, msg rustpushgo.Wrappe
 
 	rawText := strings.TrimSpace(ptrStringOr(msg.Text, ""))
 	if strings.HasPrefix(rawText, faceTimeRingMarker) ||
-		strings.HasPrefix(rawText, faceTimeMissedMarker) ||
-		strings.HasPrefix(rawText, faceTimeAnsweredElsewhereMarker) {
+		strings.HasPrefix(rawText, faceTimeMissedMarker) {
 		if c.Main.Config.DisableFaceTime {
 			return
 		}
 		switch {
 		case strings.HasPrefix(rawText, faceTimeRingMarker):
-			c.handleFaceTimeRingNotice(log, msg, rawText)
+			c.postFaceTimeNotice(log, msg, faceTimeNoticeRing)
 		case strings.HasPrefix(rawText, faceTimeMissedMarker):
-			c.handleFaceTimeMissedNotice(log, msg)
-		case strings.HasPrefix(rawText, faceTimeAnsweredElsewhereMarker):
-			c.handleFaceTimeAnsweredElsewhereNotice(log, msg)
+			c.postFaceTimeNotice(log, msg, faceTimeNoticeMissed)
 		}
 		return
 	}
@@ -4097,7 +4093,23 @@ func (c *IMClient) handleNotifyAnyways(log zerolog.Logger, msg rustpushgo.Wrappe
 	}
 }
 
-func (c *IMClient) handleFaceTimeRingNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage, rawText string) {
+// faceTimeNoticeKind is which call outcome a notice reports.
+type faceTimeNoticeKind int
+
+const (
+	faceTimeNoticeRing faceTimeNoticeKind = iota
+	faceTimeNoticeMissed
+)
+
+// postFaceTimeNotice posts an m.notice about an incoming FaceTime call.
+//
+// FaceTime is notify-only: the bridge stays registered for the FaceTime IDS
+// service so Apple keeps delivering call events, and these two notices are the
+// whole of what it does with them. There is deliberately no "answered on
+// another device" notice: the bridge never answers, so that would fire on
+// every single call the user picks up. There is no join link, no answering,
+// and no way to place a call from Matrix — answer on an Apple device.
+func (c *IMClient) postFaceTimeNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage, kind faceTimeNoticeKind) {
 	ctx := context.Background()
 	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
@@ -4114,70 +4126,18 @@ func (c *IMClient) handleFaceTimeRingNotice(log zerolog.Logger, msg rustpushgo.W
 		name = "someone"
 	}
 
-	link := firstFaceTimeLinkInText(rawText)
-	if link == "" {
-		// Native FaceTime ring — no link embedded. Use the persistent
-		// bridge link + pin its session_link to this inbound session guid.
-		//
-		// Why not GetSessionLink: upstream's get_session_link calls
-		// message_session, which sends a LinkCreated wire message to
-		// every member of the session — including the peer whose call
-		// is currently ringing our handle. Injecting a LinkCreated into
-		// peer's active ring disrupts their FT UI and empirically
-		// downgrades peer's display to audio-mode ("peer sees avatar,
-		// hears audio, no video") even when the user answers natively
-		// on a video-capable device. GetSessionLink only avoids this
-		// when session.link is already set, which it isn't for native
-		// FT calls (no web link embedded in peer's Invitation).
-		//
-		// Use the pre-minted "nextincomingcall" link slot (mirroring
-		// OpenBubbles' rotateIncomingLink pattern at
-		// rustpush_service.dart:2699-2702). The pseud has been on
-		// Apple's FT server since startup (or since the last inbound
-		// call's rotation), giving identity resolution time to fully
-		// propagate the pseud↔handle binding before the webview joins.
-		// The binding is pinned pre-rotation (while the link is still
-		// in "nextincomingcall" slot); rotation below renames it to
-		// "incomingcall" while preserving session_link.
-		if ft, ftErr := c.client.GetFacetimeClient(); ftErr == nil {
-			if generated, genErr := getFaceTimeLinkWithRecovery(ft, c.handle, ftLinkUsageNextIncomingCall); genErr == nil {
-				link = generated
-				if guid := extractFaceTimeGuid(rawText); guid != "" {
-					if bindErr := ft.BindBridgeLinkToSession(c.handle, ftLinkUsageNextIncomingCall, guid); bindErr != nil {
-						log.Warn().Err(bindErr).Str("guid", guid).Msg("FaceTimeRing: failed to pin bridge link to inbound session; web answer may route incorrectly")
-					}
-				}
-				// Rotate asynchronously: nextincomingcall → incomingcall,
-				// mint fresh nextincomingcall for the next inbound ring.
-				// The rotation renames the bound link's slot to
-				// "incomingcall" while preserving its session_link.
-				go func() {
-					_ = rotateIncomingLink(ft, c.handle)
-				}()
-				// Pre-fill the web page's display-name prompt with the
-				// user's own handle so tapping Answer lands in the call
-				// without the guest-name typing step (which otherwise
-				// creates a second participant distinct from the pseud
-				// bound to the user's handle).
-				link = appendFaceTimeLinkName(link, c.resolveFaceTimeDisplayName(ctx))
-			} else {
-				log.Warn().Err(genErr).Msg("FaceTimeRing: failed to generate bridge FaceTime link")
-			}
-		}
-	}
-
-	// Build the notice as markdown so the join link renders as a tappable
-	// anchor in the formatted_body. Plain-URL notices aren't autolinked by
-	// every Matrix client; wrapping the URL in [text](url) guarantees an
-	// <a> tag reaches the client.
-	noticeMarkdown := "📞 **Incoming FaceTime call from " + name + ".**"
-	if link != "" {
-		noticeMarkdown += "\n\n[**Answer FaceTime call**](" + link + ")"
-		noticeMarkdown += "\n\nRaw link (if the button above doesn't open): " + link
+	var markdown, logLabel string
+	switch kind {
+	case faceTimeNoticeMissed:
+		markdown = "📞 **Missed FaceTime call from " + name + ".**"
+		logLabel = "FaceTimeMissed"
+	default:
+		markdown = "📞 **Incoming FaceTime call from " + name + ".**"
+		logLabel = "FaceTimeRing"
 	}
 
 	sendNotice := func(roomID id.RoomID) error {
-		content := format.RenderMarkdown(noticeMarkdown, true, false)
+		content := format.RenderMarkdown(markdown, true, false)
 		content.MsgType = event.MsgNotice
 		content.Mentions = &event.Mentions{}
 		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{
@@ -4189,128 +4149,28 @@ func (c *IMClient) handleFaceTimeRingNotice(log zerolog.Logger, msg rustpushgo.W
 	if err == nil && portal != nil && portal.MXID != "" {
 		if sendErr := sendNotice(portal.MXID); sendErr == nil {
 			log.Info().
-				Str("sender", senderHandle).
+				Str("sender", logSafeHandle(senderHandle)).
 				Str("portal_mxid", string(portal.MXID)).
-				Msg("FaceTimeRing: posted incoming call notice to portal")
+				Msg(logLabel + ": posted notice to portal")
 			return
 		} else {
-			log.Warn().Err(sendErr).Msg("FaceTimeRing: failed to send portal notice")
+			log.Warn().Err(sendErr).Msg(logLabel + ": failed to send portal notice")
 		}
 	}
 
 	mgmtRoom, mgmtErr := c.UserLogin.User.GetManagementRoom(ctx)
 	if mgmtErr != nil {
-		log.Warn().Err(mgmtErr).Msg("FaceTimeRing: failed to get management room for fallback notice")
+		log.Warn().Err(mgmtErr).Msg(logLabel + ": failed to get management room for fallback notice")
 		return
 	}
 	if sendErr := sendNotice(mgmtRoom); sendErr != nil {
-		log.Warn().Err(sendErr).Msg("FaceTimeRing: failed to send management room notice")
+		log.Warn().Err(sendErr).Msg(logLabel + ": failed to send management room notice")
 		return
 	}
 	log.Info().
-		Str("sender", senderHandle).
+		Str("sender", logSafeHandle(senderHandle)).
 		Str("management_room", string(mgmtRoom)).
-		Msg("FaceTimeRing: posted incoming call notice to management room")
-}
-
-func (c *IMClient) handleFaceTimeMissedNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	ctx := context.Background()
-	senderHandle := ptrStringOr(msg.Sender, "")
-	name := stripIdentifierPrefix(senderHandle)
-	if senderHandle != "" {
-		ghost, ghostErr := c.Main.Bridge.GetGhostByID(ctx, makeUserID(normalizeIdentifierForPortalID(senderHandle)))
-		if ghostErr == nil && ghost != nil && ghost.Name != "" {
-			name = ghost.Name
-		}
-	}
-	if name == "" {
-		name = "someone"
-	}
-
-	// Build a call-back button that uses the bridge's pending-ring flow,
-	// same mechanism as the outbound `!im facetime` command. Tap → letmein
-	// approve adds the user to a pre-armed session → JoinEvent fires
-	// maybe_fire_pending_ring → ft.ring() against the original caller.
-	// By the time their phone rings the user is already a live participant
-	// so the callee's answer connects cleanly.
-	//
-	// No facetime:// fallback: that scheme only worked on native iOS/macOS
-	// and provided no bridge integration. If the bridge-link arm fails we
-	// still post the notice with no callback button; the user can always
-	// `!im facetime` in the portal manually.
-	noticeMarkdown := "📞 **Missed FaceTime call from " + name + ".**"
-	if senderHandle != "" && c.handle != "" {
-		if ft, ftErr := c.client.GetFacetimeClient(); ftErr == nil {
-			if webLink, _, armErr := armBridgeFaceTimeCall(ft, c.handle, senderHandle, 3600, c.resolveFaceTimeDisplayName(ctx)); armErr == nil {
-				noticeMarkdown += "\n\n[**📞 Call back " + name + "**](" + webLink + ")"
-				noticeMarkdown += "\n\n⚠️ **Tapping this link will ring " + name + "'s phone.** The ring fires the moment you join — open the link when you're ready to be on camera. Works on iOS, macOS, Android, Windows, and Linux.\n\nRaw URL: " + webLink
-			} else {
-				log.Warn().Err(armErr).Str("caller", senderHandle).Msg("FaceTimeMissed: bridge-link callback arm failed; notice posted without callback button")
-			}
-		}
-	}
-
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
-	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
-	sendNotice := func(roomID id.RoomID) error {
-		content := format.RenderMarkdown(noticeMarkdown, true, false)
-		content.MsgType = event.MsgNotice
-		content.Mentions = &event.Mentions{}
-		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{
-			Parsed: &content,
-		}, nil)
-		return sendErr
-	}
-	if err == nil && portal != nil && portal.MXID != "" {
-		if sendErr := sendNotice(portal.MXID); sendErr == nil {
-			log.Info().Str("sender", logSafeHandle(senderHandle)).Str("portal_mxid", string(portal.MXID)).Bool("has_callback", senderHandle != "" && c.handle != "").Msg("FaceTimeMissed: posted missed call notice to portal")
-			return
-		}
-	}
-	mgmtRoom, mgmtErr := c.UserLogin.User.GetManagementRoom(ctx)
-	if mgmtErr != nil {
-		log.Warn().Err(mgmtErr).Msg("FaceTimeMissed: failed to get management room for fallback notice")
-		return
-	}
-	if sendErr := sendNotice(mgmtRoom); sendErr != nil {
-		log.Warn().Err(sendErr).Msg("FaceTimeMissed: failed to send management room notice")
-		return
-	}
-	log.Info().Str("sender", logSafeHandle(senderHandle)).Str("management_room", string(mgmtRoom)).Bool("has_callback", senderHandle != "" && c.handle != "").Msg("FaceTimeMissed: posted missed call notice to management room")
-}
-
-func (c *IMClient) handleFaceTimeAnsweredElsewhereNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	ctx := context.Background()
-	notice := "📞 Incoming FaceTime call was answered on another device."
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
-	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
-	sendNotice := func(roomID id.RoomID) error {
-		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{
-			Parsed: &event.MessageEventContent{
-				MsgType:  event.MsgNotice,
-				Body:     notice,
-				Mentions: &event.Mentions{},
-			},
-		}, nil)
-		return sendErr
-	}
-	senderHandle := ptrStringOr(msg.Sender, "")
-	if err == nil && portal != nil && portal.MXID != "" {
-		if sendErr := sendNotice(portal.MXID); sendErr == nil {
-			log.Info().Str("sender", logSafeHandle(senderHandle)).Str("portal_mxid", string(portal.MXID)).Msg("FaceTimeAnsweredElsewhere: posted notice to portal")
-			return
-		}
-	}
-	mgmtRoom, mgmtErr := c.UserLogin.User.GetManagementRoom(ctx)
-	if mgmtErr != nil {
-		log.Warn().Err(mgmtErr).Msg("FaceTimeAnsweredElsewhere: failed to get management room for fallback notice")
-		return
-	}
-	if sendErr := sendNotice(mgmtRoom); sendErr != nil {
-		log.Warn().Err(sendErr).Msg("FaceTimeAnsweredElsewhere: failed to send management room notice")
-		return
-	}
-	log.Info().Str("sender", logSafeHandle(senderHandle)).Str("management_room", string(mgmtRoom)).Msg("FaceTimeAnsweredElsewhere: posted notice to management room")
+		Msg(logLabel + ": posted notice to management room")
 }
 
 // makeDeletePortalKey constructs a PortalKey from the delete/recover-specific
@@ -7946,6 +7806,30 @@ type cloudBackfillCursor struct {
 	GUID        string `json:"g"`
 }
 
+// maxBackwardDeferAttempts bounds the consecutive no-anchor deferrals a
+// backward-backfill task makes while waiting on forward backfill. Past the
+// bound the task stops waiting and takes the recovery path below, so a forward
+// backfill whose send failed cannot strand the portal until the process
+// restarts.
+//
+// This counts DISPATCHES, not wall-clock time, and the two are far apart. The
+// 30s sleep is inside FetchMessages, i.e. inside the task, and bridgev2's
+// backfill queue (RunBackfillQueue in mautrix bridgev2/backfillqueue.go) is a
+// single goroutine that runs one task per loop iteration: it picks the single
+// oldest-due task (BackfillTask.GetNext — "ORDER BY next_dispatch_min_ts LIMIT
+// 1"), runs it to completion, and doBackfillTask re-queues that portal at
+// completed_at + backfill.queue.batch_delay. Every deferring portal therefore
+// shares one lane, and a portal's next dispatch is roughly
+// N × (30s + batch_delay) away when N portals are deferring at once. Exhausting
+// this bound takes about maxBackwardDeferAttempts × N × (30s + batch_delay) —
+// with the installers' batch_delay: 1 and N=30 that is ~5 hours, not minutes.
+//
+// So: a portal logging "no anchor yet … deferring" with a low attempt count for
+// an hour is queued behind its peers, working as designed — not hung. The
+// number that says how far along it really is, is the attempt count in that log
+// line; wall time says almost nothing.
+const maxBackwardDeferAttempts = 20
+
 func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
 	fetchStart := time.Now()
 	log := zerolog.Ctx(ctx)
@@ -8147,6 +8031,67 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		// (correct DAG ordering) instead of QueueRemoteEvent (end of DAG).
 		allMessages := c.cloudRowsToBackfillMessages(ctx, allRows, groupDisplayName)
 
+		// Conversion swallowed every row this portal has. Marking the portal
+		// done from here is permanent (fwd_backfill_done gates the resync skip
+		// list and the scrub gate), so this must never happen quietly.
+		//
+		// The way it happens: the privacy scrubber NULLs a delivered row's body
+		// and sets body_scrubbed, cloudRowToBackfillMessages skips scrubbed
+		// rows, and if a portal's delivery is later undone — room deleted and
+		// recreated, so bridgev2's `message` rows cascade away while
+		// body_scrubbed stays sticky TRUE — every remaining row converts to
+		// nothing. Same shape for a restore whose CloudKit re-fetch came back
+		// empty (body_scrubbed cleared, text still NULL). The result was an
+		// empty room, a Debug line, and real history stranded on disk.
+		//
+		// Keyed on totalRows > 0, not on "are there scrubbed rows": whatever
+		// made the rows unconvertible, real CloudKit history producing zero
+		// deliverable messages is a loss worth a log line an operator can grep.
+		//
+		// Only for the no-anchor case — the portal's first backfill, into a room
+		// with nothing in it. On the anchor/catchup path an empty conversion is
+		// the normal, correct outcome: everything newer than the anchor was
+		// already delivered, which is exactly why the scrubber was allowed to
+		// clear those bodies. Rehydrating there would re-deliver messages the
+		// room already has, and the log line would cry loss on a healthy portal.
+		if len(allMessages) == 0 && totalRows > 0 && !hasCursor {
+			// Only worth a CloudKit round trip if scrubbed bodies are what we
+			// are looking at. The check is over rows already in memory — no
+			// extra query, per the one-writer SQLite pool.
+			if anyScrubbedDeliverable(allRows) {
+				log.Warn().Str("portal_id", portalID).Int("db_rows", totalRows).
+					Msg("Forward backfill: 0 deliverable messages from body-scrubbed rows — attempting one CloudKit rehydrate before marking done")
+				if c.rehydrateScrubbedPortal(ctx, *log, portalID) {
+					rows, queryErr := c.cloudStore.listLatestMessages(ctx, portalID, count)
+					if queryErr != nil {
+						log.Err(queryErr).Str("portal_id", portalID).
+							Msg("Forward backfill: re-query after rehydrate FAILED")
+						return nil, queryErr
+					}
+					for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+						rows[i], rows[j] = rows[j], rows[i]
+					}
+					c.preUploadChunkAttachments(ctx, rows, *log)
+					allRows = rows
+					totalRows = len(rows)
+					// Exactly one retry. Re-running conversion can re-queue the
+					// out-of-batch/remove tapbacks the first pass queued, which
+					// is idempotent in bridgev2 (same reaction id, and a remove
+					// of an absent reaction is a no-op); looping would not be.
+					allMessages = c.cloudRowsToBackfillMessages(ctx, allRows, groupDisplayName)
+				}
+			}
+			if len(allMessages) == 0 {
+				// CloudKit had nothing to give back, or the rows were never
+				// recoverable. Mark done anyway — leaving the task un-done just
+				// re-runs this forever — but say so loudly. Accountable loss
+				// beats silent loss, and reconcileStrandedBackfills re-arms the
+				// portal at the next startup if content ever reappears.
+				log.Error().Str("portal_id", portalID).Int("db_rows", totalRows).
+					Msg("Forward backfill: portal has CloudKit rows but none could be converted — marking done with nothing delivered (history NOT recoverable from CloudKit)")
+			}
+		}
+
 		if len(allMessages) == 0 {
 			log.Debug().Str("portal_id", portalID).Msg("Forward backfill: no rows to process")
 			// Use context.Background() — if the bridge is shutting down, ctx
@@ -8259,39 +8204,153 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	}
 
 	if beforeTS == 0 && beforeGUID == "" {
-		// If forward backfill hasn't completed yet, don't permanently mark backward
-		// as done — the anchor will appear once sendBatch finishes.
-		// But if the portal has no messages at all, stop waiting — there's
-		// nothing for forward backfill to anchor against, and deferring
-		// creates an infinite retry loop.
+		// No anchor and no cursor. Either forward backfill hasn't delivered yet
+		// (wait for it), the portal genuinely has nothing to backfill (stop),
+		// or forward backfill failed and never will deliver (recover). The
+		// three are told apart below; getting it wrong in the "stop" direction
+		// is permanent, so that answer needs the most confidence.
+		//
+		// forwardLikelyFailed is set when the deferral bound is exceeded: fall
+		// through to the recovery path rather than returning HasMore=false,
+		// which bridgev2 persists as permanently done.
+		forwardLikelyFailed := false
 		if !c.cloudStore.isForwardBackfillDone(ctx, portalID) {
-			hasMessages, _ := c.cloudStore.hasPortalMessages(ctx, portalID)
-			if hasMessages {
-				log.Info().Str("portal_id", portalID).
-					Msg("Backward backfill: no anchor yet, forward backfill still in progress — deferring")
-				// Sleep before returning HasMore=true so the bridgev2 backfill
-				// queue doesn't tight-loop on this task and steal scheduler
-				// time from forward backfill (which we're waiting on). Each
-				// tight-loop iteration was ~1s of pure no-op — with 30+
-				// deferred portals, that's 30+ CPU-seconds per second burned
-				// waiting for a state change that takes minutes to happen.
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(30 * time.Second):
-				}
-				return &bridgev2.FetchMessagesResponse{HasMore: true, Forward: false}, nil
+			// A failed read must not answer this question. Returning
+			// HasMore=false below makes bridgev2 persist is_done=true and
+			// queue_done=true, which is permanent — the row then matches
+			// portalsFullyBackfilledNoNewContent, so the portal stops getting
+			// ChatResync events and never gets another forward backfill. A
+			// transient "database is locked" (exactly what happens when the
+			// backfill queue, CloudKit sync and the crypto store write at
+			// once) would cost the portal its entire history, with a restart
+			// unable to recover it. So treat an error as "history exists" and
+			// defer: the cost of being wrong that way is one more 30s wait.
+			hasMessages, msgErr := c.cloudStore.hasPortalMessages(ctx, portalID)
+			if msgErr != nil {
+				log.Warn().Err(msgErr).Str("portal_id", portalID).
+					Msg("Backward backfill: hasPortalMessages failed — deferring rather than marking the task done")
 			}
-			log.Info().Str("portal_id", portalID).
-				Msg("Backward backfill: no anchor and no messages — stopping (nothing to backfill)")
-			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
+			if hasMessages || msgErr != nil {
+				// Deferring is right while forward backfill is genuinely still
+				// running — its first delivered message creates the anchor and
+				// this branch stops being reached. It is wrong when forward
+				// already failed its send, because nothing will ever create
+				// that anchor. The two are indistinguishable from here, so
+				// bound the wait: defer for maxBackwardDeferAttempts, then
+				// treat forward as failed and fall through to the recovery
+				// backfill below. Re-delivery is GUID-deduped, so a slow
+				// forward backfill landing afterwards is harmless.
+				c.backwardDeferMu.Lock()
+				c.backwardDeferCounts[portalID]++
+				deferCount := c.backwardDeferCounts[portalID]
+				c.backwardDeferMu.Unlock()
+				if deferCount > maxBackwardDeferAttempts {
+					// Past the bound: stop deferring, fall through to recovery.
+					//
+					// The counter is deliberately NOT cleared here. The recovery
+					// path below can itself come back inconclusive — its
+					// hasPortalMessages read can fail — and it then returns
+					// HasMore=true, because a read error must never produce
+					// HasMore=false: bridgev2 persists that as is_done +
+					// queue_done, the row then matches
+					// portalsFullyBackfilledNoNewContent, and the portal never
+					// gets another backfill. That write is permanent and costs
+					// the portal its history, so "retry" is the only safe answer
+					// to a failed read, whatever it does to the bound.
+					//
+					// Clearing the counter on the way past would make that retry
+					// re-enter at 0 and re-run all maxBackwardDeferAttempts
+					// deferrals, so a persistently failing read would cycle
+					// 20-deferral rounds forever while each round looked like a
+					// fresh, healthy wait. Keeping the count means every later
+					// dispatch comes straight back here and goes straight to
+					// recovery, and the attempt number keeps climbing, so a
+					// non-converging portal is visible in the log as exactly
+					// that. The bound is therefore a bound on WAITING and on log
+					// severity, not on the number of retries — nothing here ever
+					// gives up, by design. It is cleared only where progress is
+					// proven: forward backfill observed done (below), or a
+					// recovery batch actually delivered.
+					deferEvt := log.Warn()
+					if deferCount > maxBackwardDeferAttempts+1 {
+						// Already recovered at least once and still no anchor:
+						// recovery is not converging either. Greppable at Error
+						// so this stops being invisible after the first pass.
+						deferEvt = log.Error()
+					}
+					deferEvt.Str("portal_id", portalID).Int("attempts", deferCount).
+						Int("bound", maxBackwardDeferAttempts).
+						Msg("Backward backfill: no anchor after repeated deferrals — treating forward backfill as failed and recovering")
+					forwardLikelyFailed = true
+				} else {
+					log.Info().Str("portal_id", portalID).Int("attempt", deferCount).
+						Msg("Backward backfill: no anchor yet, forward backfill still in progress — deferring")
+						// Sleep before returning HasMore=true so the bridgev2 backfill
+						// queue doesn't tight-loop on this task and steal scheduler
+						// time from forward backfill (which we're waiting on). Each
+						// tight-loop iteration was ~1s of pure no-op — with 30+
+						// deferred portals, that's 30+ CPU-seconds per second burned
+						// waiting for a state change that takes minutes to happen.
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-time.After(30 * time.Second):
+					}
+					return &bridgev2.FetchMessagesResponse{HasMore: true, Forward: false}, nil
+				}
+			}
+			if !forwardLikelyFailed {
+				// Reached only when the read SUCCEEDED and reported nothing
+				// here (hasMessages false, msgErr nil). That is a conclusive
+				// answer, so HasMore=false is safe. Drop the counter: this
+				// portal is finished, not waiting on anything.
+				c.backwardDeferMu.Lock()
+				delete(c.backwardDeferCounts, portalID)
+				c.backwardDeferMu.Unlock()
+				log.Info().Str("portal_id", portalID).
+					Msg("Backward backfill: no anchor and no messages — stopping (nothing to backfill)")
+				return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
+			}
+		} else {
+			// Forward backfill finished: this portal is not waiting on anything,
+			// so drop any deferral count it accumulated earlier rather than
+			// leaving a stale one to shorten a future wait.
+			c.backwardDeferMu.Lock()
+			delete(c.backwardDeferCounts, portalID)
+			c.backwardDeferMu.Unlock()
 		}
 		// No anchor but forward backfill is done — this happens for recovered
 		// portals where the room already exists but has no messages (e.g. chat
 		// was deleted and recovered). Fetch the latest messages forward-style
 		// so the portal gets populated.
 		if c.cloudStore != nil {
-			if hasMessages, _ := c.cloudStore.hasPortalMessages(ctx, portalID); hasMessages {
+			hasMessages, msgErr := c.cloudStore.hasPortalMessages(ctx, portalID)
+			if msgErr != nil {
+				// Same reasoning as above: falling through to the HasMore=false
+				// return would mark this task permanently done on a failed read,
+				// which is unrecoverable. Retry instead — INVARIANT: no path in
+				// this function answers a failed read with HasMore=false.
+				//
+				// The deferral counter is intentionally left where it is (above
+				// the bound, if we got here through the fall-through). The next
+				// dispatch then skips the deferral wait entirely and comes
+				// straight back to this read, so a failing read costs one round
+				// trip per dispatch instead of another full 20-deferral wait,
+				// and the attempt count in the log keeps growing to show it.
+				c.backwardDeferMu.Lock()
+				deferCount := c.backwardDeferCounts[portalID]
+				c.backwardDeferMu.Unlock()
+				recoveryEvt := log.Warn()
+				if deferCount > maxBackwardDeferAttempts {
+					// The read has now failed on a retry that was already past
+					// the deferral bound: this portal is looping, not waiting.
+					recoveryEvt = log.Error()
+				}
+				recoveryEvt.Err(msgErr).Str("portal_id", portalID).Int("attempts", deferCount).
+					Msg("Backward backfill: hasPortalMessages failed in the recovery path — retrying rather than marking the task done")
+				return &bridgev2.FetchMessagesResponse{HasMore: true, Forward: false}, nil
+			}
+			if hasMessages {
 				log.Info().Str("portal_id", portalID).
 					Msg("Backward backfill: no anchor but portal has messages — doing recovery backfill")
 				rows, queryErr := c.cloudStore.listLatestMessages(ctx, portalID, count)
@@ -8299,20 +8358,77 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 					return nil, queryErr
 				}
 				if len(rows) > 0 {
+					// A full batch means there is probably older history behind
+					// it. Returning HasMore=false here (as this path used to)
+					// made bridgev2 mark the task done after this one batch, so
+					// a recovered portal kept only its newest `count` messages
+					// and never paginated back. Hand back a cursor instead; the
+					// normal backward path takes over from the next call. An
+					// exactly-full last batch costs one extra empty page.
+					hasMore := len(rows) == count
+					// listLatestMessages returns newest-first; the oldest row is
+					// the last one, and it becomes the cursor before reversing.
+					oldest := rows[len(rows)-1]
+					var nextCursor networkid.PaginationCursor
+					if hasMore {
+						encoded, cursorErr := encodeCloudBackfillCursor(cloudBackfillCursor{
+							TimestampMS: oldest.TimestampMS,
+							GUID:        oldest.GUID,
+						})
+						if cursorErr != nil {
+							log.Warn().Err(cursorErr).Str("portal_id", portalID).
+								Msg("Recovery backfill: failed to encode cursor, delivering this batch as the last one")
+							hasMore = false
+						} else {
+							nextCursor = encoded
+						}
+					}
 					// Reverse to chronological order
 					for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
 						rows[i], rows[j] = rows[j], rows[i]
 					}
 					allMessages := c.cloudRowsToBackfillMessages(ctx, rows, groupDisplayName)
+					if len(allMessages) == 0 {
+						// Same silent-loss shape as the forward path: real rows
+						// in, nothing deliverable out, and the CompleteCallback
+						// below still marks the portal forward-done. Rehydration
+						// is not attempted here — this path only runs after the
+						// forward path already had its one CloudKit retry for
+						// this portal — but the loss must not be silent.
+						// reconcileStrandedBackfills re-arms the task at the next
+						// startup if content ever comes back.
+						log.Error().Str("portal_id", portalID).Int("db_rows", len(rows)).
+							Bool("scrubbed_rows", anyScrubbedDeliverable(rows)).
+							Msg("Recovery backfill: portal has CloudKit rows but none could be converted — delivering nothing and marking forward-done")
+					}
 					log.Info().
 						Str("portal_id", portalID).
 						Int("db_rows", len(rows)).
 						Int("backfill_msgs", len(allMessages)).
-						Msg("Recovery backfill COMPLETE")
+						Bool("has_more", hasMore).
+						Msg("Recovery backfill batch delivered")
 					return &bridgev2.FetchMessagesResponse{
 						Messages: allMessages,
-						HasMore:  false,
+						Cursor:   nextCursor,
+						HasMore:  hasMore,
 						Forward:  false,
+						// Mark forward done only after bridgev2 has delivered
+						// this batch — never before the send. A portal recovered
+						// here reaches the same consistent state a successful
+						// forward backfill would have left it in, which is what
+						// the scrub gate and the resync skip list both read.
+						CompleteCallback: func() {
+							cloudStoreDone := c.cloudStore
+							cloudStoreDone.markForwardBackfillDone(context.Background(), portalID)
+							// Delivery is proven only here, after bridgev2 sent
+							// the batch — a failed send never runs this. That is
+							// the one condition under which the deferral count
+							// may be dropped; see maxBackwardDeferAttempts for
+							// why it is otherwise kept even past the bound.
+							c.backwardDeferMu.Lock()
+							delete(c.backwardDeferCounts, portalID)
+							c.backwardDeferMu.Unlock()
+						},
 					}, nil
 				}
 			}
@@ -8469,6 +8585,106 @@ const cloudReactionMinType uint32 = 2000
 
 func isCloudReactionRow(tapbackType *uint32) bool {
 	return tapbackType != nil && *tapbackType >= cloudReactionMinType
+}
+
+// anyScrubbedDeliverable reports whether a batch contains at least one row that
+// cloudRowToBackfillMessages will drop purely because the privacy scrubber
+// cleared its body — i.e. the rows a CloudKit rehydrate could plausibly bring
+// back. Reactions are excluded because they are not dropped for being scrubbed
+// (they fall through to cloudTapbackToBackfill and render from tapback_type).
+//
+// Deliberately operates on rows already in memory rather than asking the
+// database: it runs on the "conversion produced nothing" path in FetchMessages,
+// where the SQLite pool is clamped to a single connection and an extra COUNT(*)
+// would compete with the backfill's own writes for it.
+func anyScrubbedDeliverable(rows []cloudMessageRow) bool {
+	for i := range rows {
+		if rows[i].BodyScrubbed && !isCloudReactionRow(rows[i].TapbackType) {
+			return true
+		}
+	}
+	return false
+}
+
+// rehydrateScrubbedPortal makes one bounded attempt to put plaintext back on a
+// portal whose rows were all body-scrubbed before backfill could deliver them.
+// It clears the scrub flag (which otherwise makes the NULL sticky through
+// upsertMessageBatch's ON CONFLICT clause, the same thing restore-chat does)
+// and re-fetches the portal from CloudKit. Returns true if CloudKit gave back
+// at least one message, i.e. a retry of the conversion is worth running.
+//
+// Only ever called from the empty-conversion path, at most once per
+// FetchMessages call, with its own timeout: this runs on the portal event loop,
+// so an unbounded CloudKit fetch here would stall every other event for that
+// portal. 2 minutes matches the per-attempt budget the restore pipeline uses.
+//
+// On failure the scrub flag is put back on the rows CloudKit did not
+// repopulate. Without that, a failed rehydrate would leave them
+// body_scrubbed=FALSE with NULL text — losing the sticky-NULL protection, so a
+// later CloudKit sync could quietly refill plaintext that will never be
+// delivered (and therefore never re-scrubbed, since scrubBridgedBodies only
+// touches rows with a bridgev2 `message` row). Privacy state must not degrade
+// because a recovery attempt failed.
+//
+// One window this widens, deliberately: clearBodyScrubByPortalID has no
+// deleted=FALSE filter (clearAllBodyScrub does, and says why), so a portal's
+// unsent/deleted rows can be repopulated from CloudKit by this automatic path,
+// where before only a user-initiated restore-chat could do it. It closes
+// itself — every backfill reader filters deleted=FALSE, so nothing bridges
+// them, and scrubBridgedBodies' deleted=TRUE branch is ungated and re-scrubs
+// them on the next tick. The shared helper is left alone rather than given a
+// filter here, because restore-chat relies on the current behavior.
+func (c *IMClient) rehydrateScrubbedPortal(ctx context.Context, log zerolog.Logger, portalID string) bool {
+	if c.cloudStore == nil || c.client == nil {
+		return false
+	}
+	// Captured before the clear so the failure path can re-arm exactly the rows
+	// this attempt touched: clearBodyScrubByPortalID stamps updated_ts=now on
+	// every row it clears, and any row CloudKit does repopulate gets content.
+	clearedFrom := time.Now().UnixMilli()
+	cleared, err := c.cloudStore.clearBodyScrubByPortalID(ctx, portalID)
+	if err != nil {
+		log.Warn().Err(err).Str("portal_id", portalID).
+			Msg("Rehydrate: failed to clear body_scrubbed, not attempting CloudKit re-fetch")
+		return false
+	}
+	log.Info().Int("cleared", cleared).Str("portal_id", portalID).
+		Msg("Rehydrate: cleared body_scrubbed, re-fetching portal from CloudKit")
+
+	fetchCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	imported, _, fetchErr := c.fetchRecoveredMessagesFromCloudKit(fetchCtx, log, portalID)
+
+	// Unconditionally, and before the caller re-reads the portal. A partial
+	// restore is the normal outcome, not the exception — the CloudKit fetch is
+	// page-limited, so a portal with more history than one fetch covers comes
+	// back with imported > 0 and most rows still empty. Those rows need their
+	// flag back just as much as the rows from a fetch that failed outright.
+	// Doing it here also keeps them counted by listLatestMessages, which treats
+	// body_scrubbed as contentful: re-scrubbing after the re-read would make
+	// them vanish from the row count and have the loss log report db_rows=0.
+	// context.Background() on purpose — a cancelled ctx (shutdown, or the
+	// timeout above firing) is a likely reason to be here, and privacy state
+	// must not be left degraded because the recovery attempt was interrupted.
+	if rescrubbed, rescrubErr := c.cloudStore.rescrubEmptyRowsSince(context.Background(), portalID, clearedFrom); rescrubErr != nil {
+		log.Warn().Err(rescrubErr).Str("portal_id", portalID).
+			Msg("Rehydrate: failed to restore body_scrubbed on rows CloudKit did not repopulate")
+	} else if rescrubbed > 0 {
+		log.Info().Int64("rescrubbed", rescrubbed).Str("portal_id", portalID).
+			Msg("Rehydrate: restored body_scrubbed on rows CloudKit did not repopulate")
+	}
+
+	if fetchErr != nil || imported == 0 {
+		if fetchErr != nil {
+			log.Warn().Err(fetchErr).Str("portal_id", portalID).Msg("Rehydrate: CloudKit re-fetch failed")
+		} else {
+			log.Warn().Str("portal_id", portalID).Msg("Rehydrate: CloudKit returned no messages for this portal")
+		}
+		return false
+	}
+	log.Info().Int("imported", imported).Str("portal_id", portalID).
+		Msg("Rehydrate: CloudKit re-fetch complete")
+	return true
 }
 
 func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMessageRow, groupDisplayName string) []*bridgev2.BackfillMessage {

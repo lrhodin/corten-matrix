@@ -1,18 +1,9 @@
 // corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package connector
 
@@ -42,15 +33,35 @@ import (
 // Admin=50), so the `help` command renders each service as its own heading at
 // the bottom instead of lumping everything under "General".
 var (
-	HelpSectionFaceTime      = commands.HelpSection{Name: "FaceTime", Order: 60}
 	HelpSectionSharedStreams = commands.HelpSection{Name: "Shared Streams", Order: 80}
 	HelpSectionStatusKit     = commands.HelpSection{Name: "StatusKit", Order: 90}
 )
 
+// parseListArgs splits command arguments that name a list of things —
+// handles, album IDs — accepting either commas or whitespace as separators so
+// `a,b`, `a, b` and `a b` all mean the same list.
+func parseListArgs(args []string) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	joined := strings.Join(args, " ")
+	parts := strings.FieldsFunc(joined, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n'
+	})
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // BridgeCommands returns the custom slash commands for the iMessage bridge.
-// Pass disableFaceTime=true to skip every facetime* handler — used by
-// IMConfig.DisableFaceTime to give Apple-native FaceTime users a way to
-// keep the bridge's FT wrapper out of their chat.
+//
+// There are no FaceTime commands: FaceTime is notify-only, so the bridge
+// posts an incoming-call notice and nothing more.
 //
 // Invocation conventions for users:
 //
@@ -65,7 +76,7 @@ var (
 // Register these in main.go's PostInit hook:
 //
 //	m.Bridge.Commands.(*commands.Processor).AddHandlers(connector.BridgeCommands(...)...)
-func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
+func BridgeCommands() []*commands.FullHandler {
 	cmds := []*commands.FullHandler{
 		cmdStartChat,
 		cmdResolveIdentifierRedirect,
@@ -73,30 +84,10 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 		cmdRestoreChat,
 		cmdRestoreDebug,
 		cmdMsgDebug,
+		cmdSyncStatus,
+		cmdSyncSpace,
 		cmdContacts,
 		cmdClearIdentityCache,
-	}
-	if !disableFaceTime {
-		cmds = append(cmds,
-			cmdFaceTime,
-			cmdFaceTimeSend,
-			cmdFaceTimeClear,
-			cmdFaceTimeInvalidatePeer,
-			cmdFaceTimeRotateIdentity,
-			cmdFaceTimeState,
-			cmdFaceTimeSessionLink,
-			cmdFaceTimeUseLink,
-			cmdFaceTimeDeleteLink,
-			cmdFaceTimeLetMeIn,
-			cmdFaceTimeLetMeInApprove,
-			cmdFaceTimeLetMeInDeny,
-			cmdFaceTimeCreateSession,
-			cmdFaceTimeRing,
-			cmdFaceTimeAddMembers,
-			cmdFaceTimeRemoveMembers,
-		)
-	}
-	cmds = append(cmds,
 		cmdSetPowerLevel,
 		cmdSharedAlbums,
 		cmdSharedSubscribe,
@@ -114,7 +105,7 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 		cmdStatuskitClearInterest,
 		cmdStatuskitInviteToChannel,
 		cmdStatuskitClearLatch,
-	)
+	}
 	return cmds
 }
 
@@ -125,7 +116,6 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 // identity bundle so the bridge isn't left cache-wiped/unregistered. Use when
 // the bridge's identity has gone stale or smeared — e.g. peers can't resolve a
 // clean identity (calls ring a UUID / don't connect, inbound routing is wrong).
-// Not FaceTime-specific; stays available even with disable_facetime set.
 var cmdClearIdentityCache = &commands.FullHandler{
 	Name: "clear-identity-cache",
 	Func: fnClearIdentityCache,

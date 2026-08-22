@@ -1,18 +1,9 @@
 // corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Tulir Asokan, Ludvig Rhodin
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package main
 
@@ -22,7 +13,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/beeper/bridge-manager/api/beeperapi"
 
@@ -57,11 +50,10 @@ var m = mxmain.BridgeMain{
 func init() {
 	m.PostInit = func() {
 		proc := m.Bridge.Commands.(*commands.Processor)
-		conn, _ := m.Connector.(*connector.IMConnector)
-		disableFT := conn != nil && conn.Config.DisableFaceTime
-		for _, h := range connector.BridgeCommands(disableFT) {
+		for _, h := range connector.BridgeCommands() {
 			proc.AddHandler(h)
 		}
+		raiseMatrixHTTPTimeout()
 	}
 }
 
@@ -109,7 +101,7 @@ func main() {
 			cli.RunAllBridges()
 		case "setup", "setup-beeper", "start", "stop", "restart",
 			"status", "logs", "bbctl", "reset", "uninstall",
-			"install-service", "uninstall-service":
+			"install-service", "uninstall-service", "sync-status":
 			// Host-side management CLI (the familiar ops, now via subcommands
 			// instead of a Makefile). Docker-aware; see pkg/cli.
 			cli.RunManagement(os.Args[1], os.Args[2:])
@@ -155,6 +147,7 @@ func main() {
 			os.Args = append(os.Args[:1], os.Args[2:]...)
 			m.PreInit()
 			ensureSecureDeleteDSN(&m)
+			ensureSQLiteWriteSerialization(&m)
 			repairPermissions(&m)
 			migrateDatabaseOwner(&m)
 			m.Init()
@@ -213,6 +206,7 @@ func main() {
 	// repair broken permissions before validateConfig() runs in Init().
 	m.PreInit()
 	ensureSecureDeleteDSN(&m)
+	ensureSQLiteWriteSerialization(&m)
 	repairPermissions(&m)
 	migrateDatabaseOwner(&m)
 	m.Init()
@@ -220,6 +214,25 @@ func main() {
 	exitCode := m.WaitForInterrupt()
 	m.Stop()
 	os.Exit(exitCode)
+}
+
+// isSQLiteDatabaseType reports whether a bridgeconfig database.type names a
+// SQLite-backed engine, so the SQLite-specific fixups below can share one
+// definition instead of each spelling their own prefix test.
+//
+// "litestream" has to be in it: mxmain's initDB checks
+// `dbConfig.Type == "sqlite3-fk-wal" || dbConfig.Type == "litestream"` when it
+// warns about _txlock, and dbutil's ParseDialect maps both prefixes to the
+// SQLite dialect. The litestream driver is the same mattn/go-sqlite3 driver
+// registered with a different ConnectHook (persistent WAL, autocheckpoint off),
+// so it takes the same DSN params and has the same one-writer-per-file
+// constraint. Testing only for "sqlite" left a litestream config running with
+// the upstream max_open_conns: 5 and no _secure_delete — precisely the
+// "database is locked" backfill stranding the clamp below exists to prevent.
+// The install scripts only ever write sqlite3-fk-wal, so that gap could only
+// ever be reached from a hand-edited config.
+func isSQLiteDatabaseType(dbType string) bool {
+	return strings.HasPrefix(dbType, "sqlite") || strings.HasPrefix(dbType, "litestream")
 }
 
 // ensureSecureDeleteDSN forces SQLite's secure_delete pragma on for every
@@ -234,7 +247,7 @@ func main() {
 // In-memory only (not persisted to config.yaml). No-op for non-SQLite
 // backends and when the operator already set the param.
 func ensureSecureDeleteDSN(br *mxmain.BridgeMain) {
-	if br.Config == nil || !strings.HasPrefix(br.Config.Database.Type, "sqlite") {
+	if br.Config == nil || !isSQLiteDatabaseType(br.Config.Database.Type) {
 		return
 	}
 	uri := br.Config.Database.URI
@@ -246,6 +259,110 @@ func ensureSecureDeleteDSN(br *mxmain.BridgeMain) {
 		sep = "&"
 	}
 	br.Config.Database.URI = uri + sep + "_secure_delete=on"
+}
+
+// raiseMatrixHTTPTimeout lifts the appservice HTTP client's timeout above
+// mautrix's 180s default.
+//
+// createRoom carries every initial state event plus the invites, and on a
+// self-hosted Synapse under mass backfill it can take longer than 180s to
+// return even though the server does finish creating the room. The client gives
+// up, portal creation is retried, and the retry makes a SECOND room — the first
+// one orphaned. (Beeper's BeeperLocalRoomID idempotency hint that would prevent
+// this is a hungryserv extension; Synapse ignores it.)
+//
+// Mutating .Timeout in place rather than replacing the client keeps the cookie
+// jar and the unix-socket transport MakeAppService may have configured. Ghost
+// intents share this client — appservice.NewMautrixClient passes as.HTTPClient
+// straight through — so they get the same headroom. Double-puppet clients do
+// NOT: NewExternalMautrixClient builds its own 180s client when a separate
+// homeserver URL is set. That is fine here, since those only send individual
+// events, never a createRoom.
+//
+// AS is populated before PostInit runs (NewBridge -> Matrix.Init ->
+// MakeAppService), so the hook always has a client to adjust; it warns and
+// no-ops rather than panicking if that ever stops being true.
+const defaultMatrixHTTPTimeout = 10 * time.Minute
+
+func raiseMatrixHTTPTimeout() {
+	timeout := defaultMatrixHTTPTimeout
+	if raw := os.Getenv("CORTEN_MATRIX_HTTP_TIMEOUT"); raw != "" {
+		if secs, err := strconv.Atoi(raw); err == nil && secs > 0 {
+			timeout = time.Duration(secs) * time.Second
+		} else {
+			m.Log.Warn().Str("value", raw).
+				Msg("Ignoring invalid CORTEN_MATRIX_HTTP_TIMEOUT (want positive integer seconds)")
+		}
+	}
+	if m.Matrix == nil || m.Matrix.AS == nil || m.Matrix.AS.HTTPClient == nil {
+		m.Log.Warn().Msg("Could not raise Matrix HTTP client timeout: appservice client not available")
+		return
+	}
+	m.Matrix.AS.HTTPClient.Timeout = timeout
+	m.Log.Info().Stringer("timeout", timeout).
+		Msg("Raised Matrix appservice HTTP client timeout (stops createRoom timeouts from orphaning rooms under load)")
+}
+
+// ensureSQLiteWriteSerialization stops concurrent writers from colliding on a
+// SQLite database file.
+//
+// The upstream config template ships `max_open_conns: 5`, which is right for
+// Postgres and wrong for SQLite: five pooled connections mean five goroutines
+// trying to write one file. During the first backfill — CloudKit sync writing
+// cloud_message/cloud_chat, the backfill queue writing message rows, and the
+// crypto store writing group sessions, all at once — they collide, SQLite
+// returns SQLITE_BUSY past the 5s busy_timeout, and the caller sees
+// "database is locked".
+//
+// That is not a cosmetic failure. A locked write inside a backfill batch send
+// means bridgev2 never runs the batch's CompleteCallback, so the portal's
+// forward backfill is never marked done and its history never lands. Serializing
+// at the pool is the cheap, total fix: SQLite allows exactly one writer anyway,
+// so queuing in Go costs nothing that SQLite wasn't already going to serialize.
+//
+// In-memory only (not persisted to config.yaml), and a no-op for non-SQLite
+// backends (see isSQLiteDatabaseType — litestream counts). An explicit
+// `max_open_conns: 1` is left alone silently; anything higher is clamped with a
+// log line, because the operator asked for something we're overriding and
+// should be able to see that.
+func ensureSQLiteWriteSerialization(br *mxmain.BridgeMain) {
+	if br.Config == nil || !isSQLiteDatabaseType(br.Config.Database.Type) {
+		return
+	}
+	if br.Config.Database.MaxOpenConns > 1 {
+		fmt.Fprintf(os.Stderr,
+			"[database] clamping max_open_conns %d -> 1 for SQLite: concurrent writers on one "+
+				"file produce \"database is locked\" during backfill, which silently strands a "+
+				"portal's history. Use PostgreSQL if you need real write concurrency.\n",
+			br.Config.Database.MaxOpenConns)
+	}
+	br.Config.Database.MaxOpenConns = 1
+	if br.Config.Database.MaxIdleConns > 1 || br.Config.Database.MaxIdleConns == 0 {
+		br.Config.Database.MaxIdleConns = 1
+	}
+
+	// Ask for a longer busy handler than the driver's default, for the writers
+	// this pool does NOT own (a CLI subcommand against the same data dir).
+	//
+	// Honesty note: as of go.mau.fi/util v0.9.9 this does NOT take effect.
+	// mattn/go-sqlite3 applies DSN pragmas inside Open and calls the driver's
+	// ConnectHook afterwards, and dbutil registers both `sqlite3-fk-wal` and
+	// `litestream` with a hook that ends in `PRAGMA busy_timeout = 5000` — so
+	// the hook overwrites this value on every connection. Measured: opening
+	// either driver with `_busy_timeout=30000` reports busy_timeout=5000, while
+	// `_secure_delete=on` (which no hook touches) does survive. The param is
+	// left in place because it is harmless, is what an operator reading the DSN
+	// would expect, and starts working the day dbutil stops hard-setting the
+	// pragma. The real protection against lock contention is the clamp above,
+	// not this line — do not treat a 30s busy window as guaranteed.
+	uri := br.Config.Database.URI
+	if uri != "" && !strings.Contains(uri, "_busy_timeout") {
+		sep := "?"
+		if strings.Contains(uri, "?") {
+			sep = "&"
+		}
+		br.Config.Database.URI = uri + sep + "_busy_timeout=30000"
+	}
 }
 
 // resolveLoginConfig makes a bare `corten-matrix login` find the bridge config

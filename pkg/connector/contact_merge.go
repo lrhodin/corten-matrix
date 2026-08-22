@@ -1,10 +1,9 @@
 // corten-matrix - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package connector
 
@@ -212,7 +211,29 @@ func (c *IMClient) countNonSelfMembers(participants []string, sender *string) in
 // getContactChatGUIDs returns all possible chat.db GUIDs for a DM portal,
 // including GUIDs for alternate phone numbers/emails belonging to the same contact.
 func (c *IMClient) getContactChatGUIDs(portalID string) []string {
-	guids := portalIDToChatGUIDs(portalID)
+	// Deduplicated, because the caller queries chat.db once per GUID and
+	// concatenates the results with no dedup of its own. Two portal IDs that
+	// are different strings can still produce the same chat GUID —
+	// "tel:+15551234567(smsft)" and "tel:+15551234567" both reduce to
+	// "any;-;+15551234567" once stripSmsSuffix runs — and the altID != portalID
+	// guard below only catches exact string equality. When that happened the
+	// same chat was read twice, every message got two BackfillMessages with
+	// the same ID, and the Matrix batch send rejected the whole batch with
+	// "Event #N has same ID as previous event". A rejected batch means the
+	// forward backfill's CompleteCallback never runs, which strands the
+	// portal's history — so a duplicate here is not a wasted query, it is a
+	// conversation that never backfills.
+	seen := make(map[string]bool)
+	var guids []string
+	add := func(ids []string) {
+		for _, id := range ids {
+			if id != "" && !seen[id] {
+				seen[id] = true
+				guids = append(guids, id)
+			}
+		}
+	}
+	add(portalIDToChatGUIDs(portalID))
 
 	contact := c.lookupContact(portalID)
 	if contact == nil {
@@ -223,7 +244,7 @@ func (c *IMClient) getContactChatGUIDs(portalID string) []string {
 		if altID == portalID {
 			continue
 		}
-		guids = append(guids, portalIDToChatGUIDs(altID)...)
+		add(portalIDToChatGUIDs(altID))
 	}
 
 	return guids
