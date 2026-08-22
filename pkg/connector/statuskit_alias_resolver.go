@@ -451,8 +451,17 @@ func (c *IMClient) prewarmAliasPortalCache(ctx context.Context, log zerolog.Logg
 		log.Warn().Err(err).Msg("StatusKit alias-resolver: pre-warm ghost scan failed")
 		return
 	}
-	defer rows.Close()
-	primed := 0
+	// Drain the cursor completely before resolving anything. An open *sql.Rows
+	// holds one pooled connection for as long as it lives, and the resolve step
+	// below queries the same database (resolveSiblingHandleLive →
+	// findPortalByID → GetExistingPortalByKey) and writes to it
+	// (rememberAliasPortal → KV.Set). SQLite runs with max_open_conns=1, so
+	// doing that inside the loop asks the pool for a second connection that can
+	// never be granted: the goroutine blocks forever on a context.Background()
+	// that never times out, while holding both the process's only connection
+	// and — via GetExistingPortalByKey — the bridge-wide cache lock. Everything
+	// else then stops, with the bridge still reporting Connected.
+	ghostIDs := make([]string, 0, 256)
 	for rows.Next() {
 		var ghostID string
 		if err := rows.Scan(&ghostID); err != nil {
@@ -461,6 +470,13 @@ func (c *IMClient) prewarmAliasPortalCache(ctx context.Context, log zerolog.Logg
 		if !strings.HasPrefix(ghostID, "mailto:") && !strings.HasPrefix(ghostID, "tel:") {
 			continue
 		}
+		ghostIDs = append(ghostIDs, ghostID)
+	}
+	rowsErr := rows.Err()
+	rows.Close()
+
+	primed := 0
+	for _, ghostID := range ghostIDs {
 		if _, ok := c.statusKitPortalCache.Load(ghostID); ok {
 			continue
 		}
@@ -469,7 +485,7 @@ func (c *IMClient) prewarmAliasPortalCache(ctx context.Context, log zerolog.Logg
 			primed++
 		}
 	}
-	if err := rows.Err(); err != nil {
+	if err := rowsErr; err != nil {
 		log.Warn().Err(err).Msg("StatusKit alias-resolver: pre-warm row iteration error")
 	}
 	log.Info().Int("primed", primed).Msg("StatusKit alias-resolver: pre-warm complete")
