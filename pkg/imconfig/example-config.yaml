@@ -49,16 +49,20 @@ url_previews_in_backfill: true
 # Available handles are logged on startup.
 preferred_handle: ""
 
-# Override the display name pre-filled on the FaceTime web join page (the
-# `#n=…` fragment in the ring-notice link). If empty, the bridge reads
-# "First Last" from the Apple Account SPD; if that's also blank it falls
-# back to the bare iMessage handle (e.g. "+15551234567").
-facetime_display_name: ""
+# Bridge chats iCloud filed under "Unknown Senders" instead of skipping them.
+#
+# That filtering comes from your iCloud settings, not from the bridge, and the
+# bucket catches real conversation too — delivery notifications, 2FA codes, a
+# business replying to you. Off by default so existing installs don't suddenly
+# grow a pile of new rooms.
+bridge_filtered_chats: false
 
-# Disable bridge FaceTime integration. When true, !facetime* commands aren't
-# registered and inbound ring / missed / answered-elsewhere / peer-invite
-# notices are suppressed. Intended for users with their own Apple device who
-# answer FaceTime natively — the bridge wrapper adds nothing in that case.
+# Don't post notices when someone FaceTimes you.
+#
+# FaceTime is notify-only: the bridge stays registered for FaceTime either way,
+# and all it does with a call is post a notice — incoming or missed. You answer
+# on an Apple device; calls can't be placed or answered from Matrix. Set this to
+# true if you don't want those notices.
 disable_facetime: false
 
 # Publish "available" to StatusKit once after startup. Peer iOS reciprocates

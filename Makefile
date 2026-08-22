@@ -11,12 +11,18 @@ RUST_SRC    := $(shell find pkg/rustpushgo/src -name '*.rs' -o -name '*.m' -o -n
                $(shell find nac-validation/src -name '*.rs' -o -name '*.m' -o -name '*.h' 2>/dev/null) \
                nac-validation/build.rs
 RUSTPUSH_DIR := third_party/rustpush-upstream
+# apple-private-apis (icloud-auth, omnisette, clearadi) is a rustpush submodule.
+# Upstream moved it from <root>/apple-private-apis to <root>/third_party/
+# apple-private-apis at 0e0f13c; the submodule commit itself is unchanged. Keep
+# the location in one variable so a future move is a one-line edit rather than a
+# hunt through the patch block — where a stale path silently no-ops every guard.
+APA_DIR      := $(RUSTPUSH_DIR)/third_party/apple-private-apis
 # Pinned OpenBubbles/rustpush commit. Edit third_party/rustpush-upstream.sha to
 # bump, then test locally before committing. The Makefile reads the SHA on build
 # and checks out that exact commit — no auto-bump, no branch drift.
 RUSTPUSH_PIN_FILE := third_party/rustpush-upstream.sha
 RUSTPUSH_PIN      := $(shell cat $(RUSTPUSH_PIN_FILE) 2>/dev/null)
-RUSTPUSH_SRC:= $(shell find $(RUSTPUSH_DIR)/src $(RUSTPUSH_DIR)/apple-private-apis $(RUSTPUSH_DIR)/open-absinthe/src -name '*.rs' -o -name '*.s' 2>/dev/null) $(wildcard $(RUSTPUSH_DIR)/open-absinthe/build.rs)
+RUSTPUSH_SRC:= $(shell find $(RUSTPUSH_DIR)/src $(APA_DIR) $(RUSTPUSH_DIR)/open-absinthe/src -name '*.rs' -o -name '*.s' 2>/dev/null) $(wildcard $(RUSTPUSH_DIR)/open-absinthe/build.rs)
 CARGO_FILES := $(shell find . -name 'Cargo.toml' -o -name 'Cargo.lock' 2>/dev/null | grep -v target)
 GO_SRC      := $(shell find pkg/ cmd/ -name '*.go' 2>/dev/null)
 
@@ -111,6 +117,45 @@ FAIRPLAY_CERTS := 4056631661436364584235346952193 \
                   4056631661436364584235346952201 \
                   4056631661436364584235346952208
 
+# ---------------------------------------------------------------------------
+# rustpush source patches — every one of them PROVEN to have landed.
+# ---------------------------------------------------------------------------
+# Each patch below goes through rp_patch, which mirrors build.sh's helper of the
+# same name (same labels, same perl expressions, same verify regexes — the two
+# patch sets are kept identical on purpose; diff them when you touch either).
+#
+#   rp_patch <label> <file> <perl-expr> <verify-ere>
+#
+# It verifies the DESIRED END STATE, never "did perl fire", so:
+#   target file missing    -> FAIL  (upstream moved something; fix the path)
+#   verify already matches -> skip  (upstream fixed it themselves; not an error)
+#   still no match after   -> FAIL  (upstream reworded the anchor; fix the expr)
+#
+# The old form was `if grep -q <pre-patch-anchor>; then sed -i.bak ...; fi`:
+# a moved file or a reworded anchor was not an error, it was a silent skip. When
+# upstream relocated apple-private-apis under third_party/ that turned four
+# patches into no-ops with no output at all. Anything that does not land now
+# stops the build and names the patch.
+RP_PATCH = rp_patch() { \
+	  rp_label="$$1"; rp_file="$$2"; rp_expr="$$3"; rp_verify="$$4"; \
+	  if [ ! -f "$$rp_file" ]; then \
+	    echo "error: rustpush patch '$$rp_label': target file missing: $$rp_file (did upstream move it?)" >&2; \
+	    return 1; \
+	  fi; \
+	  if grep -qE "$$rp_verify" "$$rp_file"; then \
+	    echo "  patch $$rp_label (already satisfied upstream)"; \
+	    return 0; \
+	  fi; \
+	  perl -i -pe "$$rp_expr" "$$rp_file" \
+	    || { echo "error: rustpush patch '$$rp_label': perl failed on $$rp_file" >&2; return 1; }; \
+	  if ! grep -qE "$$rp_verify" "$$rp_file"; then \
+	    echo "error: rustpush patch '$$rp_label' did not apply to $$rp_file — the anchor no longer matches upstream" >&2; \
+	    return 1; \
+	  fi; \
+	  echo "  patch $$rp_label"; \
+	}; \
+	[ "$(RUSTPUSH_DIR)" = "third_party/rustpush-upstream" ] || exit 0;
+
 .PHONY: ensure-rustpush-source
 
 # Prepare rustpush sources the same way upstream CI does: checkout with
@@ -137,7 +182,7 @@ ensure-rustpush-source:
 			git -C third_party/rustpush-upstream remote set-url origin $(UPSTREAM_REPO); \
 			echo "Discarding any local mods to third_party/rustpush-upstream before checkout..."; \
 			git -C third_party/rustpush-upstream reset --hard HEAD || exit 1; \
-			git -C third_party/rustpush-upstream clean -fd || exit 1; \
+			git -C third_party/rustpush-upstream clean -ffd || exit 1; \
 			git -C third_party/rustpush-upstream fetch --all --tags --prune || exit 1; \
 			git -C third_party/rustpush-upstream checkout $(RUSTPUSH_PIN) || { echo "error: failed to checkout pinned SHA $(RUSTPUSH_PIN)" >&2; exit 1; }; \
 			git -C third_party/rustpush-upstream submodule sync --recursive || exit 1; \
@@ -160,54 +205,58 @@ ensure-rustpush-source:
 				cp -Rp rustpush/open-absinthe third_party/rustpush-upstream/open-absinthe; \
 			fi; \
 		fi; \
-		if [ -f $(RUSTPUSH_DIR)/apple-private-apis/omnisette/Cargo.toml ] && ! grep -q 'prefer-aoskit' $(RUSTPUSH_DIR)/apple-private-apis/omnisette/Cargo.toml 2>/dev/null; then \
-			echo "Adding no-op prefer-* anisette features to upstream omnisette (the rustpushgo anisette-aoskit/anisette-remote-v3 features reference omnisette/prefer-* features that upstream omnisette doesn't define; cargo validates the whole [features] table even though this build never selects them, so define them here as harmless no-ops)..."; \
-			perl -i -pe 's/^(remote-clearadi = .*)$$/$$1\nprefer-aoskit = []\nprefer-remote-anisette-v3 = []/' $(RUSTPUSH_DIR)/apple-private-apis/omnisette/Cargo.toml; \
-		fi; \
-		if grep -q '^mod activation;' $(RUSTPUSH_DIR)/src/lib.rs 2>/dev/null; then \
-			echo "Making rustpush activation module public (used by OSConfig overlays)..."; \
-			sed -i.bak 's/^mod activation;/pub mod activation;/' $(RUSTPUSH_DIR)/src/lib.rs && rm -f $(RUSTPUSH_DIR)/src/lib.rs.bak; \
-		fi; \
-		if grep -q '^mod ids;' $(RUSTPUSH_DIR)/src/lib.rs 2>/dev/null; then \
-			echo "Making rustpush ids module public (needed by FT RespondedElsewhere overlay)..."; \
-			sed -i.bak 's/^mod ids;/pub mod ids;/' $(RUSTPUSH_DIR)/src/lib.rs && rm -f $(RUSTPUSH_DIR)/src/lib.rs.bak; \
-		fi; \
-		if grep -q '^    token: String,$$' $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs 2>/dev/null; then \
-			echo "Making FetchedToken.token pub (needed to replay persisted PET on session restore)..."; \
-			sed -i.bak 's/^    token: String,$$/    pub token: String,/' $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs && rm -f $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs.bak; \
-		fi; \
-		if grep -q '^    expiration: SystemTime,$$' $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs 2>/dev/null; then \
-			echo "Making FetchedToken.expiration pub..."; \
-			sed -i.bak 's/^    expiration: SystemTime,$$/    pub expiration: SystemTime,/' $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs && rm -f $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs.bak; \
-		fi; \
-		if grep -q '^pub use client::{AppleAccount, LoginState,' $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/lib.rs 2>/dev/null; then \
-			echo "Re-exporting FetchedToken from icloud_auth crate root..."; \
-			sed -i.bak 's/^pub use client::{AppleAccount, LoginState,/pub use client::{AppleAccount, FetchedToken, LoginState,/' $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/lib.rs && rm -f $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/lib.rs.bak; \
-		fi; \
-		if grep -q '^            for excluded in &trust.excludeds {$$' $(RUSTPUSH_DIR)/src/icloud/keychain.rs 2>/dev/null && \
-		   ! grep -q 'Ignoring exclusion of ourselves' $(RUSTPUSH_DIR)/src/icloud/keychain.rs 2>/dev/null; then \
-			echo "Patching keychain.rs to ignore self-exclusion in fast_forward_trust (Clique self-eviction fix; ports 9f29ff1)..."; \
-			KEYCHAIN_REPL=$$(printf '            let my_id = \\&state.user_identity.as_ref().unwrap().identifier;\\\n&\\\n                if excluded == my_id {\\\n                    warn!(\\\n                        "Ignoring exclusion of ourselves ({}) from peer {}",\\\n                        excluded,\\\n                        peer.0.hash.as_ref().unwrap()\\\n                    );\\\n                    continue;\\\n                }') && \
-			sed -i.bak "s|^            for excluded in \&trust\.excludeds {\$$|$${KEYCHAIN_REPL}|" $(RUSTPUSH_DIR)/src/icloud/keychain.rs && rm -f $(RUSTPUSH_DIR)/src/icloud/keychain.rs.bak; \
-		fi; \
-		if grep -q '^    pub passcode_generation: u32,$$' $(RUSTPUSH_DIR)/src/icloud/keychain.rs 2>/dev/null; then \
-			echo "Patching keychain.rs to default passcode_generation when the escrow record omits it (deserialize compat; ports OpenBubbles/rustpush#23)..."; \
-			sed -i.bak 's|^    pub passcode_generation: u32,$$|    #[serde(default)] pub passcode_generation: u32,|' $(RUSTPUSH_DIR)/src/icloud/keychain.rs && rm -f $(RUSTPUSH_DIR)/src/icloud/keychain.rs.bak; \
-		fi; \
-		if grep -q '^    let mut request = SignedRequest::new("id-register", Method::POST)$$' $(RUSTPUSH_DIR)/src/ids/user.rs 2>/dev/null && \
-		   ! grep -q 'RUSTPUSH_LOG_REGISTER_BODY' $(RUSTPUSH_DIR)/src/ids/user.rs 2>/dev/null; then \
-			echo "Patching user.rs to add env-gated REGISTER body XML dump (StatusKit reliability diagnostic; ports d77b1ac4)..."; \
-			sed -i.bak 's|^    let mut request = SignedRequest::new("id-register", Method::POST)$$|    if std::env::var("RUSTPUSH_LOG_REGISTER_BODY").is_ok() { info!("REGISTER body XML: {}", plist_to_string(\&body).unwrap_or_default()); } let mut request = SignedRequest::new("id-register", Method::POST)|' $(RUSTPUSH_DIR)/src/ids/user.rs && rm -f $(RUSTPUSH_DIR)/src/ids/user.rs.bak; \
-		fi; \
-		if grep -q 'panic!("No saved channel for identifier!")' $(RUSTPUSH_DIR)/src/statuskit.rs 2>/dev/null; then \
-			echo "Softening statuskit.rs:119 panic to warn+default APSChannel (StatusKit reliability)..."; \
-			sed -i.bak 's|            panic!("No saved channel for identifier!")$$|            warn!("StatusKit: no saved channel for identifier — using last_msg_ns=0 (will replay)"); return APSChannel { identifier: channel.clone(), last_msg_ns: 0, subscribe: join };|' $(RUSTPUSH_DIR)/src/statuskit.rs && rm -f $(RUSTPUSH_DIR)/src/statuskit.rs.bak; \
-		fi; \
-		if grep -q 'else { panic!("Channel not found!") };' $(RUSTPUSH_DIR)/src/statuskit.rs 2>/dev/null; then \
-			echo "Softening statuskit.rs:736 panic to warn+Ok(None) (StatusKit reliability — presence-before-keysharing race)..."; \
-			sed -i.bak 's|let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else { panic!("Channel not found!") };|let Some(referenced_channel) = state.keys.get_mut(\&base64_encode(\&channel.id)) else { warn!("StatusKit: presence msg arrived before keysharing for channel={} — dropping", encode_hex(\&channel.id)); return Ok(None); };|' $(RUSTPUSH_DIR)/src/statuskit.rs && rm -f $(RUSTPUSH_DIR)/src/statuskit.rs.bak; \
-		fi; \
 	fi
+# The rustpushgo anisette-aoskit / anisette-remote-v3 features reference
+# omnisette/prefer-* features that upstream omnisette doesn't define. cargo
+# validates the whole [features] table even though this build never selects
+# them, so define them here as harmless no-ops.
+	@$(RP_PATCH) rp_patch "omnisette prefer-* no-op features" $(APA_DIR)/omnisette/Cargo.toml \
+	  's/^(remote-clearadi = .*)$$/$$1\nprefer-aoskit = []\nprefer-remote-anisette-v3 = []/' \
+	  '^prefer-aoskit'
+# Upstream gates the proto decode on msgType 1..=2 and throws the payload away
+# for anything else. Real user messages arrive from CloudKit as msgType 0 (see
+# sync_controller.go:3369) — without this they decode empty, land with
+# has_body=0, and ensureSchema's cleanup DELETEs them: silent history loss.
+	@$(RP_PATCH) rp_patch "decode msgType=0 as a message" $(RUSTPUSH_DIR)/src/imessage/cloud_messages.rs \
+	  's/^                1\.\.=2 => CloudMessageType::Message \{/                0..=2 => CloudMessageType::Message {/' \
+	  '^                0\.\.=2 => CloudMessageType::Message \{'
+# ids_guard + the IDS query call sites use rustpush::ids::*.
+	@$(RP_PATCH) rp_patch "pub mod ids" $(RUSTPUSH_DIR)/src/lib.rs \
+	  's/^mod ids;$$/pub mod ids;/' \
+	  '^pub mod ids;'
+# FetchedToken's fields are private upstream; we construct one to replay the
+# persisted PET on session restore (breaks the daily-2FA loop).
+	@$(RP_PATCH) rp_patch "FetchedToken.token pub" $(APA_DIR)/icloud-auth/src/client.rs \
+	  's/^    token: String,$$/    pub token: String,/' \
+	  '^    pub token: String,'
+	@$(RP_PATCH) rp_patch "FetchedToken.expiration pub" $(APA_DIR)/icloud-auth/src/client.rs \
+	  's/^    expiration: SystemTime,$$/    pub expiration: SystemTime,/' \
+	  '^    pub expiration: SystemTime,'
+	@$(RP_PATCH) rp_patch "FetchedToken re-export" $(APA_DIR)/icloud-auth/src/lib.rs \
+	  's/^pub use client::\{AppleAccount, LoginState,/pub use client::{AppleAccount, FetchedToken, LoginState,/' \
+	  'pub use client::\{AppleAccount, FetchedToken,'
+# Ignore self-exclusion in fast_forward_trust (Clique self-eviction fix; ports 9f29ff1).
+	@$(RP_PATCH) rp_patch "keychain self-exclusion" $(RUSTPUSH_DIR)/src/icloud/keychain.rs \
+	  's/^            for excluded in &trust\.excludeds \{$$/            let my_id = &state.user_identity.as_ref().unwrap().identifier;\n            for excluded in &trust.excludeds {\n                if excluded == my_id {\n                    warn!(\n                        "Ignoring exclusion of ourselves ({}) from peer {}",\n                        excluded,\n                        peer.0.hash.as_ref().unwrap()\n                    );\n                    continue;\n                }/' \
+	  'Ignoring exclusion of ourselves'
+# Default passcode_generation when the escrow record omits it (deserialize
+# compat; ports OpenBubbles/rustpush#23).
+	@$(RP_PATCH) rp_patch "keychain passcode_generation default" $(RUSTPUSH_DIR)/src/icloud/keychain.rs \
+	  's/^    pub passcode_generation: u32,$$/    #[serde(default)] pub passcode_generation: u32,/' \
+	  '#\[serde\(default\)\] pub passcode_generation: u32,'
+# Env-gated REGISTER body XML dump (StatusKit reliability diagnostic; ports
+# d77b1ac4). Off unless RUSTPUSH_LOG_REGISTER_BODY is set.
+	@$(RP_PATCH) rp_patch "REGISTER body XML dump" $(RUSTPUSH_DIR)/src/ids/user.rs \
+	  's/^    let mut request = SignedRequest::new\("id-register", Method::POST\)$$/    if std::env::var("RUSTPUSH_LOG_REGISTER_BODY").is_ok() { info!("REGISTER body XML: {}", plist_to_string(&body).unwrap_or_default()); } let mut request = SignedRequest::new("id-register", Method::POST)/' \
+	  'RUSTPUSH_LOG_REGISTER_BODY'
+# Soften statuskit.rs:119 panic to warn + default APSChannel (StatusKit reliability).
+	@$(RP_PATCH) rp_patch "statuskit no-saved-channel panic" $(RUSTPUSH_DIR)/src/statuskit.rs \
+	  's/            panic!\("No saved channel for identifier!"\)$$/            warn!("StatusKit: no saved channel for identifier — using last_msg_ns=0 (will replay)"); return APSChannel { identifier: channel.clone(), last_msg_ns: 0, subscribe: join };/' \
+	  'using last_msg_ns=0 \(will replay\)'
+# Soften statuskit.rs:736 panic to warn + Ok(None) (presence-before-keysharing race).
+	@$(RP_PATCH) rp_patch "statuskit channel-not-found panic" $(RUSTPUSH_DIR)/src/statuskit.rs \
+	  's/let Some\(referenced_channel\) = state\.keys\.get_mut\(&base64_encode\(&channel\.id\)\) else \{ panic!\("Channel not found!"\) \};/let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else { warn!("StatusKit: presence msg arrived before keysharing for channel={} — dropping", encode_hex(&channel.id)); return Ok(None); };/' \
+	  'presence msg arrived before keysharing'
 
 # `ensure-rustpush-source` is an order-only prereq (the `|` separator):
 # it runs before the recipe when needed, but its phony "always-dirty"

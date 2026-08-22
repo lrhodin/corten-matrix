@@ -18,7 +18,7 @@ PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
 # ── Back up an existing config before anything rewrites it ────
 # Re-running setup is a supported, routine thing to do, and several blocks
 # below rewrite config values in place on every run: the CloudKit backfill
-# toggle, the transcoding / HEIC / FaceTime / StatusKit prompts, and
+# toggle, the transcoding / HEIC / FaceTime-notice / StatusKit prompts, and
 # preferred_handle. Accepting a default at a prompt writes that default.
 # Nothing else in this script keeps a copy, so a re-run used to be able to
 # take a hand-edited setting with no way back. Take one before the first
@@ -717,46 +717,46 @@ if ! grep -q 'disable_facetime:' "$CONFIG" 2>/dev/null; then
     disable_facetime: false' "$CONFIG"
 fi
 
-# ── Disable FaceTime Bridge (use native Apple FT instead) ────────
+# ── FaceTime call notices (notify-only; answer on your Apple device) ──
 CURRENT_DISABLE_FT=$(grep 'disable_facetime:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*disable_facetime: *//' || true)
 if [ -n "${DISABLE_FACETIME:-}" ]; then
     case "$DISABLE_FACETIME" in
         1|true|TRUE|yes|YES)
             sed -i '' "s/disable_facetime: .*/disable_facetime: true/" "$CONFIG"
-            echo "✓ FaceTime Bridge disabled (DISABLE_FACETIME env)"
+            echo "✓ FaceTime call notices disabled (DISABLE_FACETIME env)"
             ;;
         *)
             sed -i '' "s/disable_facetime: .*/disable_facetime: false/" "$CONFIG"
-            echo "✓ FaceTime Bridge enabled (DISABLE_FACETIME env)"
+            echo "✓ FaceTime call notices enabled (DISABLE_FACETIME env)"
             ;;
     esac
 elif [ -t 0 ]; then
     echo ""
-    echo "FaceTime Bridge:"
-    echo "  If you have an Apple device that already handles FaceTime, the"
-    echo "  bridge's FT wrapper just clutters your chat. Disable it to skip"
-    echo "  !im facetime commands and inbound FT notices."
+    echo "FaceTime call notices:"
+    echo "  When someone FaceTimes you, the bridge can post a notice in the"
+    echo "  chat saying who is calling. That is all it does with FaceTime:"
+    echo "  calls are answered on your Apple device, never from Matrix."
     echo ""
     if [ "$CURRENT_DISABLE_FT" = "true" ]; then
-        read -p "Enable FaceTime Bridge? [y/N]: " EN_FT
+        read -p "Post FaceTime call notices? [y/N]: " EN_FT
         case "$EN_FT" in
             [yY]*)
                 sed -i '' "s/disable_facetime: .*/disable_facetime: false/" "$CONFIG"
-                echo "✓ FaceTime Bridge enabled"
+                echo "✓ FaceTime call notices enabled"
                 ;;
             *)
-                echo "✓ FaceTime Bridge disabled"
+                echo "✓ FaceTime call notices disabled"
                 ;;
         esac
     else
-        read -p "Enable FaceTime Bridge? [Y/n]: " EN_FT
+        read -p "Post FaceTime call notices? [Y/n]: " EN_FT
         case "$EN_FT" in
             [nN]*)
                 sed -i '' "s/disable_facetime: .*/disable_facetime: true/" "$CONFIG"
-                echo "✓ FaceTime Bridge disabled"
+                echo "✓ FaceTime call notices disabled"
                 ;;
             *)
-                echo "✓ FaceTime Bridge enabled"
+                echo "✓ FaceTime call notices enabled"
                 ;;
         esac
     fi
