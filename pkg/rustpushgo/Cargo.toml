@@ -112,7 +112,17 @@ ctr = "0.9.2"
 # vendored: build OpenSSL from source and link it statically into every target.
 # Required for cross-compiling (no system OpenSSL for x86_64-darwin / Linux on an
 # arm64 Mac) and gives users a self-contained Linux binary with no libssl to install.
-openssl = { version = "0.10.56", features = ["vendored"] }
+# Upper-bounded deliberately. openssl 0.10.76 added an assert to
+# Crypter::new that panics when a cipher reports an iv_len and none is
+# supplied. rustpush wraps the iCloud Keychain escrow bottle with
+# Nid::ID_AES128_WRAP and passes iv: None (util.rs:1608), relying on
+# OpenSSL's built-in RFC 3394 default IV — correct, and fine on every
+# version through 0.10.75, but an instant panic on 0.10.81:
+#   "an IV is required for this cipher" -> JoinKeychainCliqueForDevice
+# i.e. login fails at "couldn't open the bottle". 0.10.75 is what shipped
+# in 1.1.2. Raise this bound only after confirming the wrap call site
+# passes an explicit IV.
+openssl = { version = ">=0.10.56, <0.10.76", features = ["vendored"] }
 reqwest = { version = "0.11", features = ["stream", "rustls-tls", "rustls-tls-webpki-roots", "gzip"] }
 # Direct dep on rustls 0.23 so we can install the aws-lc-rs CryptoProvider
 # at startup. Upstream rustpush pulled in rustls 0.23 (transitively, via the
