@@ -103,8 +103,19 @@ func promptMultiline(label string) string {
 // Matrix bot, but reads input from stdin instead of Matrix messages.
 func runInteractiveLogin(br *mxmain.BridgeMain) {
 	// Initialize the bridge (DB, connector, etc.) without starting Matrix.
+	//
+	// This runs the SAME pre-Init fixups as main(), in the same order. They are
+	// easy to forget here because this path skips Start() — but every one of
+	// them has to happen between PreInit (config loaded) and Init (database
+	// opened), and `login` opens the database like any other entry point.
+	// Omitting migrateDatabaseOwner made `corten-matrix login` fail outright on
+	// a database created before the rename ("the database is owned by
+	// megabridge/mautrix-imessage") while the bridge itself started fine.
 	br.PreInit()
+	ensureSecureDeleteDSN(br)
+	ensureSQLiteWriteSerialization(br)
 	repairPermissions(br)
+	migrateDatabaseOwner(br)
 	br.Init()
 
 	ctx := br.Log.WithContext(context.Background())
