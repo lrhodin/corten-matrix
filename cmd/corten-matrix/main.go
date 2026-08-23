@@ -62,9 +62,6 @@ func init() {
 		for _, h := range connector.BridgeCommands() {
 			proc.AddHandler(h)
 		}
-		// Let the user delete their management room from the client — bridgev2
-		// swallows every event sent in it, so its delete never reaches a handler.
-		connector.RegisterManagementRoomDelete(m.Matrix, m.Bridge)
 		raiseMatrixHTTPTimeout()
 	}
 }
