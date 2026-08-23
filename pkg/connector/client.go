@@ -1500,7 +1500,16 @@ func (c *IMClient) Connect(ctx context.Context) {
 	// Run in a goroutine to avoid blocking Connect on the homeserver round-trip.
 	go c.ensureBotPushRuleSilenced(ctx)
 
-	go c.maybeSendManagementRoomWelcome(context.Background(), log)
+	go func() {
+		mgmtCtx := context.Background()
+		// Sequential, not a second goroutine: the welcome is the only thing that
+		// creates the room, and it repairs the room it creates. The second call
+		// is the self-heal for installs that were welcomed by an older build —
+		// there the welcome short-circuits on WelcomeSent and never resolves a
+		// room at all. It re-reads the levels and no-ops once they're right.
+		c.maybeSendManagementRoomWelcome(mgmtCtx, log)
+		c.repairManagementRoomPowerLevel(mgmtCtx, c.UserLogin.User.ManagementRoom, log)
+	}()
 
 	// Set up contact source: external CardDAV > local macOS > iCloud CardDAV
 	if c.Main.Config.CardDAV.IsConfigured() {
@@ -1606,6 +1615,12 @@ func (c *IMClient) maybeSendManagementRoomWelcome(ctx context.Context, log zerol
 		log.Warn().Err(err).Msg("Welcome: failed to get management room")
 		return
 	}
+	// Repair before the welcome, not after: in a brand-new room the power-level
+	// event then lands adjacent to the creation events, where clients fold it
+	// into the "created and configured the room" summary, and the intro message
+	// stays the last thing in the timeline.
+	c.repairManagementRoomPowerLevel(ctx, mgmtRoom, log)
+
 	prefix := c.Main.Bridge.Config.CommandPrefix
 	markdown := fmt.Sprintf(managementRoomWelcomeMarkdown, prefix)
 	content := format.RenderMarkdown(markdown, true, false)
@@ -1653,6 +1668,53 @@ You're signed in. This is your **management room** — the bot uses it to delive
 
 Run ` + "`help`" + ` any time for the full command list.
 `
+
+// managementRoomUserPowerLevel is the level the user gets in their own
+// management room: the createRoom creator default, i.e. exactly what they'd
+// have if they had made the room themselves by DMing the bot.
+const managementRoomUserPowerLevel = 100
+
+// repairManagementRoomPowerLevel raises the user to full power in their
+// management room.
+//
+// bridgev2 auto-creates that room as the bot and hands the user power level 50
+// (user.go GetManagementRoom's PowerLevelOverride). 50 is below the createRoom
+// default of 100 for m.room.power_levels, m.room.tombstone and
+// m.room.encryption, so the user is a guest with limited rights in what is
+// nominally their own room and client-side clean-up flows that touch room state
+// fail against it. A management room the user made themselves — by DMing the
+// bot — puts them at 100 for free; this makes the auto-created one match.
+//
+// Runs on every connect, so it also heals rooms created by older builds.
+// Management room only: portal rooms keep the locked-down levels from
+// hardenedPowerLevels, and since the management room is not a portal, the
+// resetEscalatedUsers rubberband never runs against it and can't undo this.
+// Best-effort — every failure is logged and swallowed.
+func (c *IMClient) repairManagementRoomPowerLevel(ctx context.Context, roomID id.RoomID, log zerolog.Logger) {
+	if roomID == "" {
+		return
+	}
+	log = log.With().Str("management_room", string(roomID)).Logger()
+	pl, err := c.Main.Bridge.Matrix.GetPowerLevels(ctx, roomID)
+	if err != nil {
+		log.Warn().Err(err).Msg("Management room: failed to read power levels")
+		return
+	}
+	userMXID := c.UserLogin.User.MXID
+	if pl.GetUserLevel(userMXID) >= managementRoomUserPowerLevel {
+		// Already fine: a user-created room, or one an earlier connect repaired.
+		return
+	}
+	if !pl.EnsureUserLevelAs(c.Main.Bridge.Bot.GetMXID(), userMXID, managementRoomUserPowerLevel) {
+		log.Warn().Msg("Management room: bot cannot raise the user's power level")
+		return
+	}
+	if _, err = c.Main.Bridge.Bot.SendState(ctx, roomID, event.StatePowerLevels, "", &event.Content{Parsed: pl}, time.Time{}); err != nil {
+		log.Warn().Err(err).Msg("Management room: failed to apply repaired power levels")
+		return
+	}
+	log.Info().Int("power_level", managementRoomUserPowerLevel).Msg("Management room: raised the user to full power")
+}
 
 func (c *IMClient) Disconnect() {
 	// bridgev2 serializes its own Disconnect calls (disconnectOnce), but
