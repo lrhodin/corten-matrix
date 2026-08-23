@@ -1500,7 +1500,11 @@ func (c *IMClient) Connect(ctx context.Context) {
 	// Run in a goroutine to avoid blocking Connect on the homeserver round-trip.
 	go c.ensureBotPushRuleSilenced(ctx)
 
-	go c.maybeSendManagementRoomWelcome(context.Background(), log)
+	go func() {
+		mgmtCtx := context.Background()
+		c.maybeSendManagementRoomWelcome(mgmtCtx, log)
+		c.markManagementRoomAsDM(mgmtCtx, c.UserLogin.User.ManagementRoom, log)
+	}()
 
 	// Set up contact source: external CardDAV > local macOS > iCloud CardDAV
 	if c.Main.Config.CardDAV.IsConfigured() {
@@ -1653,6 +1657,55 @@ You're signed in. This is your **management room** — the bot uses it to delive
 
 Run ` + "`help`" + ` any time for the full command list.
 `
+
+// markManagementRoomAsDM writes the management room into the user's m.direct
+// account data so clients render it as a chat with the bridge bot rather than a
+// plain Matrix room.
+//
+// bridgev2 calls MarkAsDM only for DM portals (bridgev2/portal.go:4797).
+// GetManagementRoom never does: it passes IsDirect: true in the createRoom
+// request, but that only sets is_direct on the user's invite membership — it
+// never touches the user's account data, which the bot can't write without the
+// double puppet.
+//
+// So every iMessage DM lands in m.direct and the management room doesn't. The
+// client sees a room with no designated counterparty, hides the bridge bot from
+// the participant list as bridge infrastructure, and gives it the plain-room
+// menu — no "Leave chat", and it reads as a Matrix room the user is alone in
+// rather than a chat with the bot.
+//
+// A management room the user makes themselves by DMing the bot never has this
+// problem: their own client writes m.direct when it creates the room. This makes
+// the auto-created one match.
+//
+// Runs on every connect and MarkAsDM no-ops when the room is already listed, so
+// an existing room is fixed in place — nothing is recreated. MarkAsDM itself is
+// gated on matrix.sync_direct_chat_list, and the whole thing needs double
+// puppeting, the same thing ensureBotPushRuleSilenced relies on.
+func (c *IMClient) markManagementRoomAsDM(ctx context.Context, roomID id.RoomID, log zerolog.Logger) {
+	if roomID == "" {
+		return
+	}
+	dp := c.UserLogin.User.DoublePuppet(ctx)
+	if dp == nil {
+		log.Warn().Stringer("management_room", roomID).
+			Msg("Management room: no double puppet available, can't mark it as a DM")
+		return
+	}
+	marker, ok := dp.(bridgev2.MarkAsDMMatrixAPI)
+	if !ok {
+		log.Warn().Stringer("management_room", roomID).
+			Msg("Management room: double puppet can't mark rooms as DMs")
+		return
+	}
+	if err := marker.MarkAsDM(ctx, roomID, c.Main.Bridge.Bot.GetMXID()); err != nil {
+		log.Warn().Err(err).Stringer("management_room", roomID).
+			Msg("Management room: failed to mark as a DM with the bridge bot")
+		return
+	}
+	log.Info().Stringer("management_room", roomID).
+		Msg("Management room: marked as a DM with the bridge bot")
+}
 
 func (c *IMClient) Disconnect() {
 	// bridgev2 serializes its own Disconnect calls (disconnectOnce), but
