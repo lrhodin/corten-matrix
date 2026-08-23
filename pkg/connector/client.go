@@ -1654,6 +1654,24 @@ You're signed in. This is your **management room** — the bot uses it to delive
 Run ` + "`help`" + ` any time for the full command list.
 `
 
+// existingManagementRoom returns the management room the user already has, or
+// "" if they don't have one. Unlike User.GetManagementRoom it never creates one.
+//
+// Bot notices must use this. GetManagementRoom creates a room whenever the
+// pointer is empty, and bridgev2 clears that pointer the moment the user leaves
+// (bridgev2/queue.go:128). So a user who leaves their management room gets a
+// brand-new one built and — on Beeper, where the create carries
+// BeeperInitialMembers/BeeperAutoJoinInvites — is silently re-joined to it by
+// the next notice that fires. Same name, same avatar, same topic, new room ID.
+// From the user's side the room they just left is simply still there and cannot
+// be escaped.
+//
+// Leaving is never power-gated in Matrix; the leave was always working. What
+// was broken is that the bridge immediately rebuilt what the user left.
+func (c *IMClient) existingManagementRoom() id.RoomID {
+	return c.UserLogin.User.ManagementRoom
+}
+
 func (c *IMClient) Disconnect() {
 	// bridgev2 serializes its own Disconnect calls (disconnectOnce), but
 	// LogoutRemote invokes this method directly, so two teardowns can run
@@ -4158,9 +4176,9 @@ func (c *IMClient) postFaceTimeNotice(log zerolog.Logger, msg rustpushgo.Wrapped
 		}
 	}
 
-	mgmtRoom, mgmtErr := c.UserLogin.User.GetManagementRoom(ctx)
-	if mgmtErr != nil {
-		log.Warn().Err(mgmtErr).Msg(logLabel + ": failed to get management room for fallback notice")
+	mgmtRoom := c.existingManagementRoom()
+	if mgmtRoom == "" {
+		log.Debug().Msg(logLabel + ": no management room, skipping fallback notice")
 		return
 	}
 	if sendErr := sendNotice(mgmtRoom); sendErr != nil {

@@ -759,10 +759,9 @@ func (c *IMClient) notifyRecycleBinCandidates(log zerolog.Logger) {
 	}
 
 	ctx := context.Background()
-	user := c.UserLogin.User
-	mgmtRoom, err := user.GetManagementRoom(ctx)
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to get management room for recycle bin notification")
+	mgmtRoom := c.existingManagementRoom()
+	if mgmtRoom == "" {
+		log.Debug().Msg("No management room, skipping recycle bin notification")
 		return
 	}
 
@@ -777,7 +776,7 @@ func (c *IMClient) notifyRecycleBinCandidates(log zerolog.Logger) {
 
 	content := format.RenderMarkdown(sb.String(), true, false)
 	content.MsgType = event.MsgNotice
-	_, err = c.Main.Bridge.Bot.SendMessage(ctx, mgmtRoom, event.EventMessage, &event.Content{
+	_, err := c.Main.Bridge.Bot.SendMessage(ctx, mgmtRoom, event.EventMessage, &event.Content{
 		Parsed: content,
 	}, nil)
 	if err != nil {

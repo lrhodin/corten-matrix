@@ -909,9 +909,10 @@ func (c *IMClient) pollSharedStreams(log zerolog.Logger) (retErr error) {
 	log.Info().Strs("albums", notifyAlbums).Msg("Detected new content in shared albums")
 
 	ctx := context.Background()
-	mgmtRoom, err := c.UserLogin.User.GetManagementRoom(ctx)
-	if err != nil {
-		return fmt.Errorf("get management room: %w", err)
+	mgmtRoom := c.existingManagementRoom()
+	if mgmtRoom == "" {
+		log.Debug().Msg("No management room, skipping shared album notice")
+		return nil
 	}
 
 	// Resolve album GUIDs to human-readable names for the notice.
