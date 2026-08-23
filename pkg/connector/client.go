@@ -47,6 +47,7 @@ import (
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/matrix"
 	matrixfmt "maunium.net/go/mautrix/bridgev2/matrix"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
@@ -1714,6 +1715,58 @@ func (c *IMClient) repairManagementRoomPowerLevel(ctx context.Context, roomID id
 		return
 	}
 	log.Info().Int("power_level", managementRoomUserPowerLevel).Msg("Management room: raised the user to full power")
+}
+
+// RegisterManagementRoomDelete makes the management room deletable from the
+// client, the same as every other room.
+//
+// bridgev2 short-circuits every event sent in the management room
+// (bridgev2/queue.go:126) and returns Success before the dispatch that would act
+// on it. Portals delete via Portal.handleMatrixDeleteChat; other non-portal
+// rooms — shared-album rooms and the like — delete at bridgev2/queue.go:152 via
+// Bot.DeleteRoom. The management room reaches neither, so Beeper's delete sends
+// com.beeper.delete_chat, it gets swallowed, and nothing happens. It is the one
+// room in the bridge the user cannot get rid of.
+//
+// The appservice event processor dispatches to its handlers in registration
+// order, so prepending gets us the event before the Matrix connector's own
+// handler hands it to QueueMatrixEvent, and we delete the room ourselves.
+// Authorization is the ownership check: the sender must be the user whose
+// management room this is.
+//
+// Note that bridgev2 will build a fresh management room the next time anything
+// calls GetManagementRoom — a bridge-state notice, a recycle-bin or shared-album
+// notice. Deleting the room removes it; it doesn't opt out of ever having one.
+func RegisterManagementRoomDelete(mx *matrix.Connector, br *bridgev2.Bridge) {
+	mx.EventProcessor.PrependHandler(event.BeeperDeleteChat, func(ctx context.Context, evt *event.Event) {
+		user, err := br.GetUserByMXID(ctx, evt.Sender)
+		if err != nil {
+			br.Log.Err(err).Stringer("room_id", evt.RoomID).
+				Msg("Management room delete: failed to look up sender")
+			return
+		} else if user == nil || user.ManagementRoom != evt.RoomID {
+			// Not a management room — the framework's own paths handle it.
+			return
+		}
+		log := br.Log.With().
+			Str("component", "management_room_delete").
+			Stringer("room_id", evt.RoomID).
+			Stringer("user_id", evt.Sender).
+			Logger()
+		if err = br.Bot.DeleteRoom(ctx, evt.RoomID, true); err != nil {
+			log.Err(err).Msg("Management room delete: failed to delete room")
+			return
+		}
+		// Clear the pointer so nothing resolves to the room we just removed.
+		// bridgev2 also clears it when it sees the bot's own leave, but that
+		// echo isn't guaranteed to arrive before the next GetManagementRoom.
+		user.ManagementRoom = ""
+		if err = br.DB.User.Update(ctx, user.User); err != nil {
+			log.Err(err).Msg("Management room delete: failed to clear management room pointer")
+			return
+		}
+		log.Info().Msg("Management room delete: deleted management room at user request")
+	})
 }
 
 func (c *IMClient) Disconnect() {
