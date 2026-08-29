@@ -7,10 +7,15 @@ name: Build release binaries
 on:
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: New Git tag for the draft release, for example 1.2.3
+      version_bump:
+        description: Version increment from the latest published release; exact draft tag is shown before builds start
         required: true
-        type: string
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
       release_title:
         description: Draft release title
         required: true
@@ -20,8 +25,45 @@ permissions:
   contents: read
 
 jobs:
+  # Resolve the release version before expensive builds begin. GitHub's manual
+  # dispatch form is static, so this uses the latest published release at run
+  # time. Draft releases are intentionally excluded by the /releases/latest API.
+  resolve-release-version:
+    name: Resolve release version
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
+    steps:
+      - name: Check out public bridge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Calculate next semantic version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUMP: ${{ inputs.version_bump }}
+        run: |
+          set -euo pipefail
+          LATEST_TAG="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          NEXT_TAG="$(./scripts/next-release-tag.sh "$LATEST_TAG" "$BUMP")"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$NEXT_TAG" >/dev/null 2>&1; then
+            echo "::error::Refusing to reuse existing tag: $NEXT_TAG"
+            exit 1
+          fi
+          printf 'release_tag=%s\n' "$NEXT_TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo '## Release version resolved'
+            echo
+            echo "Latest published release: \`$LATEST_TAG\`"
+            echo "Selected bump: \`$BUMP\`"
+            echo "Draft release tag: \`$NEXT_TAG\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   macos-amd64:
     name: macOS x86_64 slice
+    needs: resolve-release-version
     runs-on: macos-15-intel
     timeout-minutes: 360
     steps:
@@ -65,6 +107,7 @@ jobs:
 
   macos-arm64:
     name: macOS arm64 slice
+    needs: resolve-release-version
     runs-on: macos-15
     timeout-minutes: 360
     steps:
@@ -106,6 +149,7 @@ jobs:
 
   linux-amd64:
     name: Linux amd64
+    needs: resolve-release-version
     runs-on: ubuntu-24.04
     # The host handles authenticated checkout. The native build runs inside
     # Rocky Linux 8 below, preserving glibc 2.28 without Zig.
@@ -165,6 +209,7 @@ jobs:
 
   linux-arm64:
     name: Linux arm64
+    needs: resolve-release-version
     runs-on: ubuntu-24.04-arm
     # The host handles authenticated checkout. The native build runs inside the
     # arm64 Rocky Linux 8 image below, preserving glibc 2.28 without Zig.
@@ -224,7 +269,7 @@ jobs:
 
   assemble-macos:
     name: Assemble universal macOS binary
-    needs: [macos-amd64, macos-arm64, linux-amd64, linux-arm64]
+    needs: [resolve-release-version, macos-amd64, macos-arm64, linux-amd64, linux-arm64]
     runs-on: macos-15-intel
     timeout-minutes: 60
     # Creating the draft and its tag is the only write operation in this workflow.
@@ -281,21 +326,38 @@ jobs:
           lipo -archs opencider/dist/corten-matrix-macos | grep -qw x86_64
           codesign --verify opencider/dist/corten-matrix-macos
 
+      # Atomically reserve the tag immediately before release creation. The
+      # resolver's earlier read avoids wasted builds, but cannot prevent another
+      # maintainer from taking the tag while builds are running. A Git ref POST
+      # is the write-side collision guard: an existing ref fails instead of
+      # silently attaching our release to another commit.
+      - name: Reserve draft release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve-release-version.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if ! gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f "ref=refs/tags/$RELEASE_TAG" \
+            -f "sha=$GITHUB_SHA" >/dev/null; then
+            echo "::error::Refusing to use an existing or unreservable tag: $RELEASE_TAG"
+            exit 1
+          fi
+
       # This is the manual approval boundary. The job attaches only the three
       # verified end-user binaries to a draft release. It deliberately does not
       # generate notes: edit the draft's notes in GitHub, then publish manually.
-      # `--target` binds a newly created tag to the exact manually dispatched
-      # public bridge commit instead of silently using the default branch tip.
+      # The tag was atomically reserved at the dispatched commit above.
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_TAG: ${{ needs.resolve-release-version.outputs.release_tag }}
           RELEASE_TITLE: ${{ inputs.release_title }}
         run: |
           set -euo pipefail
           gh release create "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
+            --verify-tag \
             --title "$RELEASE_TITLE" \
             --draft \
             opencider/dist/corten-matrix-macos \
@@ -305,7 +367,7 @@ jobs:
       - name: Verify draft release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_TAG: ${{ needs.resolve-release-version.outputs.release_tag }}
         run: |
           set -euo pipefail
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
