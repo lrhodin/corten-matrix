@@ -1,0 +1,326 @@
+name: Build release binaries
+
+# Private OpenCider is checked out only by manual jobs started by trusted writers
+# of this repository. Never add a push, PR, pull_request_target, workflow_run,
+# or repository_dispatch trigger here: this workflow receives the read-only
+# OpenCider deploy-key secret.
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: New Git tag for the draft release, for example 1.2.3
+        required: true
+        type: string
+      release_title:
+        description: Draft release title
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  macos-amd64:
+    name: macOS x86_64 slice
+    runs-on: macos-15-intel
+    timeout-minutes: 360
+    steps:
+      - name: Check out public bridge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check out private OpenCider
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: mackid1993/OpenCider
+          ref: master
+          path: opencider
+          ssh-key: ${{ secrets.OPENCIDER_READ_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Build x86_64 macOS slice
+        working-directory: opencider
+        env:
+          REPO_DIR: ${{ github.workspace }}
+          BUILD_DIR: ${{ runner.temp }}/opencider-macos-amd64
+        run: |
+          if ! ./build-macos-slice.sh amd64 > "$RUNNER_TEMP/opencider-build.log" 2>&1; then
+            echo '::error::Private build failed. Detailed compiler output was intentionally withheld from public Actions logs.'
+            exit 1
+          fi
+
+      - name: Verify x86_64 slice
+        run: test "$(lipo -archs opencider/dist/corten-matrix-macos.amd64)" = x86_64
+
+      # Only an executable slice crosses the job boundary. Never upload dist/**:
+      # it contains private-linked static archives and other non-release output.
+      - name: Upload x86_64 macOS slice
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-amd64-slice
+          path: opencider/dist/corten-matrix-macos.amd64
+          if-no-files-found: error
+          retention-days: 1
+
+  macos-arm64:
+    name: macOS arm64 slice
+    runs-on: macos-15
+    timeout-minutes: 360
+    steps:
+      - name: Check out public bridge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check out private OpenCider
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: mackid1993/OpenCider
+          ref: master
+          path: opencider
+          ssh-key: ${{ secrets.OPENCIDER_READ_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Build arm64 macOS slice
+        working-directory: opencider
+        env:
+          REPO_DIR: ${{ github.workspace }}
+          BUILD_DIR: ${{ runner.temp }}/opencider-macos-arm64
+        run: |
+          if ! ./build-macos-slice.sh arm64 > "$RUNNER_TEMP/opencider-build.log" 2>&1; then
+            echo '::error::Private build failed. Detailed compiler output was intentionally withheld from public Actions logs.'
+            exit 1
+          fi
+
+      - name: Verify arm64 slice
+        run: test "$(lipo -archs opencider/dist/corten-matrix-macos.arm64)" = arm64
+
+      - name: Upload arm64 macOS slice
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-arm64-slice
+          path: opencider/dist/corten-matrix-macos.arm64
+          if-no-files-found: error
+          retention-days: 1
+
+  linux-amd64:
+    name: Linux amd64
+    runs-on: ubuntu-24.04
+    # The host handles authenticated checkout. The native build runs inside
+    # Rocky Linux 8 below, preserving glibc 2.28 without Zig.
+    timeout-minutes: 360
+    steps:
+      - name: Check out public bridge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check out private OpenCider
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: mackid1993/OpenCider
+          ref: master
+          path: opencider
+          ssh-key: ${{ secrets.OPENCIDER_READ_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Install Go from the public bridge toolchain declaration
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build native amd64 Linux binary
+        env:
+          REPO_DIR: /workspace
+          BUILD_DIR: /tmp/opencider-linux-amd64
+        run: |
+          set -euo pipefail
+          GOROOT="$(go env GOROOT)"
+          if ! docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$GITHUB_WORKSPACE/opencider:/workspace/opencider" \
+            --volume "$GOROOT:/opt/go:ro" \
+            --env REPO_DIR \
+            --env BUILD_DIR \
+            --env PATH=/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            --workdir /workspace/opencider \
+            rockylinux@sha256:9794037624aaa6212aeada1d28861ef5e0a935adaf93e4ef79837119f2a2d04c \
+            ./build-linux.sh > "$RUNNER_TEMP/opencider-build.log" 2>&1; then
+            echo '::error::Private build failed. Detailed compiler output was intentionally withheld from public Actions logs.'
+            exit 1
+          fi
+
+      - name: Verify amd64 ELF
+        run: readelf -h opencider/dist/corten-matrix-linux-amd64 | grep -F 'Advanced Micro Devices X86-64'
+
+      - name: Upload amd64 Linux binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-amd64-binary
+          path: opencider/dist/corten-matrix-linux-amd64
+          if-no-files-found: error
+          retention-days: 1
+
+  linux-arm64:
+    name: Linux arm64
+    runs-on: ubuntu-24.04-arm
+    # The host handles authenticated checkout. The native build runs inside the
+    # arm64 Rocky Linux 8 image below, preserving glibc 2.28 without Zig.
+    timeout-minutes: 360
+    steps:
+      - name: Check out public bridge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check out private OpenCider
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: mackid1993/OpenCider
+          ref: master
+          path: opencider
+          ssh-key: ${{ secrets.OPENCIDER_READ_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Install Go from the public bridge toolchain declaration
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build native arm64 Linux binary
+        env:
+          REPO_DIR: /workspace
+          BUILD_DIR: /tmp/opencider-linux-arm64
+        run: |
+          set -euo pipefail
+          GOROOT="$(go env GOROOT)"
+          if ! docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$GITHUB_WORKSPACE/opencider:/workspace/opencider" \
+            --volume "$GOROOT:/opt/go:ro" \
+            --env REPO_DIR \
+            --env BUILD_DIR \
+            --env PATH=/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            --workdir /workspace/opencider \
+            rockylinux@sha256:9794037624aaa6212aeada1d28861ef5e0a935adaf93e4ef79837119f2a2d04c \
+            ./build-linux.sh > "$RUNNER_TEMP/opencider-build.log" 2>&1; then
+            echo '::error::Private build failed. Detailed compiler output was intentionally withheld from public Actions logs.'
+            exit 1
+          fi
+
+      - name: Verify arm64 ELF
+        run: readelf -h opencider/dist/corten-matrix-linux-arm64 | grep -F AArch64
+
+      - name: Upload arm64 Linux binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-arm64-binary
+          path: opencider/dist/corten-matrix-linux-arm64
+          if-no-files-found: error
+          retention-days: 1
+
+  assemble-macos:
+    name: Assemble universal macOS binary
+    needs: [macos-amd64, macos-arm64, linux-amd64, linux-arm64]
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    # Creating the draft and its tag is the only write operation in this workflow.
+    permissions:
+      contents: write
+    steps:
+      - name: Check out public bridge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check out private OpenCider finalizer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: mackid1993/OpenCider
+          ref: master
+          path: opencider
+          ssh-key: ${{ secrets.OPENCIDER_READ_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Download x86_64 macOS slice
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: macos-amd64-slice
+          path: opencider/dist
+
+      - name: Download arm64 macOS slice
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: macos-arm64-slice
+          path: opencider/dist
+
+      - name: Download amd64 Linux binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: linux-amd64-binary
+          path: opencider/dist
+
+      - name: Download arm64 Linux binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: linux-arm64-binary
+          path: opencider/dist
+
+      - name: Lipo, harden, and sign macOS binary
+        working-directory: opencider
+        env:
+          REPO_DIR: ${{ github.workspace }}
+        run: ./build-macos-universal.sh
+
+      - name: Verify universal macOS binary
+        run: |
+          lipo -archs opencider/dist/corten-matrix-macos | grep -qw arm64
+          lipo -archs opencider/dist/corten-matrix-macos | grep -qw x86_64
+          codesign --verify opencider/dist/corten-matrix-macos
+
+      # This is the manual approval boundary. The job attaches only the three
+      # verified end-user binaries to a draft release. It deliberately does not
+      # generate notes: edit the draft's notes in GitHub, then publish manually.
+      # `--target` binds a newly created tag to the exact manually dispatched
+      # public bridge commit instead of silently using the default branch tip.
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_TITLE: ${{ inputs.release_title }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TITLE" \
+            --draft \
+            opencider/dist/corten-matrix-macos \
+            opencider/dist/corten-matrix-linux-amd64 \
+            opencider/dist/corten-matrix-linux-arm64
+
+      - name: Verify draft release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,assets --jq '
+              if .isDraft and ([.assets[].name] | sort == [
+                "corten-matrix-linux-amd64",
+                "corten-matrix-linux-arm64",
+                "corten-matrix-macos"
+              ]) then
+                "verified draft release with exactly the three intended binaries"
+              else
+                error("draft release state or asset allowlist is wrong")
+              end'
+          {
+            echo '## Draft release ready'
+            echo
+            echo 'Add/edit release notes in GitHub, then publish it with **Set as latest release** enabled.'
+          } >> "$GITHUB_STEP_SUMMARY"
