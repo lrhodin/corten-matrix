@@ -7975,19 +7975,59 @@ type cloudBackfillCursor struct {
 // line; wall time says almost nothing.
 const maxBackwardDeferAttempts = 20
 
+const forwardBackfillRetryDelay = time.Second
+
+// scheduleForwardBackfillRetry queues a forced resync after the cancelled
+// FetchMessages call has returned and bridgev2 has released the portal's
+// forward-backfill lock. The delayed event must not reuse the cancelled
+// request context.
+func (c *IMClient) scheduleForwardBackfillRetry(portalKey networkid.PortalKey) {
+	login := c.UserLogin
+	time.AfterFunc(forwardBackfillRetryDelay, func() {
+		runForwardBackfillRetry(func() bool {
+			if login == nil {
+				log.Warn().Object("portal_key", portalKey).
+					Msg("Forward backfill retry rejected: user login is unavailable")
+				return false
+			}
+			result := login.QueueRemoteEvent(&simplevent.ChatResync{
+				EventMeta: simplevent.EventMeta{
+					Type:      bridgev2.RemoteEventChatResync,
+					PortalKey: portalKey,
+					LogContext: func(logContext zerolog.Context) zerolog.Context {
+						return logContext.Str("source", "forward_backfill_retry")
+					},
+				},
+				CheckNeedsBackfillFunc: func(context.Context, *database.Message) (bool, error) {
+					return true, nil
+				},
+			})
+			accepted := result.Success && !result.Ignored
+			if !accepted {
+				login.Log.Warn().Err(result.Error).Object("portal_key", portalKey).
+					Bool("ignored", result.Ignored).
+					Msg("Forward backfill retry was not accepted; releasing bootstrap accounting")
+			}
+			return accepted
+		}, c.onForwardBackfillDone)
+	})
+}
+
 func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
 	fetchStart := time.Now()
 	log := zerolog.Ctx(ctx)
 
 	// For forward backfill calls: ensure the bootstrap pending counter is
-	// decremented on every return path. The normal path (with messages) sets
-	// forwardDone=true and uses CompleteCallback to decrement AFTER bridgev2
-	// delivers the batch to Matrix. All other paths (early return, empty
-	// result, error) decrement here via defer — there is nothing to wait for.
+	// decremented on every terminal return path. The normal path (with messages)
+	// sets forwardDone=true and uses CompleteCallback to decrement AFTER bridgev2
+	// delivers the batch to Matrix. A semaphore cancellation schedules another
+	// forward attempt, so that path deliberately leaves the original pending
+	// count in place for the retry to complete (or the watchdog to force-flush).
 	var forwardDone bool
+	var forwardRetryScheduled bool
 	if params.Forward {
 		defer func() {
-			if !forwardDone {
+			if !forwardDone && !forwardRetryScheduled {
 				c.onForwardBackfillDone()
 			}
 		}()
@@ -8062,11 +8102,13 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		// Use a select with ctx.Done() so we don't block the portal event
 		// loop indefinitely when all slots are taken — that causes "Portal
 		// event channel is still full" errors and dropped events.
-		select {
-		case c.forwardBackfillSem <- struct{}{}:
-		case <-ctx.Done():
-			log.Warn().Str("portal_id", portalID).Msg("Forward backfill: context cancelled while waiting for semaphore")
-			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: true}, nil
+		if err := waitForForwardBackfillSlot(ctx, c.forwardBackfillSem, func() {
+			c.scheduleForwardBackfillRetry(params.Portal.PortalKey)
+		}); err != nil {
+			forwardRetryScheduled = true
+			log.Warn().Err(err).Str("portal_id", portalID).
+				Msg("Forward backfill: context cancelled while waiting for semaphore; retry scheduled")
+			return nil, err
 		}
 		defer func() { <-c.forwardBackfillSem }()
 		log.Info().
