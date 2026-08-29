@@ -56,11 +56,27 @@ ifneq ($(UNAME_S),Darwin)
   $(error This bridge builds on macOS only: NAC uses Apple's native AAAbsintheContext framework. Build and run it on a Mac.)
 endif
 
-# Plain binary (no .app bundle; host ops live in the corten-matrix subcommands).
-export PATH := /opt/homebrew/bin:/opt/homebrew/sbin:$(PATH)
+# Homebrew prefix differs by architecture: /opt/homebrew on Apple Silicon,
+# /usr/local on Intel. Detect an installed brew first; if this is a fresh
+# install, select the architecture's normal target so check-deps installs and
+# later CGO compilation use the same location. Override with
+# `make BREW_PREFIX=...` (or an exported BREW_PREFIX) for non-standard installs.
+#
+# Keep the detected value simply-expanded so this shell probe runs once per make
+# invocation, while still preserving both environment and command-line overrides.
+ifeq ($(origin BREW_PREFIX),undefined)
+BREW_PREFIX := $(shell \
+	if [ -x /opt/homebrew/bin/brew ]; then echo /opt/homebrew; \
+	elif [ -x /usr/local/bin/brew ]; then echo /usr/local; \
+	elif command -v brew >/dev/null 2>&1; then brew --prefix; \
+	elif [ "$$(uname -m)" = x86_64 ]; then echo /usr/local; \
+	else echo /opt/homebrew; fi)
+endif
+
+export PATH := $(BREW_PREFIX)/bin:$(BREW_PREFIX)/sbin:$(PATH)
 BINARY      := $(APP_NAME)
-CGO_CFLAGS  := -I/opt/homebrew/include
-CGO_LDFLAGS := -L/opt/homebrew/lib -L$(CURDIR)
+CGO_CFLAGS  := -I$(BREW_PREFIX)/include
+CGO_LDFLAGS := -L$(BREW_PREFIX)/lib -L$(CURDIR)
 CARGO_ENV   := MACOSX_DEPLOYMENT_TARGET=13.0
 
 # ===========================================================================
@@ -72,14 +88,14 @@ check-deps:
 	@if ! command -v brew >/dev/null 2>&1; then \
 		echo "Installing Homebrew..."; \
 		NONINTERACTIVE=1 /bin/bash -c "$$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; \
-		eval "$$(/opt/homebrew/bin/brew shellenv)"; \
+		eval "$$("$(BREW_PREFIX)/bin/brew" shellenv)"; \
 	fi; \
 	missing=""; \
 	command -v go >/dev/null 2>&1    || missing="$$missing go"; \
 	command -v cargo >/dev/null 2>&1 || missing="$$missing rust"; \
 	command -v protoc >/dev/null 2>&1|| missing="$$missing protobuf"; \
 	command -v tmux >/dev/null 2>&1  || missing="$$missing tmux"; \
-	[ -f /opt/homebrew/include/olm/olm.h ] || [ -f /usr/local/include/olm/olm.h ] || missing="$$missing libolm"; \
+	[ -f "$(BREW_PREFIX)/include/olm/olm.h" ] || missing="$$missing libolm"; \
 	pkg-config --exists libheif 2>/dev/null || missing="$$missing libheif"; \
 	if [ -n "$$missing" ]; then \
 		echo "Installing dependencies:$$missing"; \
@@ -118,11 +134,12 @@ FAIRPLAY_CERTS := 4056631661436364584235346952193 \
                   4056631661436364584235346952208
 
 # ---------------------------------------------------------------------------
-# rustpush source patches — every one of them PROVEN to have landed.
+# source-build patches — every one of them PROVEN to have landed.
 # ---------------------------------------------------------------------------
-# Each patch below goes through rp_patch, which mirrors build.sh's helper of the
-# same name (same labels, same perl expressions, same verify regexes — the two
-# patch sets are kept identical on purpose; diff them when you touch either).
+# Each patch below goes through RP_PATCH, whose fail-closed semantics mirror the
+# build.sh helper. Shared vendored-tree patches should remain aligned where both
+# build lanes use them; public source-build compatibility patches may be present
+# only here and must be verified against this repository's exact pinned tree.
 #
 #   rp_patch <label> <file> <perl-expr> <verify-ere>
 #
@@ -257,6 +274,47 @@ ensure-rustpush-source:
 	@$(RP_PATCH) rp_patch "statuskit channel-not-found panic" $(RUSTPUSH_DIR)/src/statuskit.rs \
 	  's/let Some\(referenced_channel\) = state\.keys\.get_mut\(&base64_encode\(&channel\.id\)\) else \{ panic!\("Channel not found!"\) \};/let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else { warn!("StatusKit: presence msg arrived before keysharing for channel={} — dropping", encode_hex(&channel.id)); return Ok(None); };/' \
 	  'presence msg arrived before keysharing'
+
+# The pinned public omnisette exposes the two-argument default_provider in all
+# feature shapes available to this source build. Keep the wrapper's device_id
+# parameter for its callers, but compile the fetched public tree against the
+# API it actually provides.
+	@$(RP_PATCH) rp_patch "public omnisette provider comment" pkg/rustpushgo/src/lib.rs \
+	  's#^    // The omnisette provider selected with `cleanroom-registration` takes a$$#    // The pinned public upstream provider accepts login info and its state#; s#^    // `device_id`; upstream OpenBubbles omnisette.s `default_provider` is 2-arg\.$$#    // path in every feature shape used by this source build.#; s#^    // Gate on the feature so both signatures build: with cleanroom-registration$$#    // Keep device_id at the wrapper boundary for callers while using that#; s#^    // the 3-arg call is used; without it \(this from-source build\) the 2-arg$$#    // two-argument API.#; s#^    // upstream signature is used\.$$#    // Both cfg arms intentionally use the same public signature.#' \
+	  '^    // Both cfg arms intentionally use the same public signature\.$$'
+	@$(RP_PATCH) rp_patch "public omnisette default_provider is 2-arg" pkg/rustpushgo/src/lib.rs \
+	  's/^        omnisette::default_provider\(info, path, device_id\)$$/        let _ = device_id; \/\/ pinned public provider is two-argument\n        omnisette::default_provider(info, path)/' \
+	  'pinned public provider is two-argument'
+
+# The public contacts-auth dependency can be unavailable. Add a source-build
+# opt-out that leaves external CardDAV and local ChatDB Contacts ahead of the
+# disabled iCloud branch, and suppresses remote shared-profile refreshes while
+# preserving cached profile rendering, messages, and history backfill.
+	@$(RP_PATCH) rp_patch "disable iCloud contacts config field" pkg/connector/config.go \
+	  's/^(	CardDAV CardDAVConfig `yaml:"carddav"`\n)/$$1\n	\/\/ DisableICloudContacts disables iCloud CardDAV and remote shared-profile refresh.\n	DisableICloudContacts bool `yaml:"disable_icloud_contacts"`\n/' \
+	  'DisableICloudContacts bool `yaml:"disable_icloud_contacts"`'
+	@$(RP_PATCH) rp_patch "disable iCloud contacts config upgrade" pkg/connector/config.go \
+	  's/^(	helper\.Copy\(up\.Bool, "typing_notifications"\)\n)/$$1	helper.Copy(up.Bool, "disable_icloud_contacts")\n/' \
+	  'helper\.Copy\(up\.Bool, "disable_icloud_contacts"\)'
+	@$(RP_PATCH) rp_patch "disable iCloud contacts example config" pkg/imconfig/example-config.yaml \
+	  's/^(# External CardDAV server for contact name resolution\.\n)/# Disable iCloud CardDAV and remote shared-profile refresh when the public\n# contacts-auth path is unavailable. Messages and history backfill continue.\ndisable_icloud_contacts: false\n\n$$1/' \
+	  '^disable_icloud_contacts: false$$'
+# These anchors are inside the final iCloud branch, after external CardDAV and
+# local ChatDB Contacts have already been selected. They therefore cannot
+# pre-empt either higher-priority source. The constructor is also gated so the
+# disabled path never enters the public contacts-auth implementation.
+	@$(RP_PATCH) rp_patch "skip iCloud CardDAV client construction when disabled" pkg/connector/client.go \
+	  's/^		cloudContacts := newCloudContactsClient\(c\.client, log\)$$/		var cloudContacts *cloudContactsClient\n		if !c.Main.Config.DisableICloudContacts {\n			cloudContacts = newCloudContactsClient(c.client, log)\n		}/' \
+	  '^		if !c\.Main\.Config\.DisableICloudContacts \{$$'
+	@$(RP_PATCH) rp_patch "skip iCloud CardDAV setup when disabled" pkg/connector/client.go \
+	  's/^		if cloudContacts != nil \{$$/		if c.Main.Config.DisableICloudContacts {\n			log.Info().Msg("iCloud contacts disabled before CardDAV setup")\n		} else if cloudContacts != nil {/' \
+	  'iCloud contacts disabled before CardDAV setup'
+# refreshAllSharedProfiles is shared by startup and periodic refresh paths. A
+# central guard suppresses both network paths while the startup caller still
+# applies cached profiles before reaching this function.
+	@$(RP_PATCH) rp_patch "skip remote shared-profile refresh when iCloud contacts disabled" pkg/connector/shared_profile.go \
+	  's/^	if c\.sharedProfileStore == nil \|\| c\.client == nil \{$$/	if c.Main.Config.DisableICloudContacts || c.sharedProfileStore == nil || c.client == nil {/' \
+	  '^	if c\.Main\.Config\.DisableICloudContacts \|\| c\.sharedProfileStore == nil \|\| c\.client == nil \{$$'
 
 # `ensure-rustpush-source` is an order-only prereq (the `|` separator):
 # it runs before the recipe when needed, but its phony "always-dirty"
