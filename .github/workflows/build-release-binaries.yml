@@ -202,20 +202,31 @@ jobs:
         env:
           REPO_DIR: /workspace
           BUILD_DIR: /tmp/opencider-linux-amd64
+          BUILD_SAFE_STAGE_FILE: /runner-temp/opencider-linux-amd64-stage
         run: |
           set -euo pipefail
           GOROOT="$(go env GOROOT)"
+          STATUS_FILE="$RUNNER_TEMP/opencider-linux-amd64-stage"
+          rm -f "$STATUS_FILE"
           if ! docker run --rm \
             --volume "$GITHUB_WORKSPACE:/workspace:ro" \
             --volume "$GITHUB_WORKSPACE/opencider:/workspace/opencider" \
             --volume "$GOROOT:/opt/go:ro" \
+            --volume "$RUNNER_TEMP:/runner-temp" \
             --env REPO_DIR \
             --env BUILD_DIR \
+            --env BUILD_SAFE_STAGE_FILE \
             --env PATH=/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             --workdir /workspace/opencider \
             rockylinux@sha256:9794037624aaa6212aeada1d28861ef5e0a935adaf93e4ef79837119f2a2d04c \
             ./build-linux.sh > "$RUNNER_TEMP/opencider-build.log" 2>&1; then
-            echo '::error::Private build failed. Detailed compiler output was intentionally withheld from public Actions logs.'
+            stage=unknown
+            case "$(cat "$STATUS_FILE" 2>/dev/null || true)" in
+              bootstrap|glibc|prepare-private-rust-tree|cargo-build|overlay-private-go|go-build|harden|notices|complete)
+                stage="$(cat "$STATUS_FILE")"
+                ;;
+            esac
+            echo "::error::Private build failed at source-safe stage: $stage. Detailed compiler output was intentionally withheld from public Actions logs."
             exit 1
           fi
 
@@ -285,20 +296,31 @@ jobs:
         env:
           REPO_DIR: /workspace
           BUILD_DIR: /tmp/opencider-linux-arm64
+          BUILD_SAFE_STAGE_FILE: /runner-temp/opencider-linux-arm64-stage
         run: |
           set -euo pipefail
           GOROOT="$(go env GOROOT)"
+          STATUS_FILE="$RUNNER_TEMP/opencider-linux-arm64-stage"
+          rm -f "$STATUS_FILE"
           if ! docker run --rm \
             --volume "$GITHUB_WORKSPACE:/workspace:ro" \
             --volume "$GITHUB_WORKSPACE/opencider:/workspace/opencider" \
             --volume "$GOROOT:/opt/go:ro" \
+            --volume "$RUNNER_TEMP:/runner-temp" \
             --env REPO_DIR \
             --env BUILD_DIR \
+            --env BUILD_SAFE_STAGE_FILE \
             --env PATH=/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             --workdir /workspace/opencider \
             rockylinux@sha256:9794037624aaa6212aeada1d28861ef5e0a935adaf93e4ef79837119f2a2d04c \
             ./build-linux.sh > "$RUNNER_TEMP/opencider-build.log" 2>&1; then
-            echo '::error::Private build failed. Detailed compiler output was intentionally withheld from public Actions logs.'
+            stage=unknown
+            case "$(cat "$STATUS_FILE" 2>/dev/null || true)" in
+              bootstrap|glibc|prepare-private-rust-tree|cargo-build|overlay-private-go|go-build|harden|notices|complete)
+                stage="$(cat "$STATUS_FILE")"
+                ;;
+            esac
+            echo "::error::Private build failed at source-safe stage: $stage. Detailed compiler output was intentionally withheld from public Actions logs."
             exit 1
           fi
 
@@ -364,7 +386,11 @@ jobs:
         working-directory: opencider
         env:
           REPO_DIR: ${{ github.workspace }}
-        run: ./build-macos-universal.sh
+        run: |
+          if ! ./build-macos-universal.sh > "$RUNNER_TEMP/opencider-build.log" 2>&1; then
+            echo '::error::Private build failed. Detailed compiler output was intentionally withheld from public Actions logs.'
+            exit 1
+          fi
 
       - name: Verify universal macOS binary
         run: |
