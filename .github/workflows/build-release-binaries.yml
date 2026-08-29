@@ -7,6 +7,17 @@ name: Build release binaries
 on:
   workflow_dispatch:
     inputs:
+      build_scope:
+        description: Build selection
+        required: true
+        default: All platforms
+        type: choice
+        options:
+          - Mac only
+          - Linux AMD64 only
+          - Linux ARM64 only
+          - Linux both
+          - All platforms
       version_bump:
         description: Version increment from the latest published release; exact draft tag is shown before builds start
         required: true
@@ -17,8 +28,8 @@ on:
           - minor
           - major
       release_title:
-        description: Draft release title
-        required: true
+        description: Draft release title, required only for All platforms
+        required: false
         type: string
 
 permissions:
@@ -43,9 +54,24 @@ jobs:
         id: version
         env:
           GH_TOKEN: ${{ github.token }}
+          BUILD_SCOPE: ${{ inputs.build_scope }}
           BUMP: ${{ inputs.version_bump }}
+          RELEASE_TITLE: ${{ inputs.release_title }}
         run: |
           set -euo pipefail
+          if [ "$BUILD_SCOPE" != 'All platforms' ]; then
+            {
+              echo '## Platform build selected'
+              echo
+              echo "Selection: \`$BUILD_SCOPE\`"
+              echo 'No release tag will be reserved and no draft release will be created.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          [ -n "$RELEASE_TITLE" ] || {
+            echo '::error::Draft release title is required for All platforms.'
+            exit 1
+          }
           LATEST_TAG="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
           NEXT_TAG="$(./scripts/next-release-tag.sh "$LATEST_TAG" "$BUMP")"
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$NEXT_TAG" >/dev/null 2>&1; then
@@ -64,6 +90,7 @@ jobs:
   macos-amd64:
     name: macOS x86_64 slice
     needs: resolve-release-version
+    if: inputs.build_scope == 'Mac only' || inputs.build_scope == 'All platforms'
     runs-on: macos-15-intel
     timeout-minutes: 360
     steps:
@@ -108,6 +135,7 @@ jobs:
   macos-arm64:
     name: macOS arm64 slice
     needs: resolve-release-version
+    if: inputs.build_scope == 'Mac only' || inputs.build_scope == 'All platforms'
     runs-on: macos-15
     timeout-minutes: 360
     steps:
@@ -150,6 +178,7 @@ jobs:
   linux-amd64:
     name: Linux amd64
     needs: resolve-release-version
+    if: inputs.build_scope == 'Linux AMD64 only' || inputs.build_scope == 'Linux both' || inputs.build_scope == 'All platforms'
     runs-on: ubuntu-24.04
     # The host handles authenticated checkout. The native build runs inside
     # Rocky Linux 8 below, preserving glibc 2.28 without Zig.
@@ -222,7 +251,7 @@ jobs:
             ./build-linux.sh > "$RUNNER_TEMP/opencider-build.log" 2>&1; then
             stage=unknown
             case "$(cat "$STATUS_FILE" 2>/dev/null || true)" in
-              bootstrap|glibc|prepare-private-rust-tree|cargo-build|overlay-private-go|go-build|harden|notices|complete)
+              bootstrap|glibc|sync-public-bridge|clone-public-rustpush|checkout-public-rustpush|fairplay-stubs|fetch-public-submodules|validate-public-submodules|overlay-private-rust|apply-rustpush-patches|cargo-build|overlay-private-go|go-build|harden|notices|complete)
                 stage="$(cat "$STATUS_FILE")"
                 ;;
             esac
@@ -244,6 +273,7 @@ jobs:
   linux-arm64:
     name: Linux arm64
     needs: resolve-release-version
+    if: inputs.build_scope == 'Linux ARM64 only' || inputs.build_scope == 'Linux both' || inputs.build_scope == 'All platforms'
     runs-on: ubuntu-24.04-arm
     # The host handles authenticated checkout. The native build runs inside the
     # arm64 Rocky Linux 8 image below, preserving glibc 2.28 without Zig.
@@ -316,7 +346,7 @@ jobs:
             ./build-linux.sh > "$RUNNER_TEMP/opencider-build.log" 2>&1; then
             stage=unknown
             case "$(cat "$STATUS_FILE" 2>/dev/null || true)" in
-              bootstrap|glibc|prepare-private-rust-tree|cargo-build|overlay-private-go|go-build|harden|notices|complete)
+              bootstrap|glibc|sync-public-bridge|clone-public-rustpush|checkout-public-rustpush|fairplay-stubs|fetch-public-submodules|validate-public-submodules|overlay-private-rust|apply-rustpush-patches|cargo-build|overlay-private-go|go-build|harden|notices|complete)
                 stage="$(cat "$STATUS_FILE")"
                 ;;
             esac
@@ -338,6 +368,13 @@ jobs:
   assemble-macos:
     name: Assemble universal macOS binary
     needs: [resolve-release-version, macos-amd64, macos-arm64, linux-amd64, linux-arm64]
+    if: >-
+      always() &&
+      (inputs.build_scope == 'Mac only' || inputs.build_scope == 'All platforms') &&
+      needs.macos-amd64.result == 'success' &&
+      needs.macos-arm64.result == 'success' &&
+      (inputs.build_scope == 'Mac only' ||
+       (needs.linux-amd64.result == 'success' && needs.linux-arm64.result == 'success'))
     runs-on: macos-15-intel
     timeout-minutes: 60
     # Creating the draft and its tag is the only write operation in this workflow.
@@ -371,12 +408,14 @@ jobs:
           path: opencider/dist
 
       - name: Download amd64 Linux binary
+        if: inputs.build_scope == 'All platforms'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: linux-amd64-binary
           path: opencider/dist
 
       - name: Download arm64 Linux binary
+        if: inputs.build_scope == 'All platforms'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: linux-arm64-binary
@@ -398,12 +437,21 @@ jobs:
           lipo -archs opencider/dist/corten-matrix-macos | grep -qw x86_64
           codesign --verify opencider/dist/corten-matrix-macos
 
+      - name: Upload universal macOS binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-universal-binary
+          path: opencider/dist/corten-matrix-macos
+          if-no-files-found: error
+          retention-days: 1
+
       # Atomically reserve the tag immediately before release creation. The
       # resolver's earlier read avoids wasted builds, but cannot prevent another
       # maintainer from taking the tag while builds are running. A Git ref POST
       # is the write-side collision guard: an existing ref fails instead of
       # silently attaching our release to another commit.
       - name: Reserve draft release tag
+        if: inputs.build_scope == 'All platforms'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.resolve-release-version.outputs.release_tag }}
@@ -421,6 +469,7 @@ jobs:
       # generate notes: edit the draft's notes in GitHub, then publish manually.
       # The tag was atomically reserved at the dispatched commit above.
       - name: Create draft release
+        if: inputs.build_scope == 'All platforms'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.resolve-release-version.outputs.release_tag }}
@@ -437,6 +486,7 @@ jobs:
             opencider/dist/corten-matrix-linux-arm64
 
       - name: Verify draft release assets
+        if: inputs.build_scope == 'All platforms'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.resolve-release-version.outputs.release_tag }}
