@@ -175,6 +175,29 @@ jobs:
           go-version-file: go.mod
           cache: false
 
+      # This visible preflight has no private source build path. It exposes only
+      # OS package/Rustup/glibc diagnostics, then exits before any overlay,
+      # patch, or compiler work. The real build remains redacted below.
+      - name: Preflight native amd64 Linux toolchain
+        env:
+          REPO_DIR: /workspace
+          BUILD_DIR: /tmp/opencider-linux-amd64-preflight
+          BOOTSTRAP_ONLY: "1"
+        run: |
+          set -euo pipefail
+          GOROOT="$(go env GOROOT)"
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$GITHUB_WORKSPACE/opencider:/workspace/opencider" \
+            --volume "$GOROOT:/opt/go:ro" \
+            --env REPO_DIR \
+            --env BUILD_DIR \
+            --env BOOTSTRAP_ONLY \
+            --env PATH=/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            --workdir /workspace/opencider \
+            rockylinux@sha256:9794037624aaa6212aeada1d28861ef5e0a935adaf93e4ef79837119f2a2d04c \
+            ./build-linux.sh
+
       - name: Build native amd64 Linux binary
         env:
           REPO_DIR: /workspace
@@ -234,6 +257,29 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+
+      # This visible preflight has no private source build path. It exposes only
+      # OS package/Rustup/glibc diagnostics, then exits before any overlay,
+      # patch, or compiler work. The real build remains redacted below.
+      - name: Preflight native arm64 Linux toolchain
+        env:
+          REPO_DIR: /workspace
+          BUILD_DIR: /tmp/opencider-linux-arm64-preflight
+          BOOTSTRAP_ONLY: "1"
+        run: |
+          set -euo pipefail
+          GOROOT="$(go env GOROOT)"
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$GITHUB_WORKSPACE/opencider:/workspace/opencider" \
+            --volume "$GOROOT:/opt/go:ro" \
+            --env REPO_DIR \
+            --env BUILD_DIR \
+            --env BOOTSTRAP_ONLY \
+            --env PATH=/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            --workdir /workspace/opencider \
+            rockylinux@sha256:9794037624aaa6212aeada1d28861ef5e0a935adaf93e4ef79837119f2a2d04c \
+            ./build-linux.sh
 
       - name: Build native arm64 Linux binary
         env:
