@@ -95,7 +95,9 @@ jobs:
             VERSION_SELECTION="bump: $BUMP"
           fi
 
-          EXISTING_REF="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$NEXT_TAG" --jq '.object.type + ":" + .object.sha' 2>/dev/null || true)"
+          if ! EXISTING_REF="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$NEXT_TAG" --jq '.object.type + ":" + .object.sha' 2>/dev/null)"; then
+            EXISTING_REF=''
+          fi
           if [ -n "$EXISTING_REF" ]; then
             if [ "$EXISTING_REF" = "commit:$GITHUB_SHA" ]; then
               TAG_STATUS='Tag already points to this commit; reusing it.'
@@ -109,7 +111,9 @@ jobs:
             TAG_STATUS='Tag is available and will be reserved after the builds pass.'
           fi
 
-          EXISTING_RELEASE="$(gh release view "$NEXT_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if ! EXISTING_RELEASE="$(gh release view "$NEXT_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            EXISTING_RELEASE=''
+          fi
           if [ -n "$EXISTING_RELEASE" ]; then
             echo "::error::An existing release already uses this tag; handle it manually before retrying: $NEXT_TAG"
             exit 1
@@ -739,7 +743,9 @@ jobs:
           VERSION_SELECTION: ${{ inputs.version_bump }}
         run: |
           set -euo pipefail
-          EXISTING_REF="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type + ":" + .object.sha' 2>/dev/null || true)"
+          if ! EXISTING_REF="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type + ":" + .object.sha' 2>/dev/null)"; then
+            EXISTING_REF=''
+          fi
           if [ -z "$EXISTING_REF" ]; then
             if gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
               -f "ref=refs/tags/$RELEASE_TAG" \
@@ -748,7 +754,9 @@ jobs:
               exit 0
             fi
             # A concurrent retry may have created the same safe ref.
-            EXISTING_REF="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type + ":" + .object.sha' 2>/dev/null || true)"
+            if ! EXISTING_REF="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type + ":" + .object.sha' 2>/dev/null)"; then
+              EXISTING_REF=''
+            fi
           fi
           if [ "$EXISTING_REF" = "commit:$GITHUB_SHA" ]; then
             echo 'Tag already points to this commit; reusing it.'

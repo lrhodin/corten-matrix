@@ -135,7 +135,12 @@ set -euo pipefail
 if [ "$1" = api ] && [[ "$2" == */releases/latest ]]; then
   printf '%s\n' "${FAKE_LATEST_TAG:-1.2.3}"
 elif [ "$1" = api ] && [[ "$2" == */git/ref/tags/* ]]; then
-  [ -n "${FAKE_REF:-}" ] || exit 1
+  if [ -z "${FAKE_REF:-}" ]; then
+    # Match gh api's real 404 behavior: JSON is written to stdout and the
+    # command exits nonzero.
+    printf '%s\n' '{"message":"Not Found","status":"404"}'
+    exit 1
+  fi
   printf '%s\n' "$FAKE_REF"
 elif [ "$1 $2" = 'release view' ]; then
   [ -n "${FAKE_RELEASE:-}" ] || exit 1
@@ -170,6 +175,7 @@ run_resolver() {
 
 run_resolver manual 2.3.4 '' '' 0
 require "$RESOLVER_CASE_DIR/output" 'release_tag=2.3.4'
+require "$RESOLVER_CASE_DIR/summary" 'Tag is available and will be reserved after the builds pass.'
 run_resolver manual v2.3.4 'commit:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' '' 0
 require "$RESOLVER_CASE_DIR/output" 'release_tag=v2.3.4'
 require "$RESOLVER_CASE_DIR/summary" 'Manual selection will reuse the existing tag without moving it: v2.3.4'
