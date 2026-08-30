@@ -87,9 +87,75 @@ jobs:
             echo "Draft release tag: \`$NEXT_TAG\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  verify-rustpush-patches:
+    name: Apply and verify all portable RustPush patches
+    needs: resolve-release-version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      opencider_ref_token: ${{ steps.opencider.outputs.ref_token }}
+    steps:
+      - name: Check out public bridge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check out and tokenize private OpenCider revision
+        id: opencider
+        env:
+          OPENCIDER_READ_DEPLOY_KEY: ${{ secrets.OPENCIDER_READ_DEPLOY_KEY }}
+          OPENCIDER_REF_TOKEN: master
+        run: |
+          set -euo pipefail
+          ./.github/scripts/checkout-opencider.sh opencider "$OPENCIDER_REF_TOKEN"
+          sha="$(git -C opencider rev-parse HEAD)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo '::error::OpenCider checkout did not resolve to a full commit SHA.'
+            exit 1
+          }
+          token="$(OPENCIDER_SHA="$sha" python3 - <<'PY'
+          import hashlib
+          import hmac
+          import os
+
+          key = os.environ['OPENCIDER_READ_DEPLOY_KEY'].encode().rstrip(b'\r\n') + b'\n'
+          message = b'opencider-ref-v1:' + os.environ['OPENCIDER_SHA'].encode()
+          print(hmac.new(key, message, hashlib.sha256).hexdigest())
+          PY
+          )"
+          [[ "$token" =~ ^[0-9a-f]{64}$ ]] || {
+            echo '::error::OpenCider revision token generation failed.'
+            exit 1
+          }
+          printf 'ref_token=%s\n' "$token" >> "$GITHUB_OUTPUT"
+
+      - name: Apply and verify all portable RustPush patches
+        working-directory: opencider
+        env:
+          REPO_DIR: ${{ github.workspace }}
+          BUILD_DIR: ${{ runner.temp }}/opencider-patch-verify
+          PATCH_SAFE_STATUS_FILE: ${{ runner.temp }}/opencider-patch-status
+        run: |
+          set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/opencider-patch-verify.log"' EXIT
+          rm -f "$PATCH_SAFE_STATUS_FILE"
+          if ! ./verify-rustpush-patches.sh > "$RUNNER_TEMP/opencider-patch-verify.log" 2>&1; then
+            status=unknown
+            candidate="$(cat "$PATCH_SAFE_STATUS_FILE" 2>/dev/null || true)"
+            if [[ "$candidate" =~ ^(rustpush|apple-private-apis|rustpush-public):[1-9][0-9]*:[1-9][0-9]*$ ]]; then
+              IFS=: read -r scope index total <<< "$candidate"
+              if (( index <= total )); then
+                status="$candidate"
+              fi
+            fi
+            echo "::error::Portable RustPush patch verification failed at source-safe entry: $status. Detailed patch/source output was intentionally withheld from public Actions logs."
+            exit 1
+          fi
+          echo 'RustPush patches applied and verified for private and public build flavors.'
+
   macos-amd64:
     name: macOS x86_64 slice
-    needs: resolve-release-version
+    needs: [resolve-release-version, verify-rustpush-patches]
     if: inputs.build_scope == 'Mac only' || inputs.build_scope == 'All platforms'
     runs-on: macos-15-intel
     timeout-minutes: 360
@@ -99,28 +165,49 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Check out private OpenCider
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Cache only public crates.io metadata and authenticated .crate archives.
+      # Never cache registry/src, Cargo target output, or any OpenCider path.
+      - name: Cache public Cargo registry inputs
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          repository: mackid1993/OpenCider
-          ref: master
-          path: opencider
-          ssh-key: ${{ secrets.OPENCIDER_READ_DEPLOY_KEY }}
-          persist-credentials: false
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+          key: opencider-public-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pkg/rustpushgo/Cargo.lock', 'nac-validation/Cargo.lock', 'third_party/rustpush-upstream.sha') }}
 
+      - name: Check out private OpenCider
+        env:
+          OPENCIDER_READ_DEPLOY_KEY: ${{ secrets.OPENCIDER_READ_DEPLOY_KEY }}
+          OPENCIDER_REF_TOKEN: ${{ needs.verify-rustpush-patches.outputs.opencider_ref_token }}
+        run: ./.github/scripts/checkout-opencider.sh opencider "$OPENCIDER_REF_TOKEN"
+
+      # OpenCider's slice entrypoint is the public-OpenAbsinthe macOS contract;
+      # its private implementation output remains confined to the temp log.
       - name: Build x86_64 macOS slice
         working-directory: opencider
         env:
           REPO_DIR: ${{ github.workspace }}
           BUILD_DIR: ${{ runner.temp }}/opencider-macos-amd64
         run: |
+          set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/opencider-build.log"' EXIT
           if ! ./build-macos-slice.sh amd64 > "$RUNNER_TEMP/opencider-build.log" 2>&1; then
             echo '::error::Private build failed. Detailed compiler output was intentionally withheld from public Actions logs.'
             exit 1
           fi
 
       - name: Verify x86_64 slice
-        run: test "$(lipo -archs opencider/dist/corten-matrix-macos.amd64)" = x86_64
+        run: |
+          set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/opencider-macos-amd64-artifact-verify.log"' EXIT
+          binary=opencider/dist/corten-matrix-macos.amd64
+          test -f "$binary" && test ! -L "$binary" && test -x "$binary"
+          if ! ./opencider/tools/verify-macos-artifact.sh "$binary" > "$RUNNER_TEMP/opencider-macos-amd64-artifact-verify.log" 2>&1; then
+            echo '::error::Private macOS artifact safety verification failed. Detailed inspection output was intentionally withheld from public Actions logs.'
+            exit 1
+          fi
+          otool -hv "$binary" | grep -qw EXECUTE
+          test "$(lipo -archs "$binary")" = x86_64
 
       # Only an executable slice crosses the job boundary. Never upload dist/**:
       # it contains private-linked static archives and other non-release output.
@@ -134,7 +221,7 @@ jobs:
 
   macos-arm64:
     name: macOS arm64 slice
-    needs: resolve-release-version
+    needs: [resolve-release-version, verify-rustpush-patches]
     if: inputs.build_scope == 'Mac only' || inputs.build_scope == 'All platforms'
     runs-on: macos-15
     timeout-minutes: 360
@@ -144,28 +231,49 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Check out private OpenCider
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Cache only public crates.io metadata and authenticated .crate archives.
+      # Never cache registry/src, Cargo target output, or any OpenCider path.
+      - name: Cache public Cargo registry inputs
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          repository: mackid1993/OpenCider
-          ref: master
-          path: opencider
-          ssh-key: ${{ secrets.OPENCIDER_READ_DEPLOY_KEY }}
-          persist-credentials: false
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+          key: opencider-public-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pkg/rustpushgo/Cargo.lock', 'nac-validation/Cargo.lock', 'third_party/rustpush-upstream.sha') }}
 
+      - name: Check out private OpenCider
+        env:
+          OPENCIDER_READ_DEPLOY_KEY: ${{ secrets.OPENCIDER_READ_DEPLOY_KEY }}
+          OPENCIDER_REF_TOKEN: ${{ needs.verify-rustpush-patches.outputs.opencider_ref_token }}
+        run: ./.github/scripts/checkout-opencider.sh opencider "$OPENCIDER_REF_TOKEN"
+
+      # OpenCider's slice entrypoint is the public-OpenAbsinthe macOS contract;
+      # its private implementation output remains confined to the temp log.
       - name: Build arm64 macOS slice
         working-directory: opencider
         env:
           REPO_DIR: ${{ github.workspace }}
           BUILD_DIR: ${{ runner.temp }}/opencider-macos-arm64
         run: |
+          set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/opencider-build.log"' EXIT
           if ! ./build-macos-slice.sh arm64 > "$RUNNER_TEMP/opencider-build.log" 2>&1; then
             echo '::error::Private build failed. Detailed compiler output was intentionally withheld from public Actions logs.'
             exit 1
           fi
 
       - name: Verify arm64 slice
-        run: test "$(lipo -archs opencider/dist/corten-matrix-macos.arm64)" = arm64
+        run: |
+          set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/opencider-macos-arm64-artifact-verify.log"' EXIT
+          binary=opencider/dist/corten-matrix-macos.arm64
+          test -f "$binary" && test ! -L "$binary" && test -x "$binary"
+          if ! ./opencider/tools/verify-macos-artifact.sh "$binary" > "$RUNNER_TEMP/opencider-macos-arm64-artifact-verify.log" 2>&1; then
+            echo '::error::Private macOS artifact safety verification failed. Detailed inspection output was intentionally withheld from public Actions logs.'
+            exit 1
+          fi
+          otool -hv "$binary" | grep -qw EXECUTE
+          test "$(lipo -archs "$binary")" = arm64
 
       - name: Upload arm64 macOS slice
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -177,7 +285,7 @@ jobs:
 
   linux-amd64:
     name: Linux amd64
-    needs: resolve-release-version
+    needs: [resolve-release-version, verify-rustpush-patches]
     if: inputs.build_scope == 'Linux AMD64 only' || inputs.build_scope == 'Linux both' || inputs.build_scope == 'All platforms'
     runs-on: ubuntu-24.04
     # The host handles authenticated checkout. The native build runs inside
@@ -189,14 +297,27 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Check out private OpenCider
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Cache public Cargo registry inputs
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          repository: mackid1993/OpenCider
-          ref: master
-          path: opencider
-          ssh-key: ${{ secrets.OPENCIDER_READ_DEPLOY_KEY }}
-          persist-credentials: false
+          path: |
+            ${{ runner.temp }}/opencider-public-cargo-registry/cache
+            ${{ runner.temp }}/opencider-public-cargo-registry/index
+          key: opencider-public-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pkg/rustpushgo/Cargo.lock', 'nac-validation/Cargo.lock', 'third_party/rustpush-upstream.sha') }}
+
+      # This cache contains only the official protobuf ZIP. build-linux.sh
+      # authenticates it by the pinned SHA-256 and re-extracts on every run.
+      - name: Cache public protoc release archive
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/opencider-public-protoc/protoc-27.5-linux-x86_64.zip
+          key: opencider-public-protoc-${{ runner.os }}-${{ runner.arch }}-27.5-33abede6330dd22fb9af47c2d9804ead3d86c82e025b9eef361a9ac2e955ecce
+
+      - name: Check out private OpenCider
+        env:
+          OPENCIDER_READ_DEPLOY_KEY: ${{ secrets.OPENCIDER_READ_DEPLOY_KEY }}
+          OPENCIDER_REF_TOKEN: ${{ needs.verify-rustpush-patches.outputs.opencider_ref_token }}
+        run: ./.github/scripts/checkout-opencider.sh opencider "$OPENCIDER_REF_TOKEN"
 
       - name: Install Go from the public bridge toolchain declaration
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
@@ -204,36 +325,46 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      # This visible preflight has no private source build path. It exposes only
-      # OS package/Rustup/glibc diagnostics, then exits before any overlay,
-      # patch, or compiler work. The real build remains redacted below.
+      # Bootstrap separately so package/toolchain failures stop before private
+      # compilation. The entrypoint itself is private, so even preflight output
+      # stays runner-local: Bash errors can quote source lines before BOOTSTRAP_ONLY
+      # reaches its early exit.
       - name: Preflight native amd64 Linux toolchain
         env:
           REPO_DIR: /workspace
           BUILD_DIR: /tmp/opencider-linux-amd64-preflight
           BOOTSTRAP_ONLY: "1"
+          PROTOC_DOWNLOAD_CACHE_DIR: /public-protoc-cache
         run: |
           set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/opencider-preflight.log"' EXIT
           GOROOT="$(go env GOROOT)"
-          docker run --rm \
+          if ! docker run --rm \
             --volume "$GITHUB_WORKSPACE:/workspace:ro" \
             --volume "$GITHUB_WORKSPACE/opencider:/workspace/opencider" \
             --volume "$GOROOT:/opt/go:ro" \
+            --volume "$RUNNER_TEMP/opencider-public-protoc:/public-protoc-cache" \
             --env REPO_DIR \
             --env BUILD_DIR \
+            --env PROTOC_DOWNLOAD_CACHE_DIR \
             --env BOOTSTRAP_ONLY \
             --env PATH=/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             --workdir /workspace/opencider \
             rockylinux@sha256:9794037624aaa6212aeada1d28861ef5e0a935adaf93e4ef79837119f2a2d04c \
-            ./build-linux.sh
+            ./build-linux.sh > "$RUNNER_TEMP/opencider-preflight.log" 2>&1; then
+            echo '::error::Private Linux bootstrap preflight failed. Detailed output was intentionally withheld from public Actions logs.'
+            exit 1
+          fi
 
       - name: Build native amd64 Linux binary
         env:
           REPO_DIR: /workspace
           BUILD_DIR: /tmp/opencider-linux-amd64
           BUILD_SAFE_STAGE_FILE: /runner-temp/opencider-linux-amd64-stage
+          PROTOC_DOWNLOAD_CACHE_DIR: /public-protoc-cache
         run: |
           set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/opencider-build.log"' EXIT
           GOROOT="$(go env GOROOT)"
           STATUS_FILE="$RUNNER_TEMP/opencider-linux-amd64-stage"
           rm -f "$STATUS_FILE"
@@ -241,9 +372,12 @@ jobs:
             --volume "$GITHUB_WORKSPACE:/workspace:ro" \
             --volume "$GITHUB_WORKSPACE/opencider:/workspace/opencider" \
             --volume "$GOROOT:/opt/go:ro" \
+            --volume "$RUNNER_TEMP/opencider-public-protoc:/public-protoc-cache" \
             --volume "$RUNNER_TEMP:/runner-temp" \
+            --volume "$RUNNER_TEMP/opencider-public-cargo-registry:/root/.cargo/registry" \
             --env REPO_DIR \
             --env BUILD_DIR \
+            --env PROTOC_DOWNLOAD_CACHE_DIR \
             --env BUILD_SAFE_STAGE_FILE \
             --env PATH=/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             --workdir /workspace/opencider \
@@ -260,7 +394,15 @@ jobs:
           fi
 
       - name: Verify amd64 ELF
-        run: readelf -h opencider/dist/corten-matrix-linux-amd64 | grep -F 'Advanced Micro Devices X86-64'
+        run: |
+          set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/opencider-linux-amd64-artifact-verify.log"' EXIT
+          binary=opencider/dist/corten-matrix-linux-amd64
+          test -f "$binary" && test ! -L "$binary" && test -x "$binary"
+          if ! ./opencider/tools/verify-linux-artifact.sh "$binary" amd64 > "$RUNNER_TEMP/opencider-linux-amd64-artifact-verify.log" 2>&1; then
+            echo '::error::Private Linux artifact safety verification failed. Detailed inspection output was intentionally withheld from public Actions logs.'
+            exit 1
+          fi
 
       - name: Upload amd64 Linux binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -272,7 +414,7 @@ jobs:
 
   linux-arm64:
     name: Linux arm64
-    needs: resolve-release-version
+    needs: [resolve-release-version, verify-rustpush-patches]
     if: inputs.build_scope == 'Linux ARM64 only' || inputs.build_scope == 'Linux both' || inputs.build_scope == 'All platforms'
     runs-on: ubuntu-24.04-arm
     # The host handles authenticated checkout. The native build runs inside the
@@ -284,14 +426,27 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Check out private OpenCider
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Cache public Cargo registry inputs
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          repository: mackid1993/OpenCider
-          ref: master
-          path: opencider
-          ssh-key: ${{ secrets.OPENCIDER_READ_DEPLOY_KEY }}
-          persist-credentials: false
+          path: |
+            ${{ runner.temp }}/opencider-public-cargo-registry/cache
+            ${{ runner.temp }}/opencider-public-cargo-registry/index
+          key: opencider-public-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pkg/rustpushgo/Cargo.lock', 'nac-validation/Cargo.lock', 'third_party/rustpush-upstream.sha') }}
+
+      # This cache contains only the official protobuf ZIP. build-linux.sh
+      # authenticates it by the pinned SHA-256 and re-extracts on every run.
+      - name: Cache public protoc release archive
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/opencider-public-protoc/protoc-27.5-linux-aarch_64.zip
+          key: opencider-public-protoc-${{ runner.os }}-${{ runner.arch }}-27.5-9fdb165737b6dc8138473fa6a18e8a9e21a85f567102f3ab20d4e70442eef6db
+
+      - name: Check out private OpenCider
+        env:
+          OPENCIDER_READ_DEPLOY_KEY: ${{ secrets.OPENCIDER_READ_DEPLOY_KEY }}
+          OPENCIDER_REF_TOKEN: ${{ needs.verify-rustpush-patches.outputs.opencider_ref_token }}
+        run: ./.github/scripts/checkout-opencider.sh opencider "$OPENCIDER_REF_TOKEN"
 
       - name: Install Go from the public bridge toolchain declaration
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
@@ -299,36 +454,44 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      # This visible preflight has no private source build path. It exposes only
-      # OS package/Rustup/glibc diagnostics, then exits before any overlay,
-      # patch, or compiler work. The real build remains redacted below.
+      # Bootstrap separately so package/toolchain failures stop before private
+      # compilation. The private entrypoint remains fully redacted here too.
       - name: Preflight native arm64 Linux toolchain
         env:
           REPO_DIR: /workspace
           BUILD_DIR: /tmp/opencider-linux-arm64-preflight
           BOOTSTRAP_ONLY: "1"
+          PROTOC_DOWNLOAD_CACHE_DIR: /public-protoc-cache
         run: |
           set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/opencider-preflight.log"' EXIT
           GOROOT="$(go env GOROOT)"
-          docker run --rm \
+          if ! docker run --rm \
             --volume "$GITHUB_WORKSPACE:/workspace:ro" \
             --volume "$GITHUB_WORKSPACE/opencider:/workspace/opencider" \
             --volume "$GOROOT:/opt/go:ro" \
+            --volume "$RUNNER_TEMP/opencider-public-protoc:/public-protoc-cache" \
             --env REPO_DIR \
             --env BUILD_DIR \
+            --env PROTOC_DOWNLOAD_CACHE_DIR \
             --env BOOTSTRAP_ONLY \
             --env PATH=/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             --workdir /workspace/opencider \
             rockylinux@sha256:9794037624aaa6212aeada1d28861ef5e0a935adaf93e4ef79837119f2a2d04c \
-            ./build-linux.sh
+            ./build-linux.sh > "$RUNNER_TEMP/opencider-preflight.log" 2>&1; then
+            echo '::error::Private Linux bootstrap preflight failed. Detailed output was intentionally withheld from public Actions logs.'
+            exit 1
+          fi
 
       - name: Build native arm64 Linux binary
         env:
           REPO_DIR: /workspace
           BUILD_DIR: /tmp/opencider-linux-arm64
           BUILD_SAFE_STAGE_FILE: /runner-temp/opencider-linux-arm64-stage
+          PROTOC_DOWNLOAD_CACHE_DIR: /public-protoc-cache
         run: |
           set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/opencider-build.log"' EXIT
           GOROOT="$(go env GOROOT)"
           STATUS_FILE="$RUNNER_TEMP/opencider-linux-arm64-stage"
           rm -f "$STATUS_FILE"
@@ -336,9 +499,12 @@ jobs:
             --volume "$GITHUB_WORKSPACE:/workspace:ro" \
             --volume "$GITHUB_WORKSPACE/opencider:/workspace/opencider" \
             --volume "$GOROOT:/opt/go:ro" \
+            --volume "$RUNNER_TEMP/opencider-public-protoc:/public-protoc-cache" \
             --volume "$RUNNER_TEMP:/runner-temp" \
+            --volume "$RUNNER_TEMP/opencider-public-cargo-registry:/root/.cargo/registry" \
             --env REPO_DIR \
             --env BUILD_DIR \
+            --env PROTOC_DOWNLOAD_CACHE_DIR \
             --env BUILD_SAFE_STAGE_FILE \
             --env PATH=/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             --workdir /workspace/opencider \
@@ -355,7 +521,15 @@ jobs:
           fi
 
       - name: Verify arm64 ELF
-        run: readelf -h opencider/dist/corten-matrix-linux-arm64 | grep -F AArch64
+        run: |
+          set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/opencider-linux-arm64-artifact-verify.log"' EXIT
+          binary=opencider/dist/corten-matrix-linux-arm64
+          test -f "$binary" && test ! -L "$binary" && test -x "$binary"
+          if ! ./opencider/tools/verify-linux-artifact.sh "$binary" arm64 > "$RUNNER_TEMP/opencider-linux-arm64-artifact-verify.log" 2>&1; then
+            echo '::error::Private Linux artifact safety verification failed. Detailed inspection output was intentionally withheld from public Actions logs.'
+            exit 1
+          fi
 
       - name: Upload arm64 Linux binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -367,7 +541,7 @@ jobs:
 
   assemble-macos:
     name: Assemble universal macOS binary
-    needs: [resolve-release-version, macos-amd64, macos-arm64, linux-amd64, linux-arm64]
+    needs: [resolve-release-version, verify-rustpush-patches, macos-amd64, macos-arm64, linux-amd64, linux-arm64]
     if: >-
       always() &&
       (inputs.build_scope == 'Mac only' || inputs.build_scope == 'All platforms') &&
@@ -387,13 +561,10 @@ jobs:
           persist-credentials: false
 
       - name: Check out private OpenCider finalizer
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          repository: mackid1993/OpenCider
-          ref: master
-          path: opencider
-          ssh-key: ${{ secrets.OPENCIDER_READ_DEPLOY_KEY }}
-          persist-credentials: false
+        env:
+          OPENCIDER_READ_DEPLOY_KEY: ${{ secrets.OPENCIDER_READ_DEPLOY_KEY }}
+          OPENCIDER_REF_TOKEN: ${{ needs.verify-rustpush-patches.outputs.opencider_ref_token }}
+        run: ./.github/scripts/checkout-opencider.sh opencider "$OPENCIDER_REF_TOKEN"
 
       - name: Download x86_64 macOS slice
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -421,11 +592,24 @@ jobs:
           name: linux-arm64-binary
           path: opencider/dist
 
+      - name: Restore downloaded executable modes
+        env:
+          BUILD_SCOPE: ${{ inputs.build_scope }}
+        run: |
+          set -euo pipefail
+          restore_scope=mac
+          if [ "$BUILD_SCOPE" = 'All platforms' ]; then
+            restore_scope=all
+          fi
+          ./.github/scripts/restore-downloaded-executables.sh "$restore_scope" opencider/dist
+
       - name: Lipo, harden, and sign macOS binary
         working-directory: opencider
         env:
           REPO_DIR: ${{ github.workspace }}
         run: |
+          set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/opencider-build.log"' EXIT
           if ! ./build-macos-universal.sh > "$RUNNER_TEMP/opencider-build.log" 2>&1; then
             echo '::error::Private build failed. Detailed compiler output was intentionally withheld from public Actions logs.'
             exit 1
@@ -433,9 +617,18 @@ jobs:
 
       - name: Verify universal macOS binary
         run: |
-          lipo -archs opencider/dist/corten-matrix-macos | grep -qw arm64
-          lipo -archs opencider/dist/corten-matrix-macos | grep -qw x86_64
-          codesign --verify opencider/dist/corten-matrix-macos
+          set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/opencider-macos-universal-artifact-verify.log"' EXIT
+          binary=opencider/dist/corten-matrix-macos
+          test -f "$binary" && test ! -L "$binary" && test -x "$binary"
+          if ! ./opencider/tools/verify-macos-artifact.sh "$binary" > "$RUNNER_TEMP/opencider-macos-universal-artifact-verify.log" 2>&1; then
+            echo '::error::Private macOS artifact safety verification failed. Detailed inspection output was intentionally withheld from public Actions logs.'
+            exit 1
+          fi
+          otool -hv "$binary" | grep -qw EXECUTE
+          lipo -archs "$binary" | grep -qw arm64
+          lipo -archs "$binary" | grep -qw x86_64
+          codesign --verify "$binary"
 
       - name: Upload universal macOS binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

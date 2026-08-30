@@ -33,6 +33,11 @@ docker-compose.override.yml
 /bbctl
 
 # Local external worktrees / generated app workspace.
+# The workflow's private checkout and any private overlay staging must never be
+# visible to normal `git add`; the pre-commit hook also blocks forced staging.
+/opencider/
+/private-go/
+/rustpush/apple-private-apis/
 # third_party/rustpush-upstream is where build.sh clones rustpush upstream and
 # overlays our PRIVATE clean-room (open-absinthe + apple-private-apis) — never
 # commit it or the private APIs would leak into the public bridge repo.

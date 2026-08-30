@@ -3,7 +3,8 @@
 # staged with `git add -f` (which bypasses .gitignore). Tracked in .githooks/ so
 # it travels with the repo. Activate per clone with:
 #     git config core.hooksPath .githooks
-blocked=$(git diff --cached --name-only | grep -E '^third_party/rustpush-upstream/|^dist/|(^|/)librustpushgo\.a$|(^|/)target/')
+blocked=$(git diff --cached --name-only | grep -E \
+  '^opencider/|^private-go/|^rustpush/apple-private-apis/|^third_party/rustpush-upstream/|^dist/|(^|/)librustpushgo\.a$|(^|/)target/')
 if [ -n "$blocked" ]; then
   echo "✗ COMMIT BLOCKED — private/build paths are staged:" >&2
   echo "$blocked" | sed 's/^/   /' >&2
