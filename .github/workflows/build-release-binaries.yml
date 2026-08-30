@@ -27,6 +27,11 @@ on:
           - patch
           - minor
           - major
+          - manual
+      manual_version:
+        description: Exact MAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH tag, required when version selection is manual
+        required: false
+        type: string
       release_title:
         description: Draft release title, required only for All platforms
         required: false
@@ -56,6 +61,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BUILD_SCOPE: ${{ inputs.build_scope }}
           BUMP: ${{ inputs.version_bump }}
+          MANUAL_VERSION: ${{ inputs.manual_version }}
           RELEASE_TITLE: ${{ inputs.release_title }}
         run: |
           set -euo pipefail
@@ -73,9 +79,39 @@ jobs:
             exit 1
           }
           LATEST_TAG="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
-          NEXT_TAG="$(./scripts/next-release-tag.sh "$LATEST_TAG" "$BUMP")"
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$NEXT_TAG" >/dev/null 2>&1; then
-            echo "::error::Refusing to reuse existing tag: $NEXT_TAG"
+          if [ "$BUMP" = manual ]; then
+            [ -n "$MANUAL_VERSION" ] || {
+              echo '::error::Manual version is required when version selection is manual.'
+              exit 1
+            }
+            [[ "$MANUAL_VERSION" =~ ^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+              echo '::error::Manual version must be MAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH.'
+              exit 1
+            }
+            NEXT_TAG="$MANUAL_VERSION"
+            VERSION_SELECTION="manual: $NEXT_TAG"
+          else
+            NEXT_TAG="$(./scripts/next-release-tag.sh "$LATEST_TAG" "$BUMP")"
+            VERSION_SELECTION="bump: $BUMP"
+          fi
+
+          EXISTING_REF="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$NEXT_TAG" --jq '.object.type + ":" + .object.sha' 2>/dev/null || true)"
+          if [ -n "$EXISTING_REF" ]; then
+            if [ "$EXISTING_REF" = "commit:$GITHUB_SHA" ]; then
+              TAG_STATUS='Tag already points to this commit; reusing it.'
+            elif [ "$BUMP" = manual ]; then
+              TAG_STATUS="Manual selection will reuse the existing tag without moving it: $NEXT_TAG"
+            else
+              echo "::error::Existing automatically selected tag points to a different commit: $NEXT_TAG"
+              exit 1
+            fi
+          else
+            TAG_STATUS='Tag is available and will be reserved after the builds pass.'
+          fi
+
+          EXISTING_RELEASE="$(gh release view "$NEXT_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if [ -n "$EXISTING_RELEASE" ]; then
+            echo "::error::An existing release already uses this tag; handle it manually before retrying: $NEXT_TAG"
             exit 1
           fi
           printf 'release_tag=%s\n' "$NEXT_TAG" >> "$GITHUB_OUTPUT"
@@ -83,8 +119,10 @@ jobs:
             echo '## Release version resolved'
             echo
             echo "Latest published release: \`$LATEST_TAG\`"
-            echo "Selected bump: \`$BUMP\`"
+            echo "Version selection: \`$VERSION_SELECTION\`"
             echo "Draft release tag: \`$NEXT_TAG\`"
+            echo "$TAG_STATUS"
+            echo 'A new draft release will be created.'
           } >> "$GITHUB_STEP_SUMMARY"
 
   verify-rustpush-patches:
@@ -660,21 +698,33 @@ jobs:
           done
           test "$(find dist -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" = 3
 
-      # Atomically reserve the tag immediately before release creation. The
-      # resolver's earlier read avoids wasted builds, but cannot prevent another
-      # maintainer from taking the tag while builds are running. A Git ref POST
-      # is the write-side collision guard: an existing ref fails instead of
-      # silently attaching our release to another commit.
+      # Reserve the tag immediately before release creation. A retry may reuse a
+      # tag already pointing to this exact workflow commit; any other target is
+      # still a hard collision.
       - name: Reserve draft release tag
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.resolve-release-version.outputs.release_tag }}
+          VERSION_SELECTION: ${{ inputs.version_bump }}
         run: |
           set -euo pipefail
-          if ! gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
-            -f "ref=refs/tags/$RELEASE_TAG" \
-            -f "sha=$GITHUB_SHA" >/dev/null; then
-            echo "::error::Refusing to use an existing or unreservable tag: $RELEASE_TAG"
+          EXISTING_REF="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type + ":" + .object.sha' 2>/dev/null || true)"
+          if [ -z "$EXISTING_REF" ]; then
+            if gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f "ref=refs/tags/$RELEASE_TAG" \
+              -f "sha=$GITHUB_SHA" >/dev/null; then
+              echo 'Reserved a new release tag.'
+              exit 0
+            fi
+            # A concurrent retry may have created the same safe ref.
+            EXISTING_REF="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type + ":" + .object.sha' 2>/dev/null || true)"
+          fi
+          if [ "$EXISTING_REF" = "commit:$GITHUB_SHA" ]; then
+            echo 'Tag already points to this commit; reusing it.'
+          elif [ "$VERSION_SELECTION" = manual ] && [ -n "$EXISTING_REF" ]; then
+            echo "Manual selection will reuse the existing tag without moving it: $RELEASE_TAG"
+          else
+            echo "::error::Existing automatically selected tag points to a different commit: $RELEASE_TAG"
             exit 1
           fi
 

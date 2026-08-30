@@ -43,6 +43,19 @@ require "$WORKFLOW" "if [ \"\$BUILD_SCOPE\" != 'All platforms' ]; then"
 require "$WORKFLOW" 'No release tag will be reserved and no draft release will be created.'
 require "$WORKFLOW" 'Upload universal macOS binary'
 require "$WORKFLOW" 'RELEASE_TITLE: ${{ inputs.release_title }}'
+require "$WORKFLOW" '      manual_version:'
+require "$WORKFLOW" '          - manual'
+require "$WORKFLOW" 'MANUAL_VERSION: ${{ inputs.manual_version }}'
+require "$WORKFLOW" 'Manual version is required when version selection is manual.'
+require "$WORKFLOW" 'Manual version must be MAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH.'
+require "$WORKFLOW" 'Tag already points to this commit; reusing it.'
+require "$WORKFLOW" 'Manual selection will reuse the existing tag without moving it:'
+require "$WORKFLOW" 'VERSION_SELECTION: ${{ inputs.version_bump }}'
+require "$WORKFLOW" 'Existing automatically selected tag points to a different commit:'
+require "$WORKFLOW" 'An existing release already uses this tag; handle it manually before retrying:'
+if grep -Fq -- 'gh release upload' "$WORKFLOW" || grep -Fq -- '--clobber' "$WORKFLOW"; then
+  fail 'release workflow must never replace assets on an existing release'
+fi
 require "$WORKFLOW" "Draft release title is required for All platforms."
 python3 - "$WORKFLOW" <<'PY'
 from pathlib import Path
@@ -98,6 +111,72 @@ require "$PRIVATE_CHECKOUT" 'Private checkout failed. Detailed Git output was in
 checkout_tmp="$(mktemp -d)"
 trap 'rm -rf "$checkout_tmp"' EXIT
 mkdir -p "$checkout_tmp/bin" "$checkout_tmp/runner"
+
+resolver_script="$checkout_tmp/resolve-release-version.sh"
+python3 - "$WORKFLOW" "$resolver_script" <<'PY'
+from pathlib import Path
+import sys
+
+lines = Path(sys.argv[1]).read_text().splitlines()
+step = next(i for i, line in enumerate(lines) if line.strip() == '- name: Calculate next semantic version')
+run = next(i for i in range(step + 1, len(lines)) if lines[i].strip() == 'run: |')
+indent = len(lines[run]) - len(lines[run].lstrip())
+body = []
+for line in lines[run + 1:]:
+    if line.strip() and len(line) - len(line.lstrip()) <= indent:
+        break
+    body.append(line[indent + 2:] if line.strip() else '')
+Path(sys.argv[2]).write_text('\n'.join(body) + '\n')
+PY
+mkdir -p "$checkout_tmp/resolver-bin"
+cat > "$checkout_tmp/resolver-bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$1" = api ] && [[ "$2" == */releases/latest ]]; then
+  printf '%s\n' "${FAKE_LATEST_TAG:-1.2.3}"
+elif [ "$1" = api ] && [[ "$2" == */git/ref/tags/* ]]; then
+  [ -n "${FAKE_REF:-}" ] || exit 1
+  printf '%s\n' "$FAKE_REF"
+elif [ "$1 $2" = 'release view' ]; then
+  [ -n "${FAKE_RELEASE:-}" ] || exit 1
+  printf '%s\n' "$FAKE_RELEASE"
+else
+  printf 'unexpected fake gh invocation: %q ' "$@" >&2
+  exit 99
+fi
+EOF
+chmod +x "$checkout_tmp/resolver-bin/gh"
+
+run_resolver() {
+  local bump="$1" manual="$2" ref="${3:-}" release="${4:-}" expected_rc="$5"
+  local case_dir="$checkout_tmp/resolver-$bump-${manual//[^A-Za-z0-9]/_}-$RANDOM"
+  mkdir -p "$case_dir"
+  set +e
+  (
+    cd "$ROOT"
+    PATH="$checkout_tmp/resolver-bin:$PATH" \
+      BUILD_SCOPE='All platforms' BUMP="$bump" MANUAL_VERSION="$manual" \
+      RELEASE_TITLE='Test draft' GITHUB_REPOSITORY='lrhodin/corten-matrix' \
+      GITHUB_SHA='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+      GITHUB_OUTPUT="$case_dir/output" GITHUB_STEP_SUMMARY="$case_dir/summary" \
+      FAKE_REF="$ref" FAKE_RELEASE="$release" \
+      bash "$resolver_script"
+  ) >"$case_dir/stdout" 2>"$case_dir/stderr"
+  local rc=$?
+  set -e
+  [ "$rc" = "$expected_rc" ] || fail "resolver case bump=$bump manual=$manual returned $rc, expected $expected_rc"
+  RESOLVER_CASE_DIR="$case_dir"
+}
+
+run_resolver manual 2.3.4 '' '' 0
+require "$RESOLVER_CASE_DIR/output" 'release_tag=2.3.4'
+run_resolver manual v2.3.4 'commit:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' '' 0
+require "$RESOLVER_CASE_DIR/output" 'release_tag=v2.3.4'
+require "$RESOLVER_CASE_DIR/summary" 'Manual selection will reuse the existing tag without moving it: v2.3.4'
+run_resolver manual '' '' '' 1
+run_resolver manual 01.2.3 '' '' 1
+run_resolver patch '' 'commit:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' '' 1
+run_resolver manual 2.3.4 '' true 1
 
 mode_mac="$checkout_tmp/mode-mac"
 mkdir -p "$mode_mac"
