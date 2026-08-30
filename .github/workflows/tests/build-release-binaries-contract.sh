@@ -391,6 +391,25 @@ private_checkout_count="$(grep -Fc -- './.github/scripts/checkout-opencider.sh o
 verified_ref_count="$(grep -Fc -- 'OPENCIDER_REF_TOKEN: ${{ needs.verify-rustpush-patches.outputs.opencider_ref_token }}' "$WORKFLOW")"
 [ "$verified_ref_count" -eq 5 ] || fail "all four platform jobs and finalizer must consume the opaque verified OpenCider token (found $verified_ref_count)"
 require "$WORKFLOW" 'needs: [verify-rustpush-patches, macos-amd64, macos-arm64]'
+require "$WORKFLOW" 'test "$(uname -m)" = x86_64'
+require "$WORKFLOW" '[binary, "--help"]'
+python3 - "$WORKFLOW" <<'PY'
+from pathlib import Path
+import sys
+
+workflow = Path(sys.argv[1]).read_text()
+amd64 = workflow.split('\n  macos-amd64:', 1)[1].split('\n  macos-arm64:', 1)[0]
+arm64 = workflow.split('\n  macos-arm64:', 1)[1].split('\n  linux-amd64:', 1)[0]
+assemble = workflow.split('\n  assemble-macos:', 1)[1].split('\n  prepare-release:', 1)[0]
+if 'runs-on: macos-15\n' not in amd64:
+    raise SystemExit('x86_64 slice must cross-build on Apple Silicon macos-15')
+if 'runs-on: macos-15\n' not in arm64:
+    raise SystemExit('arm64 slice must remain on Apple Silicon macos-15')
+if 'runs-on: macos-15-intel\n' not in assemble:
+    raise SystemExit('universal finalizer must remain on Intel for native x86 smoke testing')
+if assemble.index('[binary, "--help"]') > assemble.index('./build-macos-universal.sh'):
+    raise SystemExit('native x86 smoke test must run before universal assembly')
+PY
 require "$WORKFLOW" '  prepare-release:'
 require "$WORKFLOW" 'needs: [resolve-release-version, assemble-macos, linux-amd64, linux-arm64]'
 cancellation_guard_count="$(grep -Fc -- '!cancelled() &&' "$WORKFLOW" || true)"

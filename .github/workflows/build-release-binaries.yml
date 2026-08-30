@@ -195,7 +195,9 @@ jobs:
     name: macOS x86_64 slice
     needs: [resolve-release-version, verify-rustpush-patches]
     if: inputs.build_scope == 'Mac only' || inputs.build_scope == 'All platforms'
-    runs-on: macos-15-intel
+    # Cross-compile x86_64 on Apple Silicon: clang and Rust both target x86_64
+    # explicitly, and this runner is substantially faster than the Intel host.
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - name: Check out public bridge
@@ -610,6 +612,35 @@ jobs:
 
       - name: Restore downloaded executable modes
         run: ./.github/scripts/restore-downloaded-executables.sh mac opencider/dist
+
+      # Compilation happens on Apple Silicon for speed. Execute the downloaded
+      # x86_64 slice on this Intel finalizer before Lipo so release validation
+      # still includes a native launch rather than architecture inspection alone.
+      - name: Smoke-test x86_64 slice natively
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          binary=opencider/dist/corten-matrix-macos.amd64
+          log="$RUNNER_TEMP/opencider-macos-amd64-smoke.log"
+          trap 'rm -f "$log"' EXIT
+          if ! python3 - "$binary" "$log" <<'PY'
+          import subprocess
+          import sys
+
+          binary, log_path = sys.argv[1:]
+          with open(log_path, "wb") as log:
+              subprocess.run(
+                  [binary, "--help"],
+                  stdout=log,
+                  stderr=subprocess.STDOUT,
+                  timeout=30,
+                  check=True,
+              )
+          PY
+          then
+            echo '::error::Native x86_64 macOS smoke test failed. Detailed output was intentionally withheld from public Actions logs.'
+            exit 1
+          fi
 
       - name: Lipo and apply identity-free macOS kernel seal
         working-directory: opencider
