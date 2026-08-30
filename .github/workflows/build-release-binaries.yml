@@ -537,19 +537,15 @@ jobs:
 
   assemble-macos:
     name: Assemble universal macOS binary
-    needs: [resolve-release-version, verify-rustpush-patches, macos-amd64, macos-arm64, linux-amd64, linux-arm64]
+    needs: [verify-rustpush-patches, macos-amd64, macos-arm64]
     if: >-
       always() &&
+      !cancelled() &&
       (inputs.build_scope == 'Mac only' || inputs.build_scope == 'All platforms') &&
       needs.macos-amd64.result == 'success' &&
-      needs.macos-arm64.result == 'success' &&
-      (inputs.build_scope == 'Mac only' ||
-       (needs.linux-amd64.result == 'success' && needs.linux-arm64.result == 'success'))
+      needs.macos-arm64.result == 'success'
     runs-on: macos-15-intel
     timeout-minutes: 60
-    # Creating the draft and its tag is the only write operation in this workflow.
-    permissions:
-      contents: write
     steps:
       - name: Check out public bridge
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -574,32 +570,10 @@ jobs:
           name: macos-arm64-slice
           path: opencider/dist
 
-      - name: Download amd64 Linux binary
-        if: inputs.build_scope == 'All platforms'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: linux-amd64-binary
-          path: opencider/dist
-
-      - name: Download arm64 Linux binary
-        if: inputs.build_scope == 'All platforms'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: linux-arm64-binary
-          path: opencider/dist
-
       - name: Restore downloaded executable modes
-        env:
-          BUILD_SCOPE: ${{ inputs.build_scope }}
-        run: |
-          set -euo pipefail
-          restore_scope=mac
-          if [ "$BUILD_SCOPE" = 'All platforms' ]; then
-            restore_scope=all
-          fi
-          ./.github/scripts/restore-downloaded-executables.sh "$restore_scope" opencider/dist
+        run: ./.github/scripts/restore-downloaded-executables.sh mac opencider/dist
 
-      - name: Lipo, harden, and sign macOS binary
+      - name: Lipo and apply identity-free macOS kernel seal
         working-directory: opencider
         env:
           REPO_DIR: ${{ github.workspace }}
@@ -611,18 +585,15 @@ jobs:
             exit 1
           fi
 
-      - name: Verify universal macOS binary
-        env:
-          REPO_DIR: ${{ github.workspace }}
+      # Both input slices already passed the complete private-source boundary
+      # gate. Lipo introduces no new printable content; verify only the universal
+      # structure and identity-free arm64 kernel seal here. This is neither
+      # Developer ID signing nor notarization and does not satisfy Gatekeeper.
+      - name: Verify universal macOS structure and kernel seal
         run: |
           set -euo pipefail
-          trap 'rm -f "$RUNNER_TEMP/opencider-macos-universal-artifact-verify.log"' EXIT
           binary=opencider/dist/corten-matrix-macos
           test -f "$binary" && test ! -L "$binary" && test -x "$binary"
-          if ! ./opencider/tools/verify-macos-artifact.sh "$binary" > "$RUNNER_TEMP/opencider-macos-universal-artifact-verify.log" 2>&1; then
-            echo '::error::Private macOS artifact safety verification failed. Detailed inspection output was intentionally withheld from public Actions logs.'
-            exit 1
-          fi
           otool -hv "$binary" | grep -qw EXECUTE
           lipo -archs "$binary" | grep -qw arm64
           lipo -archs "$binary" | grep -qw x86_64
@@ -636,13 +607,65 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  prepare-release:
+    name: Prepare draft release
+    needs: [resolve-release-version, assemble-macos, linux-amd64, linux-arm64]
+    if: >-
+      always() &&
+      !cancelled() &&
+      inputs.build_scope == 'All platforms' &&
+      needs.resolve-release-version.result == 'success' &&
+      needs.assemble-macos.result == 'success' &&
+      needs.linux-amd64.result == 'success' &&
+      needs.linux-arm64.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # This packaging-only job is the sole release mutation boundary. It receives
+    # no OpenCider secret or private checkout and compiles no source.
+    permissions:
+      contents: write
+    steps:
+      - name: Check out public release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Download universal macOS binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: macos-universal-binary
+          path: dist
+
+      - name: Download amd64 Linux binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: linux-amd64-binary
+          path: dist
+
+      - name: Download arm64 Linux binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: linux-arm64-binary
+          path: dist
+
+      - name: Restore and validate final release binaries
+        run: |
+          set -euo pipefail
+          ./.github/scripts/restore-downloaded-executables.sh release dist
+          for binary in \
+            dist/corten-matrix-macos \
+            dist/corten-matrix-linux-amd64 \
+            dist/corten-matrix-linux-arm64; do
+            test -f "$binary" && test ! -L "$binary" && test -x "$binary"
+          done
+          test "$(find dist -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" = 3
+
       # Atomically reserve the tag immediately before release creation. The
       # resolver's earlier read avoids wasted builds, but cannot prevent another
       # maintainer from taking the tag while builds are running. A Git ref POST
       # is the write-side collision guard: an existing ref fails instead of
       # silently attaching our release to another commit.
       - name: Reserve draft release tag
-        if: inputs.build_scope == 'All platforms'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.resolve-release-version.outputs.release_tag }}
@@ -658,9 +681,7 @@ jobs:
       # This is the manual approval boundary. The job attaches only the three
       # verified end-user binaries to a draft release. It deliberately does not
       # generate notes: edit the draft's notes in GitHub, then publish manually.
-      # The tag was atomically reserved at the dispatched commit above.
       - name: Create draft release
-        if: inputs.build_scope == 'All platforms'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.resolve-release-version.outputs.release_tag }}
@@ -672,12 +693,11 @@ jobs:
             --verify-tag \
             --title "$RELEASE_TITLE" \
             --draft \
-            opencider/dist/corten-matrix-macos \
-            opencider/dist/corten-matrix-linux-amd64 \
-            opencider/dist/corten-matrix-linux-arm64
+            dist/corten-matrix-macos \
+            dist/corten-matrix-linux-amd64 \
+            dist/corten-matrix-linux-arm64
 
       - name: Verify draft release assets
-        if: inputs.build_scope == 'All platforms'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.resolve-release-version.outputs.release_tag }}

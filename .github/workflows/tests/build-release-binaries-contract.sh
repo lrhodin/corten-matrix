@@ -79,9 +79,10 @@ MAC_BUILD_MONITOR="$ROOT/.github/scripts/run-private-macos-build.sh"
 require "$WORKFLOW" '../.github/scripts/run-private-macos-build.sh amd64'
 require "$WORKFLOW" '../.github/scripts/run-private-macos-build.sh arm64'
 mac_timeout_count="$(grep -Fc -- 'timeout-minutes: 60' "$WORKFLOW")"
-[ "$mac_timeout_count" -ge 3 ] || fail "both Mac slices and finalizer require 60-minute job caps (found $mac_timeout_count)"
+[ "$mac_timeout_count" -ge 3 ] || fail "both Mac slices and the assembler require 60-minute job caps (found $mac_timeout_count)"
 require "$RESTORE_EXECUTABLES" 'chmod 0755'
-require "$WORKFLOW" './.github/scripts/restore-downloaded-executables.sh "$restore_scope" opencider/dist'
+require "$WORKFLOW" './.github/scripts/restore-downloaded-executables.sh mac opencider/dist'
+require "$WORKFLOW" './.github/scripts/restore-downloaded-executables.sh release dist'
 require "$PRIVATE_CHECKOUT" 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl'
 require "$PRIVATE_CHECKOUT" 'fetch --quiet --no-tags origin refs/heads/master'
 if grep -Eq -- '--filter=|--depth=' "$PRIVATE_CHECKOUT"; then
@@ -130,6 +131,18 @@ chmod 0644 "$mode_all"/*
   || fail 'mode helper rejected exact all-platform downloaded artifacts'
 for binary in "$mode_all"/*; do
   [ -x "$binary" ] || fail 'mode helper did not restore an all-platform artifact to executable'
+done
+
+mode_release="$checkout_tmp/mode-release"
+mkdir -p "$mode_release"
+for name in corten-matrix-macos corten-matrix-linux-amd64 corten-matrix-linux-arm64; do
+  printf '%s\n' "$name" > "$mode_release/$name"
+done
+chmod 0644 "$mode_release"/*
+"$RESTORE_EXECUTABLES" release "$mode_release" >/dev/null 2>&1 \
+  || fail 'mode helper rejected the exact three final release binaries'
+for binary in "$mode_release"/*; do
+  [ -x "$binary" ] || fail 'mode helper did not restore a final release binary to executable'
 done
 
 monitor_dir="$checkout_tmp/mac-monitor"
@@ -298,7 +311,11 @@ private_checkout_count="$(grep -Fc -- './.github/scripts/checkout-opencider.sh o
 [ "$private_checkout_count" -eq 6 ] || fail "all six private checkouts must use the source-safe helper (found $private_checkout_count)"
 verified_ref_count="$(grep -Fc -- 'OPENCIDER_REF_TOKEN: ${{ needs.verify-rustpush-patches.outputs.opencider_ref_token }}' "$WORKFLOW")"
 [ "$verified_ref_count" -eq 5 ] || fail "all four platform jobs and finalizer must consume the opaque verified OpenCider token (found $verified_ref_count)"
-require "$WORKFLOW" 'needs: [resolve-release-version, verify-rustpush-patches, macos-amd64, macos-arm64, linux-amd64, linux-arm64]'
+require "$WORKFLOW" 'needs: [verify-rustpush-patches, macos-amd64, macos-arm64]'
+require "$WORKFLOW" '  prepare-release:'
+require "$WORKFLOW" 'needs: [resolve-release-version, assemble-macos, linux-amd64, linux-arm64]'
+cancellation_guard_count="$(grep -Fc -- '!cancelled() &&' "$WORKFLOW" || true)"
+[ "$cancellation_guard_count" -eq 2 ] || fail "assembler and release jobs must both stop on workflow cancellation (found $cancellation_guard_count guards)"
 require "$WORKFLOW" 'Apply and verify all portable RustPush patches'
 require "$WORKFLOW" 'RustPush patches applied and verified for private and public build flavors.'
 require "$WORKFLOW" 'PATCH_SAFE_STATUS_FILE: ${{ runner.temp }}/opencider-patch-status'
@@ -313,7 +330,7 @@ readelf_guard_count="$(grep -Fc -- 'readelf --dyn-syms --wide' "$WORKFLOW" || tr
 artifact_verifier_count="$(grep -Fc -- './opencider/tools/verify-linux-artifact.sh "$binary"' "$WORKFLOW")"
 [ "$artifact_verifier_count" -eq 2 ] || fail "both Linux artifacts must pass the redacted private verifier (found $artifact_verifier_count)"
 mac_artifact_verifier_count="$(grep -Fc -- './opencider/tools/verify-macos-artifact.sh "$binary"' "$WORKFLOW" || true)"
-[ "$mac_artifact_verifier_count" -eq 3 ] || fail "both macOS slices and the universal binary must pass the redacted private verifier (found $mac_artifact_verifier_count)"
+[ "$mac_artifact_verifier_count" -eq 2 ] || fail "both macOS slices must pass the redacted private verifier before Lipo (found $mac_artifact_verifier_count)"
 require "$WORKFLOW" 'Private Linux artifact safety verification failed. Detailed inspection output was intentionally withheld from public Actions logs.'
 require "$WORKFLOW" 'Private macOS artifact safety verification failed. Detailed inspection output was intentionally withheld from public Actions logs.'
 regular_file_guard_count="$(grep -Fc -- 'test ! -L "$binary"' "$WORKFLOW")"
@@ -338,8 +355,8 @@ private_commands = re.findall(
     workflow,
     re.MULTILINE,
 )
-if len(private_commands) != 11:
-    raise SystemExit(f'expected 11 directly redacted private-script invocations, found {len(private_commands)}')
+if len(private_commands) != 10:
+    raise SystemExit(f'expected 10 directly redacted private-script invocations, found {len(private_commands)}')
 unsafe_commands = [
     command for command in private_commands
     if not re.search(r'> "\$RUNNER_TEMP/[^"]+\.log" 2>&1', command)
@@ -459,7 +476,7 @@ if re.search(r'^\s+(?:if ! )?\./build\.sh\b', workflow, re.MULTILINE):
 setup_go_blocks = [block for block in step_blocks if re.search(r'^        uses: actions/setup-go@[0-9a-f]{40}', block, re.MULTILINE)]
 if len(setup_go_blocks) != 2 or any(block.count('          cache: false\n') != 1 for block in setup_go_blocks):
     raise SystemExit('both and only the Linux setup-go steps must keep caching disabled')
-if workflow.count("trap 'rm -f \"$RUNNER_TEMP/opencider") != 11:
+if workflow.count("trap 'rm -f \"$RUNNER_TEMP/opencider") != 10:
     raise SystemExit('every directly invoked private build/verification transcript must be deleted when its step exits')
 for forbidden in ('set -x', 'set -o xtrace', 'tee ', 'printenv'):
     if forbidden in workflow:
@@ -468,7 +485,15 @@ secret_names = re.findall(r'secrets\.([A-Za-z0-9_]+)', workflow)
 if set(secret_names) != {'OPENCIDER_READ_DEPLOY_KEY'} or len(secret_names) != 6:
     raise SystemExit(f'unexpected workflow secret surface: {secret_names!r}')
 if workflow.count('contents: write') != 1:
-    raise SystemExit('only the finalizer may receive contents: write')
+    raise SystemExit('only the separate release job may receive contents: write')
+assemble = workflow.split('\n  assemble-macos:', 1)[1].split('\n  prepare-release:', 1)[0]
+release = workflow.split('\n  prepare-release:', 1)[1]
+if 'contents: write' in assemble or 'gh release ' in assemble or 'Reserve draft release tag' in assemble:
+    raise SystemExit('macOS assembly job must not mutate or prepare a release')
+if 'contents: write' not in release or 'gh release create' not in release:
+    raise SystemExit('separate release job must own the sole release mutation')
+if 'checkout-opencider.sh' in release or 'OPENCIDER_READ_DEPLOY_KEY' in release:
+    raise SystemExit('release job must not receive private checkout access')
 PY
 require "$WORKFLOW" './build-macos-universal.sh > "$RUNNER_TEMP/opencider-build.log" 2>&1'
 require "$WORKFLOW" 'Private build failed. Detailed compiler output was intentionally withheld from public Actions logs.'

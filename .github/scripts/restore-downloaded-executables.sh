@@ -12,22 +12,35 @@ fail() {
 scope="$1"
 dist="$2"
 case "$scope" in
-  mac|all) ;;
+  mac|all|release) ;;
   *) fail ;;
 esac
 [ -d "$dist" ] || fail
 [ ! -L "$dist" ] || fail
 
-expected=(
-  corten-matrix-macos.amd64
-  corten-matrix-macos.arm64
-)
-if [ "$scope" = all ]; then
-  expected+=(
-    corten-matrix-linux-amd64
-    corten-matrix-linux-arm64
-  )
-fi
+case "$scope" in
+  mac)
+    expected=(
+      corten-matrix-macos.amd64
+      corten-matrix-macos.arm64
+    )
+    ;;
+  all)
+    expected=(
+      corten-matrix-macos.amd64
+      corten-matrix-macos.arm64
+      corten-matrix-linux-amd64
+      corten-matrix-linux-arm64
+    )
+    ;;
+  release)
+    expected=(
+      corten-matrix-macos
+      corten-matrix-linux-amd64
+      corten-matrix-linux-arm64
+    )
+    ;;
+esac
 
 shopt -s nullglob dotglob
 entries=("$dist"/*)
