@@ -232,7 +232,7 @@ jobs:
         env:
           REPO_DIR: ${{ github.workspace }}
           BUILD_DIR: ${{ runner.temp }}/opencider-macos-amd64
-        run: ../.github/scripts/run-private-macos-build.sh amd64
+        run: ../.github/scripts/run-private-slice-build.sh macos amd64
 
       - name: Verify x86_64 slice
         env:
@@ -294,7 +294,7 @@ jobs:
         env:
           REPO_DIR: ${{ github.workspace }}
           BUILD_DIR: ${{ runner.temp }}/opencider-macos-arm64
-        run: ../.github/scripts/run-private-macos-build.sh arm64
+        run: ../.github/scripts/run-private-slice-build.sh macos arm64
 
       - name: Verify arm64 slice
         env:
@@ -324,30 +324,24 @@ jobs:
     needs: [resolve-release-version, verify-rustpush-patches]
     if: inputs.build_scope == 'Linux AMD64 only' || inputs.build_scope == 'Linux both' || inputs.build_scope == 'All platforms'
     runs-on: ubuntu-24.04
-    # The host handles authenticated checkout. The native build runs inside
-    # Rocky Linux 8 below, preserving glibc 2.28 without Zig.
-    timeout-minutes: 360
+    # Build directly on the free native runner with Zig's glibc 2.28 target.
+    # This removes both Rocky containers and the duplicate package bootstrap.
+    timeout-minutes: 60
     steps:
       - name: Check out public bridge
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
+      # Cache only public crates.io metadata and authenticated .crate archives.
+      # Never cache registry/src, Cargo target output, or any OpenCider path.
       - name: Cache public Cargo registry inputs
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
-            ${{ runner.temp }}/opencider-public-cargo-registry/cache
-            ${{ runner.temp }}/opencider-public-cargo-registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
           key: opencider-public-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pkg/rustpushgo/Cargo.lock', 'nac-validation/Cargo.lock', 'third_party/rustpush-upstream.sha') }}
-
-      # This cache contains only the official protobuf ZIP. build-linux.sh
-      # authenticates it by the pinned SHA-256 and re-extracts on every run.
-      - name: Cache public protoc release archive
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ${{ runner.temp }}/opencider-public-protoc/protoc-27.5-linux-x86_64.zip
-          key: opencider-public-protoc-${{ runner.os }}-${{ runner.arch }}-27.5-33abede6330dd22fb9af47c2d9804ead3d86c82e025b9eef361a9ac2e955ecce
 
       - name: Check out private OpenCider
         env:
@@ -361,73 +355,12 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      # Bootstrap separately so package/toolchain failures stop before private
-      # compilation. The entrypoint itself is private, so even preflight output
-      # stays runner-local: Bash errors can quote source lines before BOOTSTRAP_ONLY
-      # reaches its early exit.
-      - name: Preflight native amd64 Linux toolchain
+      - name: Build amd64 Linux binary with Zig
+        working-directory: opencider
         env:
-          REPO_DIR: /workspace
-          BUILD_DIR: /tmp/opencider-linux-amd64-preflight
-          BOOTSTRAP_ONLY: "1"
-          PROTOC_DOWNLOAD_CACHE_DIR: /public-protoc-cache
-        run: |
-          set -euo pipefail
-          trap 'rm -f "$RUNNER_TEMP/opencider-preflight.log"' EXIT
-          GOROOT="$(go env GOROOT)"
-          if ! docker run --rm \
-            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
-            --volume "$GITHUB_WORKSPACE/opencider:/workspace/opencider" \
-            --volume "$GOROOT:/opt/go:ro" \
-            --volume "$RUNNER_TEMP/opencider-public-protoc:/public-protoc-cache" \
-            --env REPO_DIR \
-            --env BUILD_DIR \
-            --env PROTOC_DOWNLOAD_CACHE_DIR \
-            --env BOOTSTRAP_ONLY \
-            --env PATH=/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            --workdir /workspace/opencider \
-            rockylinux@sha256:9794037624aaa6212aeada1d28861ef5e0a935adaf93e4ef79837119f2a2d04c \
-            ./build-linux.sh > "$RUNNER_TEMP/opencider-preflight.log" 2>&1; then
-            echo '::error::Private Linux bootstrap preflight failed. Detailed output was intentionally withheld from public Actions logs.'
-            exit 1
-          fi
-
-      - name: Build native amd64 Linux binary
-        env:
-          REPO_DIR: /workspace
-          BUILD_DIR: /tmp/opencider-linux-amd64
-          BUILD_SAFE_STAGE_FILE: /runner-temp/opencider-linux-amd64-stage
-          PROTOC_DOWNLOAD_CACHE_DIR: /public-protoc-cache
-        run: |
-          set -euo pipefail
-          trap 'rm -f "$RUNNER_TEMP/opencider-build.log"' EXIT
-          GOROOT="$(go env GOROOT)"
-          STATUS_FILE="$RUNNER_TEMP/opencider-linux-amd64-stage"
-          rm -f "$STATUS_FILE"
-          if ! docker run --rm \
-            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
-            --volume "$GITHUB_WORKSPACE/opencider:/workspace/opencider" \
-            --volume "$GOROOT:/opt/go:ro" \
-            --volume "$RUNNER_TEMP/opencider-public-protoc:/public-protoc-cache" \
-            --volume "$RUNNER_TEMP:/runner-temp" \
-            --volume "$RUNNER_TEMP/opencider-public-cargo-registry:/root/.cargo/registry" \
-            --env REPO_DIR \
-            --env BUILD_DIR \
-            --env PROTOC_DOWNLOAD_CACHE_DIR \
-            --env BUILD_SAFE_STAGE_FILE \
-            --env PATH=/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            --workdir /workspace/opencider \
-            rockylinux@sha256:9794037624aaa6212aeada1d28861ef5e0a935adaf93e4ef79837119f2a2d04c \
-            ./build-linux.sh > "$RUNNER_TEMP/opencider-build.log" 2>&1; then
-            stage=unknown
-            case "$(cat "$STATUS_FILE" 2>/dev/null || true)" in
-              bootstrap|glibc|sync-public-bridge|clone-public-rustpush|checkout-public-rustpush|fairplay-stubs|fetch-public-submodules|validate-public-submodules|overlay-private-rust|apply-rustpush-patches|cargo-build|overlay-private-go|go-build|harden|notices|complete)
-                stage="$(cat "$STATUS_FILE")"
-                ;;
-            esac
-            echo "::error::Private build failed at source-safe stage: $stage. Detailed compiler output was intentionally withheld from public Actions logs."
-            exit 1
-          fi
+          REPO_DIR: ${{ github.workspace }}
+          BUILD_DIR: ${{ runner.temp }}/opencider-linux-amd64
+        run: ../.github/scripts/run-private-slice-build.sh linux amd64
 
       - name: Verify amd64 ELF
         env:
@@ -455,30 +388,24 @@ jobs:
     needs: [resolve-release-version, verify-rustpush-patches]
     if: inputs.build_scope == 'Linux ARM64 only' || inputs.build_scope == 'Linux both' || inputs.build_scope == 'All platforms'
     runs-on: ubuntu-24.04-arm
-    # The host handles authenticated checkout. The native build runs inside the
-    # arm64 Rocky Linux 8 image below, preserving glibc 2.28 without Zig.
-    timeout-minutes: 360
+    # Build directly on the free native runner with Zig's glibc 2.28 target.
+    # This removes both Rocky containers and the duplicate package bootstrap.
+    timeout-minutes: 60
     steps:
       - name: Check out public bridge
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
+      # Cache only public crates.io metadata and authenticated .crate archives.
+      # Never cache registry/src, Cargo target output, or any OpenCider path.
       - name: Cache public Cargo registry inputs
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
-            ${{ runner.temp }}/opencider-public-cargo-registry/cache
-            ${{ runner.temp }}/opencider-public-cargo-registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
           key: opencider-public-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pkg/rustpushgo/Cargo.lock', 'nac-validation/Cargo.lock', 'third_party/rustpush-upstream.sha') }}
-
-      # This cache contains only the official protobuf ZIP. build-linux.sh
-      # authenticates it by the pinned SHA-256 and re-extracts on every run.
-      - name: Cache public protoc release archive
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ${{ runner.temp }}/opencider-public-protoc/protoc-27.5-linux-aarch_64.zip
-          key: opencider-public-protoc-${{ runner.os }}-${{ runner.arch }}-27.5-9fdb165737b6dc8138473fa6a18e8a9e21a85f567102f3ab20d4e70442eef6db
 
       - name: Check out private OpenCider
         env:
@@ -492,71 +419,12 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      # Bootstrap separately so package/toolchain failures stop before private
-      # compilation. The private entrypoint remains fully redacted here too.
-      - name: Preflight native arm64 Linux toolchain
+      - name: Build arm64 Linux binary with Zig
+        working-directory: opencider
         env:
-          REPO_DIR: /workspace
-          BUILD_DIR: /tmp/opencider-linux-arm64-preflight
-          BOOTSTRAP_ONLY: "1"
-          PROTOC_DOWNLOAD_CACHE_DIR: /public-protoc-cache
-        run: |
-          set -euo pipefail
-          trap 'rm -f "$RUNNER_TEMP/opencider-preflight.log"' EXIT
-          GOROOT="$(go env GOROOT)"
-          if ! docker run --rm \
-            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
-            --volume "$GITHUB_WORKSPACE/opencider:/workspace/opencider" \
-            --volume "$GOROOT:/opt/go:ro" \
-            --volume "$RUNNER_TEMP/opencider-public-protoc:/public-protoc-cache" \
-            --env REPO_DIR \
-            --env BUILD_DIR \
-            --env PROTOC_DOWNLOAD_CACHE_DIR \
-            --env BOOTSTRAP_ONLY \
-            --env PATH=/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            --workdir /workspace/opencider \
-            rockylinux@sha256:9794037624aaa6212aeada1d28861ef5e0a935adaf93e4ef79837119f2a2d04c \
-            ./build-linux.sh > "$RUNNER_TEMP/opencider-preflight.log" 2>&1; then
-            echo '::error::Private Linux bootstrap preflight failed. Detailed output was intentionally withheld from public Actions logs.'
-            exit 1
-          fi
-
-      - name: Build native arm64 Linux binary
-        env:
-          REPO_DIR: /workspace
-          BUILD_DIR: /tmp/opencider-linux-arm64
-          BUILD_SAFE_STAGE_FILE: /runner-temp/opencider-linux-arm64-stage
-          PROTOC_DOWNLOAD_CACHE_DIR: /public-protoc-cache
-        run: |
-          set -euo pipefail
-          trap 'rm -f "$RUNNER_TEMP/opencider-build.log"' EXIT
-          GOROOT="$(go env GOROOT)"
-          STATUS_FILE="$RUNNER_TEMP/opencider-linux-arm64-stage"
-          rm -f "$STATUS_FILE"
-          if ! docker run --rm \
-            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
-            --volume "$GITHUB_WORKSPACE/opencider:/workspace/opencider" \
-            --volume "$GOROOT:/opt/go:ro" \
-            --volume "$RUNNER_TEMP/opencider-public-protoc:/public-protoc-cache" \
-            --volume "$RUNNER_TEMP:/runner-temp" \
-            --volume "$RUNNER_TEMP/opencider-public-cargo-registry:/root/.cargo/registry" \
-            --env REPO_DIR \
-            --env BUILD_DIR \
-            --env PROTOC_DOWNLOAD_CACHE_DIR \
-            --env BUILD_SAFE_STAGE_FILE \
-            --env PATH=/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            --workdir /workspace/opencider \
-            rockylinux@sha256:9794037624aaa6212aeada1d28861ef5e0a935adaf93e4ef79837119f2a2d04c \
-            ./build-linux.sh > "$RUNNER_TEMP/opencider-build.log" 2>&1; then
-            stage=unknown
-            case "$(cat "$STATUS_FILE" 2>/dev/null || true)" in
-              bootstrap|glibc|sync-public-bridge|clone-public-rustpush|checkout-public-rustpush|fairplay-stubs|fetch-public-submodules|validate-public-submodules|overlay-private-rust|apply-rustpush-patches|cargo-build|overlay-private-go|go-build|harden|notices|complete)
-                stage="$(cat "$STATUS_FILE")"
-                ;;
-            esac
-            echo "::error::Private build failed at source-safe stage: $stage. Detailed compiler output was intentionally withheld from public Actions logs."
-            exit 1
-          fi
+          REPO_DIR: ${{ github.workspace }}
+          BUILD_DIR: ${{ runner.temp }}/opencider-linux-arm64
+        run: ../.github/scripts/run-private-slice-build.sh linux arm64
 
       - name: Verify arm64 ELF
         env:

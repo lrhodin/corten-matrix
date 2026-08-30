@@ -87,12 +87,19 @@ PRIVATE_CHECKOUT="$ROOT/.github/scripts/checkout-opencider.sh"
 [ -x "$PRIVATE_CHECKOUT" ] || fail 'missing executable source-safe private checkout helper'
 RESTORE_EXECUTABLES="$ROOT/.github/scripts/restore-downloaded-executables.sh"
 [ -x "$RESTORE_EXECUTABLES" ] || fail 'missing executable downloaded-artifact mode restoration helper'
-MAC_BUILD_MONITOR="$ROOT/.github/scripts/run-private-macos-build.sh"
-[ -x "$MAC_BUILD_MONITOR" ] || fail 'missing executable source-safe macOS build monitor'
-require "$WORKFLOW" '../.github/scripts/run-private-macos-build.sh amd64'
-require "$WORKFLOW" '../.github/scripts/run-private-macos-build.sh arm64'
+SLICE_BUILD_MONITOR="$ROOT/.github/scripts/run-private-slice-build.sh"
+[ -x "$SLICE_BUILD_MONITOR" ] || fail 'missing executable source-safe platform slice build monitor'
+require "$WORKFLOW" '../.github/scripts/run-private-slice-build.sh macos amd64'
+require "$WORKFLOW" '../.github/scripts/run-private-slice-build.sh macos arm64'
+require "$WORKFLOW" '../.github/scripts/run-private-slice-build.sh linux amd64'
+require "$WORKFLOW" '../.github/scripts/run-private-slice-build.sh linux arm64'
 mac_timeout_count="$(grep -Fc -- 'timeout-minutes: 60' "$WORKFLOW")"
-[ "$mac_timeout_count" -ge 3 ] || fail "both Mac slices and the assembler require 60-minute job caps (found $mac_timeout_count)"
+[ "$mac_timeout_count" -ge 5 ] || fail "all four slices and the assembler require 60-minute job caps (found $mac_timeout_count)"
+for forbidden_fast_path in 'docker run' 'rockylinux@sha256:' 'Preflight native' 'Cache public protoc release archive'; do
+  if grep -Fq -- "$forbidden_fast_path" "$WORKFLOW"; then
+    fail "fast release workflow retained container/bootstrap overhead: $forbidden_fast_path"
+  fi
+done
 require "$RESTORE_EXECUTABLES" 'chmod 0755'
 require "$WORKFLOW" './.github/scripts/restore-downloaded-executables.sh mac opencider/dist'
 require "$WORKFLOW" './.github/scripts/restore-downloaded-executables.sh release dist'
@@ -230,8 +237,8 @@ for binary in "$mode_release"/*; do
   [ -x "$binary" ] || fail 'mode helper did not restore a final release binary to executable'
 done
 
-monitor_dir="$checkout_tmp/mac-monitor"
-monitor_runner="$checkout_tmp/mac-monitor-runner"
+monitor_dir="$checkout_tmp/slice-monitor"
+monitor_runner="$checkout_tmp/slice-monitor-runner"
 mkdir -p "$monitor_dir" "$monitor_runner"
 cat > "$monitor_dir/build-macos-slice.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -240,43 +247,42 @@ printf '%s\n' 'PRIVATE COMPILER OUTPUT MUST STAY HIDDEN' >&2
 sleep 2
 printf '%s\n' complete > "$BUILD_SAFE_STAGE_FILE"
 EOF
-chmod +x "$monitor_dir/build-macos-slice.sh"
-monitor_output="$checkout_tmp/mac-monitor-output"
-(
-  cd "$monitor_dir"
-  RUNNER_TEMP="$monitor_runner" MAC_BUILD_HEARTBEAT_SECONDS=1 \
-    MAC_BUILD_HEARTBEAT_EVERY=1 "$MAC_BUILD_MONITOR" arm64
-) > "$monitor_output" 2>&1 || fail 'macOS build monitor rejected a successful private build'
-require "$monitor_output" 'macOS arm64 build stage: cargo-build'
-require "$monitor_output" 'macOS arm64 build stage: complete'
-if grep -Fq 'PRIVATE COMPILER OUTPUT' "$monitor_output"; then
-  fail 'macOS build monitor exposed private build output on success'
-fi
-if compgen -G "$monitor_runner/opencider-macos-*" >/dev/null; then
-  fail 'macOS build monitor retained a private transcript or status file after success'
-fi
-cat > "$monitor_dir/build-macos-slice.sh" <<'EOF'
+cat > "$monitor_dir/build-linux-zig-slice.sh" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' go-build > "$BUILD_SAFE_STAGE_FILE"
 printf '%s\n' 'PRIVATE FAILURE OUTPUT MUST STAY HIDDEN' >&2
 exit 7
 EOF
-chmod +x "$monitor_dir/build-macos-slice.sh"
+chmod +x "$monitor_dir/build-macos-slice.sh" "$monitor_dir/build-linux-zig-slice.sh"
+monitor_output="$checkout_tmp/slice-monitor-output"
+(
+  cd "$monitor_dir"
+  RUNNER_TEMP="$monitor_runner" SLICE_BUILD_HEARTBEAT_SECONDS=1 \
+    SLICE_BUILD_HEARTBEAT_EVERY=1 "$SLICE_BUILD_MONITOR" macos arm64
+) > "$monitor_output" 2>&1 || fail 'slice build monitor rejected a successful private macOS build'
+require "$monitor_output" 'macOS arm64 build stage: cargo-build'
+require "$monitor_output" 'macOS arm64 build stage: complete'
+if grep -Fq 'PRIVATE COMPILER OUTPUT' "$monitor_output"; then
+  fail 'slice build monitor exposed private macOS output on success'
+fi
+if compgen -G "$monitor_runner/opencider-*-*" >/dev/null; then
+  fail 'slice build monitor retained a private transcript or status file after success'
+fi
 if (
   cd "$monitor_dir"
-  RUNNER_TEMP="$monitor_runner" MAC_BUILD_HEARTBEAT_SECONDS=1 \
-    MAC_BUILD_HEARTBEAT_EVERY=1 "$MAC_BUILD_MONITOR" amd64
+  RUNNER_TEMP="$monitor_runner" SLICE_BUILD_HEARTBEAT_SECONDS=1 \
+    SLICE_BUILD_HEARTBEAT_EVERY=1 "$SLICE_BUILD_MONITOR" linux amd64
 ) > "$monitor_output" 2>&1; then
-  fail 'macOS build monitor accepted a failed private build'
+  fail 'slice build monitor accepted a failed private Linux Zig build'
 fi
-require "$monitor_output" 'Private macOS build failed at source-safe stage: go-build.'
+require "$monitor_output" 'Private Linux build failed at source-safe stage: go-build.'
 if grep -Fq 'PRIVATE FAILURE OUTPUT' "$monitor_output"; then
-  fail 'macOS build monitor exposed private build output on failure'
+  fail 'slice build monitor exposed private Linux output on failure'
 fi
-if compgen -G "$monitor_runner/opencider-macos-*" >/dev/null; then
-  fail 'macOS build monitor retained a private transcript or status file after failure'
+if compgen -G "$monitor_runner/opencider-*-*" >/dev/null; then
+  fail 'slice build monitor retained a private transcript or status file after failure'
 fi
-cat > "$monitor_dir/build-macos-slice.sh" <<'EOF'
+cat > "$monitor_dir/build-linux-zig-slice.sh" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$$" > "$FAKE_CHILD_PID_FILE"
 printf '%s\n' cargo-build > "$BUILD_SAFE_STAGE_FILE"
@@ -284,13 +290,13 @@ printf '%s\n' 'PRIVATE CANCELLATION OUTPUT MUST STAY HIDDEN' >&2
 trap 'exit 0' INT TERM
 while :; do sleep 1; done
 EOF
-chmod +x "$monitor_dir/build-macos-slice.sh"
-child_pid_file="$checkout_tmp/mac-monitor-child-pid"
+chmod +x "$monitor_dir/build-linux-zig-slice.sh"
+child_pid_file="$checkout_tmp/slice-monitor-child-pid"
 monitor_cwd="$PWD"
 cd "$monitor_dir"
-RUNNER_TEMP="$monitor_runner" MAC_BUILD_HEARTBEAT_SECONDS=1 \
-  MAC_BUILD_HEARTBEAT_EVERY=1 FAKE_CHILD_PID_FILE="$child_pid_file" \
-  "$MAC_BUILD_MONITOR" arm64 > "$monitor_output" 2>&1 &
+RUNNER_TEMP="$monitor_runner" SLICE_BUILD_HEARTBEAT_SECONDS=1 \
+  SLICE_BUILD_HEARTBEAT_EVERY=1 FAKE_CHILD_PID_FILE="$child_pid_file" \
+  "$SLICE_BUILD_MONITOR" linux arm64 > "$monitor_output" 2>&1 &
 monitor_pid=$!
 cd "$monitor_cwd"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -304,21 +310,21 @@ set +e
 wait "$monitor_pid"
 monitor_status=$?
 set -e
-[ "$monitor_status" -ne 0 ] || fail 'cancelled macOS build monitor reported success'
+[ "$monitor_status" -ne 0 ] || fail 'cancelled slice build monitor reported success'
 for _ in 1 2 3 4 5; do
   kill -0 "$child_pid" 2>/dev/null || break
   sleep 1
 done
 if kill -0 "$child_pid" 2>/dev/null; then
   kill -TERM "$child_pid" 2>/dev/null || true
-  fail 'cancelled macOS build monitor left its private child running'
+  fail 'cancelled slice build monitor left its private child running'
 fi
 sleep 1
-if compgen -G "$monitor_runner/opencider-macos-*" >/dev/null; then
-  fail 'cancelled macOS build recreated or retained a private transcript/status file'
+if compgen -G "$monitor_runner/opencider-*-*" >/dev/null; then
+  fail 'cancelled slice build retained a private transcript/status file'
 fi
 if grep -Fq 'PRIVATE CANCELLATION OUTPUT' "$monitor_output"; then
-  fail 'macOS build monitor exposed private build output on cancellation'
+  fail 'slice build monitor exposed private output on cancellation'
 fi
 
 guard_repo="$checkout_tmp/public-guard-repo"
@@ -404,13 +410,17 @@ from pathlib import Path
 import sys
 
 workflow = Path(sys.argv[1]).read_text()
-amd64 = workflow.split('\n  macos-amd64:', 1)[1].split('\n  macos-arm64:', 1)[0]
-arm64 = workflow.split('\n  macos-arm64:', 1)[1].split('\n  linux-amd64:', 1)[0]
+mac_amd64 = workflow.split('\n  macos-amd64:', 1)[1].split('\n  macos-arm64:', 1)[0]
+mac_arm64 = workflow.split('\n  macos-arm64:', 1)[1].split('\n  linux-amd64:', 1)[0]
+linux_amd64 = workflow.split('\n  linux-amd64:', 1)[1].split('\n  linux-arm64:', 1)[0]
+linux_arm64 = workflow.split('\n  linux-arm64:', 1)[1].split('\n  assemble-macos:', 1)[0]
 assemble = workflow.split('\n  assemble-macos:', 1)[1].split('\n  prepare-release:', 1)[0]
-if 'runs-on: macos-15\n' not in amd64:
-    raise SystemExit('x86_64 slice must cross-build on Apple Silicon macos-15')
-if 'runs-on: macos-15\n' not in arm64:
-    raise SystemExit('arm64 slice must remain on Apple Silicon macos-15')
+if 'runs-on: macos-15\n' not in mac_amd64 or 'runs-on: macos-15\n' not in mac_arm64:
+    raise SystemExit('both macOS slices must compile on free Apple Silicon macos-15 runners')
+if 'runs-on: ubuntu-24.04\n' not in linux_amd64:
+    raise SystemExit('Linux amd64 must Zig-build directly on the free native Ubuntu runner')
+if 'runs-on: ubuntu-24.04-arm\n' not in linux_arm64:
+    raise SystemExit('Linux arm64 must Zig-build directly on the free native Ubuntu ARM runner')
 if 'runs-on: macos-15-intel\n' not in assemble:
     raise SystemExit('universal finalizer must remain on Intel for native x86 smoke testing')
 if assemble.index('[binary, "--help"]') > assemble.index('./build-macos-universal.sh'):
@@ -441,13 +451,13 @@ regular_file_guard_count="$(grep -Fc -- 'test ! -L "$binary"' "$WORKFLOW")"
 [ "$regular_file_guard_count" -ge 5 ] || fail "every uploaded artifact must reject symlinks (found $regular_file_guard_count guards)"
 mach_execute_guard_count="$(grep -Fc -- 'otool -hv "$binary" | grep -qw EXECUTE' "$WORKFLOW")"
 [ "$mach_execute_guard_count" -ge 3 ] || fail "both macOS slices and the universal binary must be Mach-O executables (found $mach_execute_guard_count guards)"
-python3 - "$WORKFLOW" "$MAC_BUILD_MONITOR" <<'PY'
+python3 - "$WORKFLOW" "$SLICE_BUILD_MONITOR" <<'PY'
 from pathlib import Path
 import re
 import sys
 
 workflow = Path(sys.argv[1]).read_text()
-mac_monitor = Path(sys.argv[2]).read_text()
+slice_monitor = Path(sys.argv[2]).read_text()
 action_uses = re.findall(r'^\s+uses:\s+([^@\s]+)@([^\s]+)', workflow, re.MULTILINE)
 if not action_uses:
     raise SystemExit('workflow has no pinned Actions to validate')
@@ -459,20 +469,23 @@ private_commands = re.findall(
     workflow,
     re.MULTILINE,
 )
-if len(private_commands) != 10:
-    raise SystemExit(f'expected 10 directly redacted private-script invocations, found {len(private_commands)}')
+if len(private_commands) != 6:
+    raise SystemExit(f'expected 6 directly redacted private-script invocations, found {len(private_commands)}')
 unsafe_commands = [
     command for command in private_commands
     if not re.search(r'> "\$RUNNER_TEMP/[^"]+\.log" 2>&1', command)
 ]
 if unsafe_commands:
     raise SystemExit('private OpenCider script can write directly to public Actions logs')
-if '["./build-macos-slice.sh", arch]' not in mac_monitor or 'start_new_session=True' not in mac_monitor:
-    raise SystemExit('macOS monitor must launch exactly one fixed private slice build in an isolated process group')
-if 'os.killpg(child.pid, signum)' not in mac_monitor:
-    raise SystemExit('macOS monitor must forward cancellation to the complete private build process group')
-if "trap cleanup EXIT" not in mac_monitor or 'rm -f "$status_file" "$build_log"' not in mac_monitor:
-    raise SystemExit('macOS monitor must delete its source-safe status and private transcript')
+for entrypoint in ('build-macos-slice.sh', 'build-linux-zig-slice.sh'):
+    if entrypoint not in slice_monitor:
+        raise SystemExit(f'slice monitor must map a fixed platform to {entrypoint}')
+if 'start_new_session=True' not in slice_monitor:
+    raise SystemExit('slice monitor must launch each fixed private build in an isolated process group')
+if 'os.killpg(child.pid, signum)' not in slice_monitor:
+    raise SystemExit('slice monitor must forward cancellation to the complete private build process group')
+if "trap cleanup EXIT" not in slice_monitor or 'rm -f "$status_file" "$build_log"' not in slice_monitor:
+    raise SystemExit('slice monitor must delete its source-safe status and private transcript')
 
 upload_paths = re.findall(
     r'uses: actions/upload-artifact@[0-9a-f]{40}.*?\n\s+with:\n.*?\n\s+path: ([^\n]+)',
@@ -497,8 +510,8 @@ step_blocks = [
     for index, match in enumerate(step_starts)
 ]
 cache_blocks = [block for block in step_blocks if re.search(r'^        uses: actions/cache@[0-9a-f]{40}', block, re.MULTILINE)]
-if len(cache_blocks) != 6:
-    raise SystemExit(f'exactly six public-input cache steps are required, found {len(cache_blocks)}')
+if len(cache_blocks) != 4:
+    raise SystemExit(f'exactly four public Cargo input cache steps are required, found {len(cache_blocks)}')
 
 def cache_spec(block):
     name_match = re.search(r'^      - name: (.+)$', block, re.MULTILINE)
@@ -519,24 +532,8 @@ def cache_spec(block):
     return name_match.group(1), tuple(paths), key_match.group(1)
 
 cargo_key = "opencider-public-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pkg/rustpushgo/Cargo.lock', 'nac-validation/Cargo.lock', 'third_party/rustpush-upstream.sha') }}"
-expected_cache_specs = [
-    ('Cache public Cargo registry inputs', ('~/.cargo/registry/cache', '~/.cargo/registry/index'), cargo_key),
-    ('Cache public Cargo registry inputs', ('~/.cargo/registry/cache', '~/.cargo/registry/index'), cargo_key),
-    ('Cache public Cargo registry inputs', (
-        '${{ runner.temp }}/opencider-public-cargo-registry/cache',
-        '${{ runner.temp }}/opencider-public-cargo-registry/index',
-    ), cargo_key),
-    ('Cache public protoc release archive', (
-        '${{ runner.temp }}/opencider-public-protoc/protoc-27.5-linux-x86_64.zip',
-    ), 'opencider-public-protoc-${{ runner.os }}-${{ runner.arch }}-27.5-33abede6330dd22fb9af47c2d9804ead3d86c82e025b9eef361a9ac2e955ecce'),
-    ('Cache public Cargo registry inputs', (
-        '${{ runner.temp }}/opencider-public-cargo-registry/cache',
-        '${{ runner.temp }}/opencider-public-cargo-registry/index',
-    ), cargo_key),
-    ('Cache public protoc release archive', (
-        '${{ runner.temp }}/opencider-public-protoc/protoc-27.5-linux-aarch_64.zip',
-    ), 'opencider-public-protoc-${{ runner.os }}-${{ runner.arch }}-27.5-9fdb165737b6dc8138473fa6a18e8a9e21a85f567102f3ab20d4e70442eef6db'),
-]
+cargo_cache = ('Cache public Cargo registry inputs', ('~/.cargo/registry/cache', '~/.cargo/registry/index'), cargo_key)
+expected_cache_specs = [cargo_cache] * 4
 actual_cache_specs = [cache_spec(block) for block in cache_blocks]
 if actual_cache_specs != expected_cache_specs:
     raise SystemExit(f'public cache allowlist changed: {actual_cache_specs!r}')
@@ -548,39 +545,25 @@ for forbidden_cache_path in (
 ):
     if any(forbidden_cache_path in block for block in cache_blocks):
         raise SystemExit(f'private, extracted-source, or compiled cache path is forbidden: {forbidden_cache_path}')
-protoc_mount = '--volume "$RUNNER_TEMP/opencider-public-protoc:/public-protoc-cache"'
-cargo_mount = '--volume "$RUNNER_TEMP/opencider-public-cargo-registry:/root/.cargo/registry"'
-if workflow.count(protoc_mount) != 4:
-    raise SystemExit('both Linux preflight and build containers must mount the protoc archive cache')
-if workflow.count(cargo_mount) != 2:
-    raise SystemExit('only the two Linux build containers may mount the public Cargo registry cache')
-
-def one_step(name):
-    matches = [block for block in step_blocks if block.startswith(f'      - name: {name}\n')]
-    if len(matches) != 1:
-        raise SystemExit(f'expected exactly one workflow step named {name!r}, found {len(matches)}')
-    return matches[0]
-
-for arch in ('amd64', 'arm64'):
-    preflight = one_step(f'Preflight native {arch} Linux toolchain')
-    build = one_step(f'Build native {arch} Linux binary')
-    if preflight.count(protoc_mount) != 1 or build.count(protoc_mount) != 1:
-        raise SystemExit(f'Linux {arch} preflight and build must each mount the protoc ZIP cache')
-    if cargo_mount in preflight or build.count(cargo_mount) != 1:
-        raise SystemExit(f'only the Linux {arch} build may mount the Cargo registry cache')
-mac_slice_invocations = re.findall(
-    r'^\s+run: (\.\./\.github/scripts/run-private-macos-build\.sh (?:amd64|arm64))$',
+slice_invocations = re.findall(
+    r'^\s+run: (\.\./\.github/scripts/run-private-slice-build\.sh (?:macos|linux) (?:amd64|arm64))$',
     workflow,
     re.MULTILINE,
 )
-if mac_slice_invocations != ['../.github/scripts/run-private-macos-build.sh amd64', '../.github/scripts/run-private-macos-build.sh arm64']:
-    raise SystemExit(f'macOS jobs must use the source-safe public-OpenAbsinthe build monitor: {mac_slice_invocations!r}')
+expected_slice_invocations = [
+    '../.github/scripts/run-private-slice-build.sh macos amd64',
+    '../.github/scripts/run-private-slice-build.sh macos arm64',
+    '../.github/scripts/run-private-slice-build.sh linux amd64',
+    '../.github/scripts/run-private-slice-build.sh linux arm64',
+]
+if slice_invocations != expected_slice_invocations:
+    raise SystemExit(f'all platform jobs must use the fixed source-safe slice monitor: {slice_invocations!r}')
 if re.search(r'^\s+(?:if ! )?\./build\.sh\b', workflow, re.MULTILINE):
-    raise SystemExit('public workflow must not bypass the macOS public-OpenAbsinthe slice contract')
+    raise SystemExit('public workflow must not bypass fixed platform slice entrypoints')
 setup_go_blocks = [block for block in step_blocks if re.search(r'^        uses: actions/setup-go@[0-9a-f]{40}', block, re.MULTILINE)]
 if len(setup_go_blocks) != 2 or any(block.count('          cache: false\n') != 1 for block in setup_go_blocks):
-    raise SystemExit('both and only the Linux setup-go steps must keep caching disabled')
-if workflow.count("trap 'rm -f \"$RUNNER_TEMP/opencider") != 10:
+    raise SystemExit('both and only the direct Linux Zig jobs must use the declared Go toolchain without private caching')
+if workflow.count("trap 'rm -f \"$RUNNER_TEMP/opencider") != 6:
     raise SystemExit('every directly invoked private build/verification transcript must be deleted when its step exits')
 for forbidden in ('set -x', 'set -o xtrace', 'tee ', 'printenv'):
     if forbidden in workflow:
@@ -601,14 +584,10 @@ if 'checkout-opencider.sh' in release or 'OPENCIDER_READ_DEPLOY_KEY' in release:
 PY
 require "$WORKFLOW" './build-macos-universal.sh > "$RUNNER_TEMP/opencider-build.log" 2>&1'
 require "$WORKFLOW" 'Private build failed. Detailed compiler output was intentionally withheld from public Actions logs.'
-require "$WORKFLOW" 'BUILD_SAFE_STAGE_FILE: /runner-temp/opencider-linux-amd64-stage'
-require "$WORKFLOW" 'BUILD_SAFE_STAGE_FILE: /runner-temp/opencider-linux-arm64-stage'
-require "$WORKFLOW" '--volume "$RUNNER_TEMP:/runner-temp"'
-require "$WORKFLOW" '--volume "$RUNNER_TEMP/opencider-public-cargo-registry:/root/.cargo/registry"'
-require "$WORKFLOW" '--volume "$RUNNER_TEMP/opencider-public-protoc:/public-protoc-cache"'
-require "$WORKFLOW" 'PROTOC_DOWNLOAD_CACHE_DIR: /public-protoc-cache'
-require "$WORKFLOW" 'Private build failed at source-safe stage:'
-require "$WORKFLOW" 'sync-public-bridge|clone-public-rustpush|checkout-public-rustpush|fairplay-stubs|fetch-public-submodules|validate-public-submodules|overlay-private-rust|apply-rustpush-patches'
+require "$WORKFLOW" 'Build amd64 Linux binary with Zig'
+require "$WORKFLOW" 'Build arm64 Linux binary with Zig'
+require "$WORKFLOW" '../.github/scripts/run-private-slice-build.sh linux amd64'
+require "$WORKFLOW" '../.github/scripts/run-private-slice-build.sh linux arm64'
 
 ruby -e 'require "yaml"; YAML.load_file(ARGV.fetch(0))' "$WORKFLOW" \
   || fail 'workflow YAML does not parse'
