@@ -158,7 +158,7 @@ jobs:
     needs: [resolve-release-version, verify-rustpush-patches]
     if: inputs.build_scope == 'Mac only' || inputs.build_scope == 'All platforms'
     runs-on: macos-15-intel
-    timeout-minutes: 360
+    timeout-minutes: 60
     steps:
       - name: Check out public bridge
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -188,13 +188,7 @@ jobs:
         env:
           REPO_DIR: ${{ github.workspace }}
           BUILD_DIR: ${{ runner.temp }}/opencider-macos-amd64
-        run: |
-          set -euo pipefail
-          trap 'rm -f "$RUNNER_TEMP/opencider-build.log"' EXIT
-          if ! ./build-macos-slice.sh amd64 > "$RUNNER_TEMP/opencider-build.log" 2>&1; then
-            echo '::error::Private build failed. Detailed compiler output was intentionally withheld from public Actions logs.'
-            exit 1
-          fi
+        run: ../.github/scripts/run-private-macos-build.sh amd64
 
       - name: Verify x86_64 slice
         run: |
@@ -224,7 +218,7 @@ jobs:
     needs: [resolve-release-version, verify-rustpush-patches]
     if: inputs.build_scope == 'Mac only' || inputs.build_scope == 'All platforms'
     runs-on: macos-15
-    timeout-minutes: 360
+    timeout-minutes: 60
     steps:
       - name: Check out public bridge
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -254,13 +248,7 @@ jobs:
         env:
           REPO_DIR: ${{ github.workspace }}
           BUILD_DIR: ${{ runner.temp }}/opencider-macos-arm64
-        run: |
-          set -euo pipefail
-          trap 'rm -f "$RUNNER_TEMP/opencider-build.log"' EXIT
-          if ! ./build-macos-slice.sh arm64 > "$RUNNER_TEMP/opencider-build.log" 2>&1; then
-            echo '::error::Private build failed. Detailed compiler output was intentionally withheld from public Actions logs.'
-            exit 1
-          fi
+        run: ../.github/scripts/run-private-macos-build.sh arm64
 
       - name: Verify arm64 slice
         run: |
