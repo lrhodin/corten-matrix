@@ -191,6 +191,8 @@ jobs:
         run: ../.github/scripts/run-private-macos-build.sh amd64
 
       - name: Verify x86_64 slice
+        env:
+          REPO_DIR: ${{ github.workspace }}
         run: |
           set -euo pipefail
           trap 'rm -f "$RUNNER_TEMP/opencider-macos-amd64-artifact-verify.log"' EXIT
@@ -251,6 +253,8 @@ jobs:
         run: ../.github/scripts/run-private-macos-build.sh arm64
 
       - name: Verify arm64 slice
+        env:
+          REPO_DIR: ${{ github.workspace }}
         run: |
           set -euo pipefail
           trap 'rm -f "$RUNNER_TEMP/opencider-macos-arm64-artifact-verify.log"' EXIT
@@ -382,6 +386,8 @@ jobs:
           fi
 
       - name: Verify amd64 ELF
+        env:
+          REPO_DIR: ${{ github.workspace }}
         run: |
           set -euo pipefail
           trap 'rm -f "$RUNNER_TEMP/opencider-linux-amd64-artifact-verify.log"' EXIT
@@ -509,6 +515,8 @@ jobs:
           fi
 
       - name: Verify arm64 ELF
+        env:
+          REPO_DIR: ${{ github.workspace }}
         run: |
           set -euo pipefail
           trap 'rm -f "$RUNNER_TEMP/opencider-linux-arm64-artifact-verify.log"' EXIT
@@ -604,6 +612,8 @@ jobs:
           fi
 
       - name: Verify universal macOS binary
+        env:
+          REPO_DIR: ${{ github.workspace }}
         run: |
           set -euo pipefail
           trap 'rm -f "$RUNNER_TEMP/opencider-macos-universal-artifact-verify.log"' EXIT
