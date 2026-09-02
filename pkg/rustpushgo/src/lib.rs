@@ -26,7 +26,7 @@ use rustpush::{
     TextFlags, TextFormat, TextEffect,
     ShareProfileMessage, SharedPoster, PartExtension, UpdateExtensionMessage, UpdateProfileMessage,
     UpdateProfileSharingMessage, SetTranscriptBackgroundMessage,
-    TokenProvider,
+    TokenProvider, TokenProviderState,
     ScheduleMode,
     cloudkit::{ZoneDeleteOperation, CloudKitSession},
     ResourceState,
@@ -1445,17 +1445,9 @@ async fn create_keychain_clients(
 
     let (dsid, adsid, anisette) = {
         let account = wp.account.lock().await;
-        let spd = account.spd.as_ref().ok_or(WrappedError::GenericError {
-            msg: "AppleAccount has no SPD — not fully logged in".into(),
-        })?;
-        let dsid = spd.get("DsPrsId")
-            .and_then(|v| v.as_unsigned_integer())
-            .ok_or(WrappedError::GenericError { msg: "SPD missing DsPrsId".into() })?
-            .to_string();
-        let adsid = spd.get("adsid")
-            .and_then(|v| v.as_string())
-            .ok_or(WrappedError::GenericError { msg: "SPD missing adsid".into() })?
-            .to_string();
+        let persisted = persisted_identity(&*account)?;
+        let dsid = persisted.dsid.to_string();
+        let adsid = persisted.adsid.clone();
         let anisette = account.anisette.clone();
         (dsid, adsid, anisette)
     };
@@ -1685,10 +1677,11 @@ async fn join_keychain_with_bottles(
 /// `restore_token_provider` (one-shot at startup) and
 /// `WrappedTokenProvider::refresh_pet_token` (periodic mid-run).
 ///
-/// Snapshot `account.tokens` before the call, run `login_email_pass`, then
-/// merge the snapshot back so any token `login_email_pass` didn't (re)write is
-/// preserved. The `login_email_pass` call can unconditionally overwrite
-/// `self.tokens` when SPD contains a `t` dict (client.rs:776), which on a
+/// Snapshot the persisted token map before the call, run `login_email_pass`,
+/// then merge the snapshot back so any token `login_email_pass` didn't
+/// (re)write is preserved. The `login_email_pass` call can unconditionally
+/// overwrite the persisted tokens when SPD contains a `t` dict (and resets the
+/// whole persisted record when the account name changed), which on a
 /// non-LoggedIn return path would partially wipe a good token map. The merge
 /// guarantees we never exit with fewer tokens than we entered.
 ///
@@ -1703,13 +1696,15 @@ async fn refresh_pet_with_snapshot(
     hashed_password: &[u8],
     context: &str,
 ) {
-    let snapshot = std::mem::take(&mut account.tokens);
+    let snapshot = account.persisted.as_mut()
+        .map(|persisted| std::mem::take(&mut persisted.tokens))
+        .unwrap_or_default();
     match account.login_email_pass(username, hashed_password).await {
         Ok(icloud_auth::LoginState::LoggedIn) => {
             info!("{}: proactive PET refresh succeeded", context);
         }
         Ok(state) => {
-            if account.tokens.contains_key("com.apple.gs.idms.pet") {
+            if account.persisted.as_ref().map(|p| p.tokens.contains_key("com.apple.gs.idms.pet")).unwrap_or(false) {
                 info!(
                     "{}: PET refresh returned {:?} but PET was populated — treating as success",
                     context, state
@@ -1725,9 +1720,91 @@ async fn refresh_pet_with_snapshot(
             warn!("{}: proactive PET refresh failed (non-fatal): {}", context, err);
         }
     }
-    for (k, v) in snapshot {
-        account.tokens.entry(k).or_insert(v);
+    if let Some(persisted) = account.persisted.as_mut() {
+        for (k, v) in snapshot {
+            persisted.tokens.entry(k).or_insert(v);
+        }
     }
+}
+
+/// The login credentials rustpush keeps on the account after a successful SRP
+/// exchange (`login_email_pass`) or that `restore_token_provider` seeded: the
+/// account name and the SRP-hashed password. None until a login populated them.
+fn persisted_credentials(account: &AppleAccount<BridgeDefaultAnisetteProvider>) -> Option<(String, Vec<u8>)> {
+    let persisted = account.persisted.as_ref()?;
+    if persisted.username.is_empty() || persisted.hashed_password.is_empty() {
+        return None;
+    }
+    Some((persisted.username.clone(), persisted.hashed_password.clone()))
+}
+
+/// The persisted account identity (dsid/adsid/name), which rustpush fills in
+/// from the SPD during `login_email_pass` and which `restore_token_provider`
+/// rebuilds from the bridge's stored SPD plist.
+fn persisted_identity(account: &AppleAccount<BridgeDefaultAnisetteProvider>) -> Result<&icloud_auth::PersistAccountData, WrappedError> {
+    let persisted = account.persisted.as_ref().ok_or(WrappedError::GenericError {
+        msg: "AppleAccount has no persisted account data — not fully logged in".into(),
+    })?;
+    if persisted.adsid.is_empty() || persisted.dsid == 0 {
+        return Err(WrappedError::GenericError { msg: "persisted account data is missing adsid/dsid".into() });
+    }
+    Ok(persisted)
+}
+
+fn plist_value_as_u64(value: &plist::Value) -> Option<u64> {
+    if let Some(u) = value.as_unsigned_integer() {
+        Some(u)
+    } else if let Some(i) = value.as_signed_integer() {
+        u64::try_from(i).ok()
+    } else {
+        value.as_string().and_then(|s| s.trim().parse::<u64>().ok())
+    }
+}
+
+/// Rebuild rustpush's `PersistAccountData` from the SPD dictionary the bridge
+/// persists: either a real GSA SPD (installs that logged in before upstream's
+/// "Token fixes" hid the SPD) or the synthetic one `spd_from_persist_data`
+/// writes now. Both carry the same identity keys.
+fn persist_data_from_spd(spd: &plist::Dictionary, username: &str, hashed_password: Vec<u8>) -> Result<icloud_auth::PersistAccountData, WrappedError> {
+    let dsid = spd.get("DsPrsId").or_else(|| spd.get("dsid"))
+        .and_then(plist_value_as_u64)
+        .ok_or(WrappedError::GenericError { msg: "SPD missing DsPrsId".into() })?;
+    let adsid = spd.get("adsid")
+        .and_then(|v| v.as_string())
+        .filter(|s| !s.is_empty())
+        .ok_or(WrappedError::GenericError { msg: "SPD missing adsid".into() })?
+        .to_string();
+    let plist_string = |key: &str| spd.get(key).and_then(|v| v.as_string()).map(|v| v.to_string());
+    Ok(icloud_auth::PersistAccountData {
+        username: username.to_string(),
+        first_name: plist_string("fn"),
+        last_name: plist_string("ln"),
+        hashed_password,
+        postdata_done: None,
+        tokens: HashMap::new(),
+        adsid,
+        dsid,
+        acname: plist_string("acname").unwrap_or_else(|| username.to_string()),
+    })
+}
+
+/// The SPD-shaped plist the bridge persists for `restore_token_provider`.
+/// rustpush no longer exposes the raw SPD, so this carries the identity facts
+/// rustpush keeps in `PersistAccountData` under the same keys a real SPD uses,
+/// leaving the Go side's stored schema unchanged.
+fn spd_from_persist_data(persisted: &icloud_auth::PersistAccountData) -> plist::Dictionary {
+    let mut spd = plist::Dictionary::new();
+    spd.insert("DsPrsId".to_string(), plist::Value::Integer(persisted.dsid.into()));
+    spd.insert("adsid".to_string(), plist::Value::String(persisted.adsid.clone()));
+    let acname = if persisted.acname.is_empty() { &persisted.username } else { &persisted.acname };
+    spd.insert("acname".to_string(), plist::Value::String(acname.clone()));
+    if let Some(first) = &persisted.first_name {
+        spd.insert("fn".to_string(), plist::Value::String(first.clone()));
+    }
+    if let Some(last) = &persisted.last_name {
+        spd.insert("ln".to_string(), plist::Value::String(last.clone()));
+    }
+    spd
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -1819,17 +1896,10 @@ impl WrappedTokenProvider {
         Ok(url)
     }
 
-    /// Get the DSID for this account (from AppleAccount's SPD dictionary).
+    /// Get the DSID for this account (from AppleAccount's persisted identity).
     pub async fn get_dsid(&self) -> Result<String, WrappedError> {
         let account = self.account.lock().await;
-        let spd = account.spd.as_ref().ok_or(WrappedError::GenericError {
-            msg: "AppleAccount has no SPD — not fully logged in".into(),
-        })?;
-        let dsid = spd.get("DsPrsId")
-            .and_then(|v| v.as_unsigned_integer())
-            .ok_or(WrappedError::GenericError { msg: "SPD missing DsPrsId".into() })?
-            .to_string();
-        Ok(dsid)
+        Ok(persisted_identity(&*account)?.dsid.to_string())
     }
 
     /// Get the serialized MobileMe delegate as a plist string (for persistence).
@@ -1871,11 +1941,8 @@ impl WrappedTokenProvider {
     /// again next tick" rather than a hard failure.
     pub async fn refresh_pet_token(&self) -> Result<(), WrappedError> {
         let mut account = self.account.lock().await;
-        let username = account.username.clone().ok_or(WrappedError::GenericError {
-            msg: "refresh_pet_token: account has no username".into(),
-        })?;
-        let hashed_password = account.hashed_password.clone().ok_or(WrappedError::GenericError {
-            msg: "refresh_pet_token: account has no hashed_password".into(),
+        let (username, hashed_password) = persisted_credentials(&*account).ok_or(WrappedError::GenericError {
+            msg: "refresh_pet_token: account has no persisted username/hashed_password".into(),
         })?;
         refresh_pet_with_snapshot(&mut account, &username, &hashed_password, "refresh_pet_token").await;
         Ok(())
@@ -1915,9 +1982,7 @@ impl WrappedTokenProvider {
         // HappyBirthdayError on first warm-path invocation.
         {
             let mut account = self.account.lock().await;
-            let username = account.username.clone();
-            let hashed_password = account.hashed_password.clone();
-            if let (Some(u), Some(h)) = (username, hashed_password) {
+            if let Some((u, h)) = persisted_credentials(&*account) {
                 info!("GSA announce: priming GSA tokens via PET refresh");
                 refresh_pet_with_snapshot(&mut account, &u, &h, "announce_apple_device").await;
             } else {
@@ -1996,17 +2061,10 @@ fn normalize_mme_delegate_dict(value: plist::Value) -> plist::Value {
 // to read state previously available via `TokenProvider::get_xxx()` methods that
 // rustpush doesn't expose. These are not exported as FFI symbols.
 impl WrappedTokenProvider {
-    /// Get the ADSID from the AppleAccount's SPD dictionary.
+    /// Get the ADSID from the AppleAccount's persisted identity.
     pub(crate) async fn get_adsid(&self) -> Result<String, WrappedError> {
         let account = self.account.lock().await;
-        let spd = account.spd.as_ref().ok_or(WrappedError::GenericError {
-            msg: "AppleAccount has no SPD — not fully logged in".into(),
-        })?;
-        let adsid = spd.get("adsid")
-            .and_then(|v| v.as_string())
-            .ok_or(WrappedError::GenericError { msg: "SPD missing adsid".into() })?
-            .to_string();
-        Ok(adsid)
+        Ok(persisted_identity(&*account)?.adsid.clone())
     }
 
     /// Lazily fetch the MobileMe delegate from Apple if our wrapper's bytes
@@ -2144,17 +2202,9 @@ impl WrappedTokenProvider {
     /// display-name field so peer sees a real name instead of a phone number.
     pub(crate) async fn get_apple_account_full_name(&self) -> String {
         let account = self.account.lock().await;
-        let Some(spd) = account.spd.as_ref() else { return String::new(); };
-        let first = spd
-            .get("fn")
-            .and_then(|v| v.as_string())
-            .unwrap_or("")
-            .trim();
-        let last = spd
-            .get("ln")
-            .and_then(|v| v.as_string())
-            .unwrap_or("")
-            .trim();
+        let Some(persisted) = account.persisted.as_ref() else { return String::new(); };
+        let first = persisted.first_name.as_deref().unwrap_or("").trim();
+        let last = persisted.last_name.as_deref().unwrap_or("").trim();
         let combined = format!("{} {}", first, last);
         combined.trim().to_string()
     }
@@ -2297,25 +2347,22 @@ pub async fn restore_token_provider(
     let anisette_state_path = PathBuf::from(subsystem_state_path("anisette"));
     let anisette = bridge_default_provider(client_info.clone(), anisette_state_path, os_config.get_device_uuid());
 
-    // Create a new AppleAccount and populate it with persisted state
-    let mut account = AppleAccount::new_with_anisette(client_info, anisette)
-        .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create account: {}", e) })?;
-
-    account.username = Some(username.clone());
-
     // Restore hashed password
     let hashed_password = decode_hex(&hashed_password_hex)
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hashed_password hex: {}", e) })?;
-    account.hashed_password = Some(hashed_password.clone());
 
-    // Restore SPD from base64-encoded plist
+    // Restore the account identity from the persisted SPD plist. Since
+    // upstream's "Token fixes" (apple-private-apis b8598d2) the account no
+    // longer exposes its SPD or loose username/password/token fields; it keeps
+    // one serializable `PersistAccountData` that the host hands back on
+    // restart. The bridge already persists the same facts as an SPD-shaped
+    // plist, so rebuild that record from it and leave the Go schema alone.
     let spd_bytes = base64_decode(&spd_base64);
     let spd: plist::Dictionary = plist::from_bytes(&spd_bytes)
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid SPD plist: {}", e) })?;
+    let mut persisted = persist_data_from_spd(&spd, &username, hashed_password)?;
 
-    account.spd = Some(spd);
-
-    // Inject the persisted PET into account.tokens with an already-expired
+    // Inject the persisted PET into the persisted tokens with an already-expired
     // timestamp. Byte-for-byte port of the master-branch restore path
     // (master's pkg/rustpushgo/src/lib.rs line 805).
     //
@@ -2350,7 +2397,7 @@ pub async fn restore_token_provider(
     // that appeared after the refactor migration to raw rustpush and
     // was never fully restored by the subsequent periodic-refresh commits
     // (66d6402, bdd4ebe).
-    account.tokens.insert(
+    persisted.tokens.insert(
         "com.apple.gs.idms.pet".to_string(),
         icloud_auth::FetchedToken {
             token: pet,
@@ -2358,8 +2405,21 @@ pub async fn restore_token_provider(
         },
     );
 
+    // The bridge keeps its own persistence (session metadata plus
+    // get_mme_delegate_json) and reads the state back through
+    // `account.persisted` when Go asks, so rustpush's update callbacks are
+    // no-ops here. The MobileMe delegate state likewise starts empty and
+    // rustpush refreshes it on first use, exactly as before.
+    let account = AppleAccount::new_with_anisette(client_info, anisette, Some(persisted), Box::new(|_| {}))
+        .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create account: {}", e) })?;
+
     let account = Arc::new(rustpush::DebugMutex::new(account));
-    let token_provider = TokenProvider::new(account.clone(), os_config.clone());
+    let token_provider = TokenProvider::new(
+        account.clone(),
+        os_config.clone(),
+        TokenProviderState::default(),
+        Box::new(|_| {}),
+    );
 
     info!("Restored TokenProvider from persisted credentials");
 
@@ -5057,7 +5117,7 @@ pub async fn login_start(
 
     let anisette = bridge_default_provider(client_info.clone(), anisette_state_path, os_config.get_device_uuid());
 
-    let mut account = AppleAccount::new_with_anisette(client_info, anisette)
+    let mut account = AppleAccount::new_with_anisette(client_info, anisette, None, Box::new(|_| {}))
         .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create account: {}", e) })?;
 
     info!("login_start: calling login_email_pass for {}", user_trimmed);
@@ -5170,10 +5230,12 @@ impl LoginSession {
             }
             icloud_auth::LoginState::NeedsLogin => {
                 info!("2FA code accepted; re-running login_email_pass to collect the PET");
-                let hashed = account.hashed_password.clone().ok_or(WrappedError::GenericError {
-                    msg: "No hashed password available for post-2FA re-login".to_string(),
-                })?;
-                let relogin = account.login_email_pass(&self.username, &hashed).await
+                // Prefer the account name/hash rustpush persisted from the SRP
+                // exchange (it normalizes the account name); fall back to what
+                // the user typed so the re-login can never be skipped.
+                let (username, hashed) = persisted_credentials(&*account)
+                    .unwrap_or_else(|| (self.username.clone(), self.password_hash.clone()));
+                let relogin = account.login_email_pass(&username, &hashed).await
                     .map_err(|e| WrappedError::GenericError { msg: format!("Post-2FA re-login failed: {}", e) })?;
                 info!("Post-2FA re-login returned: {:?}; PET available: {}", relogin, account.get_pet().is_some());
                 Ok(matches!(relogin, icloud_auth::LoginState::LoggedIn) || account.get_pet().is_some())
@@ -5198,28 +5260,17 @@ impl LoginSession {
         let pet = account.get_pet()
             .ok_or(WrappedError::GenericError { msg: "No PET token available after login".to_string() })?;
 
-        let spd = account.spd.as_ref().expect("No SPD after login");
-        let adsid = spd.get("adsid").expect("No adsid").as_string().unwrap().to_string();
-        let dsid = spd.get("DsPrsId").or_else(|| spd.get("dsid"))
-            .and_then(|v| {
-                if let Some(s) = v.as_string() {
-                    Some(s.to_string())
-                } else if let Some(i) = v.as_signed_integer() {
-                    Some(i.to_string())
-                } else if let Some(i) = v.as_unsigned_integer() {
-                    Some(i.to_string())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
+        let persisted = persisted_identity(&*account)?;
+        let adsid = persisted.adsid.clone();
+        let dsid = persisted.dsid.to_string();
 
-        // Build persist data before delegates call (while we have SPD access)
-        let hashed_password_hex = account.hashed_password.as_ref()
-            .map(|p| encode_hex(p))
-            .unwrap_or_default();
+        // Build persist data before the delegates call. rustpush no longer
+        // exposes the raw SPD, so persist the identity it kept as an
+        // SPD-shaped plist (same keys, same Go schema) for restore_token_provider.
+        let hashed_password_hex = encode_hex(&persisted.hashed_password);
+        let spd = spd_from_persist_data(persisted);
         let mut spd_bytes = Vec::new();
-        plist::to_writer_binary(&mut spd_bytes, spd)
+        plist::to_writer_binary(&mut spd_bytes, &spd)
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to serialize SPD: {}", e) })?;
         let spd_base64 = base64_encode(&spd_bytes);
 
@@ -5336,7 +5387,14 @@ impl LoginSession {
         let owned_account = guard.take()
             .ok_or(WrappedError::GenericError { msg: "Account already consumed".to_string() })?;
         let account_arc = Arc::new(rustpush::DebugMutex::new(owned_account));
-        let token_provider = TokenProvider::new(account_arc.clone(), os_config.clone());
+        // The bridge persists the MobileMe delegate itself (see below), so the
+        // provider starts with empty state and no-op persistence callbacks.
+        let token_provider = TokenProvider::new(
+            account_arc.clone(),
+            os_config.clone(),
+            TokenProviderState::default(),
+            Box::new(|_| {}),
+        );
 
         // Store the MobileMe delegate in the WrappedTokenProvider as opaque plist
         // bytes. The `MobileMeDelegateResponse` type is not `Serialize`, so we
@@ -7973,7 +8031,9 @@ impl Client {
                 // login_email_pass only writes the map on success.
                 let pet_present = {
                     let account = tp.account.lock().await;
-                    account.tokens.contains_key("com.apple.gs.idms.pet")
+                    account.persisted.as_ref()
+                        .map(|p| p.tokens.contains_key("com.apple.gs.idms.pet"))
+                        .unwrap_or(false)
                 };
                 if !pet_present {
                     PET_REFRESH_STUCK_UNTIL_MS
@@ -7989,7 +8049,7 @@ impl Client {
             // Always attempt refresh_mme — it's a cheap MobileMe call that
             // uses whatever PET is currently in memory. If nothing changed
             // it'll just log the same Token missing warning once.
-            if let Err(e) = tp.inner.refresh_mme().await {
+            if let Err(e) = tp.inner.refresh_mme(&mut *tp.inner.state.lock().await).await {
                 warn!("refresh_mme failed during cloud-client recovery: {}", e);
             } else {
                 info!("Cloud client recovery: refreshed MobileMe delegate");
@@ -8075,7 +8135,7 @@ impl Client {
     pub async fn reset_sharedstreams_client(&self) {
         *self.sharedstreams_client.lock().await = None;
         if let Some(tp) = &self.token_provider {
-            let _ = tp.inner.refresh_mme().await;
+            let _ = tp.inner.refresh_mme(&mut *tp.inner.state.lock().await).await;
         }
     }
 
