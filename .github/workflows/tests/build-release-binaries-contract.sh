@@ -561,8 +561,8 @@ if slice_invocations != expected_slice_invocations:
 if re.search(r'^\s+(?:if ! )?\./build\.sh\b', workflow, re.MULTILINE):
     raise SystemExit('public workflow must not bypass fixed platform slice entrypoints')
 setup_go_blocks = [block for block in step_blocks if re.search(r'^        uses: actions/setup-go@[0-9a-f]{40}', block, re.MULTILINE)]
-if len(setup_go_blocks) != 2 or any(block.count('          cache: false\n') != 1 for block in setup_go_blocks):
-    raise SystemExit('both and only the direct Linux Zig jobs must use the declared Go toolchain without private caching')
+if len(setup_go_blocks) != 4 or any(block.count('          cache: false\n') != 1 for block in setup_go_blocks):
+    raise SystemExit('all four slice jobs must install the declared go.mod toolchain without private caching')
 if workflow.count("trap 'rm -f \"$RUNNER_TEMP/opencider") != 6:
     raise SystemExit('every directly invoked private build/verification transcript must be deleted when its step exits')
 for forbidden in ('set -x', 'set -o xtrace', 'tee ', 'printenv'):
@@ -588,6 +588,19 @@ require "$WORKFLOW" 'Build amd64 Linux binary with Zig'
 require "$WORKFLOW" 'Build arm64 Linux binary with Zig'
 require "$WORKFLOW" '../.github/scripts/run-private-slice-build.sh linux amd64'
 require "$WORKFLOW" '../.github/scripts/run-private-slice-build.sh linux arm64'
+
+# No other workflow may touch the private deploy key, and a pull_request_target
+# workflow must never check out code from the pull request it reacts to.
+for other_workflow in "$ROOT"/.github/workflows/*.yml; do
+  [ "$other_workflow" != "$WORKFLOW" ] || continue
+  if grep -Fq -- 'OPENCIDER_READ_DEPLOY_KEY' "$other_workflow"; then
+    fail "only the release workflow may reference the private deploy key: ${other_workflow##*/}"
+  fi
+  if grep -Eq -- '^[[:space:]]*pull_request_target:' "$other_workflow" \
+     && grep -Fq -- 'actions/checkout' "$other_workflow"; then
+    fail "a pull_request_target workflow must never check out code: ${other_workflow##*/}"
+  fi
+done
 
 ruby -e 'require "yaml"; YAML.load_file(ARGV.fetch(0))' "$WORKFLOW" \
   || fail 'workflow YAML does not parse'

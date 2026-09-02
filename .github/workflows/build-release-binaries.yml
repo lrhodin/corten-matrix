@@ -225,6 +225,12 @@ jobs:
           OPENCIDER_REF_TOKEN: ${{ needs.verify-rustpush-patches.outputs.opencider_ref_token }}
         run: ./.github/scripts/checkout-opencider.sh opencider "$OPENCIDER_REF_TOKEN"
 
+      - name: Install Go from the public bridge toolchain declaration
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
       # OpenCider's slice entrypoint is the public-OpenAbsinthe macOS contract;
       # its private implementation output remains confined to the temp log.
       - name: Build x86_64 macOS slice
@@ -286,6 +292,12 @@ jobs:
           OPENCIDER_READ_DEPLOY_KEY: ${{ secrets.OPENCIDER_READ_DEPLOY_KEY }}
           OPENCIDER_REF_TOKEN: ${{ needs.verify-rustpush-patches.outputs.opencider_ref_token }}
         run: ./.github/scripts/checkout-opencider.sh opencider "$OPENCIDER_REF_TOKEN"
+
+      - name: Install Go from the public bridge toolchain declaration
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
 
       # OpenCider's slice entrypoint is the public-OpenAbsinthe macOS contract;
       # its private implementation output remains confined to the temp log.
