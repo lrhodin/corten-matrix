@@ -4086,6 +4086,62 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
 // Callback interfaces
 // ============================================================================
 
+/// Default `RUST_LOG` filter installed by both logger entry points: silence
+/// rustpush's own chatter at WARN and keep this wrapper's diagnostics at INFO.
+const DEFAULT_RUST_LOG: &str = "warn,rustpush=warn,rustpushgo=info";
+
+/// Foreign log sink. The Go bridge implements this so every Rust log record
+/// that passes the `RUST_LOG` filter lands in the bridge's own logger, and
+/// therefore in `bridge.log`, instead of in the separate stdout capture that
+/// `corten-matrix logs` never shows.
+#[uniffi::export(callback_interface)]
+pub trait RustLogSink: Send + Sync {
+    fn log(&self, level: String, target: String, message: String);
+}
+
+struct ForwardingLogger {
+    filter: pretty_env_logger::env_logger::filter::Filter,
+    sink: Box<dyn RustLogSink>,
+}
+
+impl log::Log for ForwardingLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        self.filter.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.filter.matches(record) {
+            return;
+        }
+        self.sink.log(
+            record.level().to_string(),
+            record.target().to_string(),
+            record.args().to_string(),
+        );
+    }
+
+    fn flush(&self) {}
+}
+
+/// Install `sink` as the process-wide Rust logger, then run the same runtime
+/// setup as `init_logger`. Call this before any other FFI call in the bridge
+/// process: a logger can only be installed once, so later `init_logger`
+/// calls keep the sink and only repeat the runtime setup.
+#[uniffi::export]
+pub fn init_logger_with_sink(sink: Box<dyn RustLogSink>) {
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", DEFAULT_RUST_LOG);
+    }
+    let filter = pretty_env_logger::env_logger::filter::Builder::new()
+        .parse(&std::env::var("RUST_LOG").unwrap_or_default())
+        .build();
+    let max_level = filter.filter();
+    if log::set_boxed_logger(Box::new(ForwardingLogger { filter, sink })).is_ok() {
+        log::set_max_level(max_level);
+    }
+    init_logger();
+}
+
 #[uniffi::export(callback_interface)]
 pub trait MessageCallback: Send + Sync {
     fn on_message(&self, msg: WrappedMessage);
@@ -4305,10 +4361,7 @@ pub fn init_logger() {
         //   RUST_LOG=info,rustpush=info          # all rustpush info logs
         //   RUST_LOG=info,rustpush::icloud=debug # deep cloudkit/mmcs/pcs
         //   RUST_LOG=debug                       # everything
-        std::env::set_var(
-            "RUST_LOG",
-            "warn,rustpush=warn,rustpushgo=info",
-        );
+        std::env::set_var("RUST_LOG", DEFAULT_RUST_LOG);
     }
     // Write to stdout, not stderr: the Go bridge's own logger writes to
     // stdout, and that is the stream the service captures and the logs

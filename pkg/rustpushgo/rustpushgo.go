@@ -354,6 +354,7 @@ func readFloat64(reader io.Reader) float64 {
 func init() {
 
 	(&FfiConverterCallbackInterfaceMessageCallback{}).register()
+	(&FfiConverterCallbackInterfaceRustLogSink{}).register()
 	(&FfiConverterCallbackInterfaceStatusCallback{}).register()
 	(&FfiConverterCallbackInterfaceUpdateUsersCallback{}).register()
 	uniffiInitContinuationCallback()
@@ -432,6 +433,15 @@ func uniffiCheckChecksums() {
 		if checksum != 38755 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_func_init_logger: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_func_init_logger_with_sink(uniffiStatus)
+		})
+		if checksum != 53126 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_func_init_logger_with_sink: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -1728,6 +1738,15 @@ func uniffiCheckChecksums() {
 		if checksum != 9227 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_messagecallback_on_message: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_rustlogsink_log(uniffiStatus)
+		})
+		if checksum != 29422 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_rustlogsink_log: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -7697,6 +7716,68 @@ type FfiDestroyerCallbackInterfaceMessageCallback struct{}
 func (FfiDestroyerCallbackInterfaceMessageCallback) Destroy(value MessageCallback) {
 }
 
+type RustLogSink interface {
+	Log(level string, target string, message string)
+}
+
+// foreignCallbackCallbackInterfaceRustLogSink cannot be callable be a compiled function at a same time
+type foreignCallbackCallbackInterfaceRustLogSink struct{}
+
+//export rustpushgo_cgo_RustLogSink
+func rustpushgo_cgo_RustLogSink(handle C.uint64_t, method C.int32_t, argsPtr *C.uint8_t, argsLen C.int32_t, outBuf *C.RustBuffer) C.int32_t {
+	cb := FfiConverterCallbackInterfaceRustLogSinkINSTANCE.Lift(uint64(handle))
+	switch method {
+	case 0:
+		// 0 means Rust is done with the callback, and the callback
+		// can be dropped by the foreign language.
+		*outBuf = rustBufferToC(FfiConverterCallbackInterfaceRustLogSinkINSTANCE.drop(uint64(handle)))
+		// See docs of ForeignCallback in `uniffi/src/ffi/foreigncallbacks.rs`
+		return C.int32_t(uniffiIdxCallbackFree)
+
+	case 1:
+		var result uniffiCallbackResult
+		args := unsafe.Slice((*byte)(argsPtr), argsLen)
+		result = foreignCallbackCallbackInterfaceRustLogSink{}.InvokeLog(cb, args, outBuf)
+		return C.int32_t(result)
+
+	default:
+		// This should never happen, because an out of bounds method index won't
+		// ever be used. Once we can catch errors, we should return an InternalException.
+		// https://github.com/mozilla/uniffi-rs/issues/351
+		return C.int32_t(uniffiCallbackUnexpectedResultError)
+	}
+}
+
+func (foreignCallbackCallbackInterfaceRustLogSink) InvokeLog(callback RustLogSink, args []byte, outBuf *C.RustBuffer) uniffiCallbackResult {
+	reader := bytes.NewReader(args)
+	callback.Log(FfiConverterStringINSTANCE.Read(reader), FfiConverterStringINSTANCE.Read(reader), FfiConverterStringINSTANCE.Read(reader))
+
+	return uniffiCallbackResultSuccess
+}
+
+type FfiConverterCallbackInterfaceRustLogSink struct {
+	FfiConverterCallbackInterface[RustLogSink]
+}
+
+var FfiConverterCallbackInterfaceRustLogSinkINSTANCE = &FfiConverterCallbackInterfaceRustLogSink{
+	FfiConverterCallbackInterface: FfiConverterCallbackInterface[RustLogSink]{
+		handleMap: newConcurrentHandleMap[RustLogSink](),
+	},
+}
+
+// This is a static function because only 1 instance is supported for registering
+func (c *FfiConverterCallbackInterfaceRustLogSink) register() {
+	rustCall(func(status *C.RustCallStatus) int32 {
+		C.uniffi_rustpushgo_fn_init_callback_rustlogsink(C.ForeignCallback(C.rustpushgo_cgo_RustLogSink), status)
+		return 0
+	})
+}
+
+type FfiDestroyerCallbackInterfaceRustLogSink struct{}
+
+func (FfiDestroyerCallbackInterfaceRustLogSink) Destroy(value RustLogSink) {
+}
+
 type StatusCallback interface {
 	OnStatusUpdate(user string, mode *string, available bool)
 
@@ -9063,6 +9144,13 @@ func FordKeyCacheSize() uint64 {
 func InitLogger() {
 	rustCall(func(_uniffiStatus *C.RustCallStatus) bool {
 		C.uniffi_rustpushgo_fn_func_init_logger(_uniffiStatus)
+		return false
+	})
+}
+
+func InitLoggerWithSink(sink RustLogSink) {
+	rustCall(func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_rustpushgo_fn_func_init_logger_with_sink(FfiConverterCallbackInterfaceRustLogSinkINSTANCE.Lower(sink), _uniffiStatus)
 		return false
 	})
 }

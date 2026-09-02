@@ -48,6 +48,9 @@ func (c *IMConnector) GetName() bridgev2.BridgeName {
 
 func (c *IMConnector) Init(bridge *bridgev2.Bridge) {
 	c.Bridge = bridge
+	// First FFI call in the bridge process: route Rust logging into the
+	// bridge logger before any InitLogger fallback can claim it.
+	installRustLogSink(bridge.Log)
 }
 
 func (c *IMConnector) Start(ctx context.Context) error {

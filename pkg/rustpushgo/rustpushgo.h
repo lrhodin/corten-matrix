@@ -1029,6 +1029,11 @@ void uniffi_rustpushgo_fn_init_callback_messagecallback(
 	RustCallStatus* out_status
 );
 
+void uniffi_rustpushgo_fn_init_callback_rustlogsink(
+	ForeignCallback callback_stub,
+	RustCallStatus* out_status
+);
+
 void uniffi_rustpushgo_fn_init_callback_statuscallback(
 	ForeignCallback callback_stub,
 	RustCallStatus* out_status
@@ -1070,6 +1075,11 @@ uint64_t uniffi_rustpushgo_fn_func_ford_key_cache_size(
 );
 
 void uniffi_rustpushgo_fn_func_init_logger(
+	RustCallStatus* out_status
+);
+
+void uniffi_rustpushgo_fn_func_init_logger_with_sink(
+	uint64_t sink,
 	RustCallStatus* out_status
 );
 
@@ -1432,6 +1442,10 @@ uint16_t uniffi_rustpushgo_checksum_func_ford_key_cache_size(
 );
 
 uint16_t uniffi_rustpushgo_checksum_func_init_logger(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_func_init_logger_with_sink(
 	RustCallStatus* out_status
 );
 
@@ -2011,6 +2025,10 @@ uint16_t uniffi_rustpushgo_checksum_method_messagecallback_on_message(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_rustlogsink_log(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_statuscallback_on_status_update(
 	RustCallStatus* out_status
 );
@@ -2037,6 +2055,7 @@ uint32_t ffi_rustpushgo_uniffi_contract_version(
 
 
 int32_t rustpushgo_cgo_MessageCallback(uint64_t, int32_t, uint8_t *, int32_t, RustBuffer *);
+int32_t rustpushgo_cgo_RustLogSink(uint64_t, int32_t, uint8_t *, int32_t, RustBuffer *);
 int32_t rustpushgo_cgo_StatusCallback(uint64_t, int32_t, uint8_t *, int32_t, RustBuffer *);
 int32_t rustpushgo_cgo_UpdateUsersCallback(uint64_t, int32_t, uint8_t *, int32_t, RustBuffer *);
 
