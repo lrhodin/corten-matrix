@@ -1027,14 +1027,20 @@ func (c *IMClient) migrateSmsSuffixPortals(log zerolog.Logger, ctx context.Conte
 func safeRestoreTokenProvider(
 	config *rustpushgo.WrappedOsConfig,
 	conn *rustpushgo.WrappedApsConnection,
-	username, hashedPwHex, pet, spdBase64 string,
+	username, hashedPwHex, pet, spdBase64, persistBlob string,
 ) (tp *rustpushgo.WrappedTokenProvider, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("RestoreTokenProvider panicked: %v", r)
 		}
 	}()
-	return rustpushgo.RestoreTokenProvider(config, conn, username, hashedPwHex, pet, spdBase64)
+	// The blob is optional: sessions that predate it restore from the legacy
+	// SPD fields, and rustpush falls back to those itself if it cannot use it.
+	var blob *string
+	if persistBlob != "" {
+		blob = &persistBlob
+	}
+	return rustpushgo.RestoreTokenProvider(config, conn, username, hashedPwHex, pet, spdBase64, blob)
 }
 
 // safeLoginStart, safeSubmit2fa, and safeFinish wrap the interactive login
@@ -1113,7 +1119,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 			log.Info().Msg("Restoring iCloud TokenProvider from persisted credentials")
 			tp, err := safeRestoreTokenProvider(c.config, c.connection,
 				meta.AccountUsername, meta.AccountHashedPasswordHex,
-				meta.AccountPET, meta.AccountSPDBase64)
+				meta.AccountPET, meta.AccountSPDBase64, meta.AccountPersistBlob)
 			if err != nil {
 				log.Warn().Err(err).Msg("Failed to restore TokenProvider — cloud services unavailable")
 			} else {
@@ -10359,6 +10365,8 @@ func (c *IMClient) periodicPetRefresh(log zerolog.Logger) {
 				log.Warn().Err(err).Msg("Periodic PET refresh failed")
 			} else {
 				log.Debug().Msg("Periodic PET refresh completed")
+				// Save the refreshed tokens so a restart reuses them.
+				c.persistMmeDelegate(log)
 			}
 		case <-c.stopChan:
 			return
@@ -10445,30 +10453,38 @@ func contactSyncBackoff(base, max time.Duration, failures int) time.Duration {
 	return d
 }
 
-// persistMmeDelegate saves the current MobileMe delegate to user_login metadata
-// so it can be seeded on restore without needing a fresh PET-based auth.
+// persistMmeDelegate saves the current MobileMe delegate and the account
+// state rustpush persisted (tokens with their real expirations plus the
+// delegate state) to user_login metadata so a restart reuses them without
+// needing a fresh PET-based auth. Saves only when something changed.
 func (c *IMClient) persistMmeDelegate(log zerolog.Logger) {
 	if c.tokenProvider == nil || *c.tokenProvider == nil {
 		return
 	}
 	tp := *c.tokenProvider
+	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+	changed := false
 	delegateJSON, err := tp.GetMmeDelegateJson()
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to get MobileMe delegate for persistence")
+	} else if delegateJSON != nil && *delegateJSON != "" && meta.MmeDelegateJSON != *delegateJSON {
+		meta.MmeDelegateJSON = *delegateJSON
+		changed = true
+	}
+	blob, err := tp.GetAccountPersistBlob()
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get rustpush account state for persistence")
+	} else if blob != nil && *blob != "" && meta.AccountPersistBlob != *blob {
+		meta.AccountPersistBlob = *blob
+		changed = true
+	}
+	if !changed {
 		return
 	}
-	if delegateJSON == nil || *delegateJSON == "" {
-		return
-	}
-	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
-	if meta.MmeDelegateJSON == *delegateJSON {
-		return // unchanged
-	}
-	meta.MmeDelegateJSON = *delegateJSON
 	if err = c.UserLogin.Save(context.Background()); err != nil {
-		log.Warn().Err(err).Msg("Failed to persist MobileMe delegate")
+		log.Warn().Err(err).Msg("Failed to persist MobileMe delegate and account state")
 	} else {
-		log.Info().Msg("Persisted MobileMe delegate to user_login metadata")
+		log.Info().Msg("Persisted MobileMe delegate and rustpush account state to user_login metadata")
 	}
 }
 

@@ -243,6 +243,7 @@ func (c *IMConnector) tryAutoRestore(ctx context.Context) {
 		AccountDSID:              state.AccountDSID,
 		AccountSPDBase64:         state.AccountSPDBase64,
 		MmeDelegateJSON:          state.MmeDelegateJSON,
+		AccountPersistBlob:       state.AccountPersistBlob,
 	}
 
 	_, err = user.NewLogin(ctx, &database.UserLogin{
@@ -367,6 +368,7 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 			AccountDSID:              meta.AccountDSID,
 			AccountSPDBase64:         meta.AccountSPDBase64,
 			MmeDelegateJSON:          meta.MmeDelegateJSON,
+			AccountPersistBlob:       meta.AccountPersistBlob,
 		})
 	}
 

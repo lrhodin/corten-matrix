@@ -465,7 +465,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_func_restore_token_provider(uniffiStatus)
 		})
-		if checksum != 43442 {
+		if checksum != 65214 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_func_restore_token_provider: UniFFI API checksum mismatch")
 		}
@@ -1602,6 +1602,15 @@ func uniffiCheckChecksums() {
 		if checksum != 11426 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedtokenprovider_apple_account_full_name: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_account_persist_blob(uniffiStatus)
+		})
+		if checksum != 63205 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_account_persist_blob: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -5510,6 +5519,31 @@ func (_self *WrappedTokenProvider) AppleAccountFullName() string {
 		})
 }
 
+func (_self *WrappedTokenProvider) GetAccountPersistBlob() (*string, error) {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedTokenProvider")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedtokenprovider_get_account_persist_blob(
+				_pointer,
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterOptionalStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
 func (_self *WrappedTokenProvider) GetContactsUrl() (*string, error) {
 	_pointer := _self.ffiObject.incrementPointer("*WrappedTokenProvider")
 	defer _self.ffiObject.decrementPointer()
@@ -9084,11 +9118,11 @@ func RegisterFordKey(key []byte) {
 	})
 }
 
-func RestoreTokenProvider(config *WrappedOsConfig, connection *WrappedApsConnection, username string, hashedPasswordHex string, pet string, spdBase64 string) (*WrappedTokenProvider, error) {
+func RestoreTokenProvider(config *WrappedOsConfig, connection *WrappedApsConnection, username string, hashedPasswordHex string, pet string, spdBase64 string, persistBlob *string) (*WrappedTokenProvider, error) {
 	return uniffiRustCallAsyncWithErrorAndResult(
 		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
 			// rustFutureFunc
-			return (*C.void)(C.uniffi_rustpushgo_fn_func_restore_token_provider(FfiConverterWrappedOSConfigINSTANCE.Lower(config), FfiConverterWrappedAPSConnectionINSTANCE.Lower(connection), rustBufferToC(FfiConverterStringINSTANCE.Lower(username)), rustBufferToC(FfiConverterStringINSTANCE.Lower(hashedPasswordHex)), rustBufferToC(FfiConverterStringINSTANCE.Lower(pet)), rustBufferToC(FfiConverterStringINSTANCE.Lower(spdBase64)),
+			return (*C.void)(C.uniffi_rustpushgo_fn_func_restore_token_provider(FfiConverterWrappedOSConfigINSTANCE.Lower(config), FfiConverterWrappedAPSConnectionINSTANCE.Lower(connection), rustBufferToC(FfiConverterStringINSTANCE.Lower(username)), rustBufferToC(FfiConverterStringINSTANCE.Lower(hashedPasswordHex)), rustBufferToC(FfiConverterStringINSTANCE.Lower(pet)), rustBufferToC(FfiConverterStringINSTANCE.Lower(spdBase64)), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(persistBlob)),
 				status,
 			))
 		},

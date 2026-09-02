@@ -1416,6 +1416,9 @@ pub struct WrappedTokenProvider {
     // is still `mme_delegate_bytes`; this lock just guards the populate
     // path.
     mme_self_heal_lock: tokio::sync::Mutex<()>,
+    // Latest account record and MobileMe delegate state rustpush persisted
+    // through its callbacks; Go reads it via `get_account_persist_blob`.
+    persist_snapshot: SharedPersistSnapshot,
 }
 
 /// Helper: create CloudKit + Keychain clients from a WrappedTokenProvider.
@@ -1826,6 +1829,113 @@ fn spd_from_persist_data(persisted: &icloud_auth::PersistAccountData) -> plist::
     spd
 }
 
+/// The latest state rustpush handed back through its persistence callbacks:
+/// the account record (`PersistAccountData`) and the MobileMe delegate state
+/// (`TokenProviderState`). Both are kept as plist values so
+/// `get_account_persist_blob` can hand Go one binary plist without going
+/// through JSON, which would not round-trip the `plist::Data` hashed password.
+#[derive(Default)]
+struct PersistSnapshot {
+    account: Option<plist::Value>,
+    provider: Option<plist::Value>,
+}
+
+type SharedPersistSnapshot = Arc<std::sync::Mutex<PersistSnapshot>>;
+
+fn record_account_persist(snapshot: &SharedPersistSnapshot, data: &icloud_auth::PersistAccountData) {
+    match plist::to_value(data) {
+        Ok(value) => {
+            if let Ok(mut guard) = snapshot.lock() {
+                guard.account = Some(value);
+            }
+        }
+        Err(e) => warn!("Could not snapshot the persisted account record: {}", e),
+    }
+}
+
+fn record_provider_state(snapshot: &SharedPersistSnapshot, state: &TokenProviderState) {
+    match plist::to_value(state) {
+        Ok(value) => {
+            if let Ok(mut guard) = snapshot.lock() {
+                guard.provider = Some(value);
+            }
+        }
+        Err(e) => warn!("Could not snapshot the MobileMe delegate state: {}", e),
+    }
+}
+
+/// The two callbacks rustpush invokes whenever the account record or the
+/// MobileMe delegate state changes, both writing into `snapshot`.
+fn persist_callbacks(
+    snapshot: &SharedPersistSnapshot,
+) -> (
+    Box<dyn FnMut(&icloud_auth::PersistAccountData) + Send + Sync>,
+    Box<dyn Fn(&TokenProviderState) + Send + Sync>,
+) {
+    let account_snapshot = snapshot.clone();
+    let provider_snapshot = snapshot.clone();
+    (
+        Box::new(move |data| record_account_persist(&account_snapshot, data)),
+        Box::new(move |state| record_provider_state(&provider_snapshot, state)),
+    )
+}
+
+/// Format of the blob Go stores as `account_persist_blob`: a base64 binary
+/// plist `{version, account, provider?}` where `account` is rustpush's
+/// `PersistAccountData` and `provider` its `TokenProviderState`, both in their
+/// own serde layout so a future rustpush field arrives without a schema change.
+const PERSIST_BLOB_VERSION: u64 = 1;
+
+fn encode_persist_blob(snapshot: &PersistSnapshot) -> Result<Option<String>, WrappedError> {
+    let Some(account) = &snapshot.account else { return Ok(None); };
+    let mut root = plist::Dictionary::new();
+    root.insert("version".to_string(), plist::Value::Integer(PERSIST_BLOB_VERSION.into()));
+    root.insert("account".to_string(), account.clone());
+    if let Some(provider) = &snapshot.provider {
+        root.insert("provider".to_string(), provider.clone());
+    }
+    let mut bytes = Vec::new();
+    plist::to_writer_binary(&mut bytes, &plist::Value::Dictionary(root))
+        .map_err(|e| WrappedError::GenericError { msg: format!("Failed to serialize account persist blob: {}", e) })?;
+    Ok(Some(base64_encode(&bytes)))
+}
+
+fn decode_persist_blob(blob: &str) -> Result<(icloud_auth::PersistAccountData, Option<TokenProviderState>), WrappedError> {
+    let bytes = base64_decode(blob);
+    let root: plist::Dictionary = plist::from_bytes(&bytes)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid account persist blob: {}", e) })?;
+    let version = root.get("version").and_then(plist_value_as_u64).unwrap_or(0);
+    if version != PERSIST_BLOB_VERSION {
+        return Err(WrappedError::GenericError { msg: format!("Unsupported account persist blob version {}", version) });
+    }
+    let account = root.get("account")
+        .ok_or(WrappedError::GenericError { msg: "Account persist blob has no account record".into() })?;
+    let account: icloud_auth::PersistAccountData = plist::from_value(account)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid persisted account record: {}", e) })?;
+    let provider = match root.get("provider") {
+        Some(value) => Some(plist::from_value::<TokenProviderState>(value)
+            .map_err(|e| WrappedError::GenericError { msg: format!("Invalid persisted MobileMe delegate state: {}", e) })?),
+        None => None,
+    };
+    Ok((account, provider))
+}
+
+/// Build rustpush's MobileMe delegate state from a delegate fetched at
+/// `refreshed`. The state's fields are private but serde-derived, so it is
+/// assembled through its plist representation.
+fn provider_state_from_delegate(
+    delegate: &rustpush::MobileMeDelegateResponse,
+    refreshed: std::time::SystemTime,
+) -> Result<TokenProviderState, WrappedError> {
+    let mut root = plist::Dictionary::new();
+    root.insert("mme".to_string(), plist::to_value(delegate)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Could not serialize MobileMe delegate: {}", e) })?);
+    root.insert("refreshed".to_string(), plist::to_value(&refreshed)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Could not serialize delegate timestamp: {}", e) })?);
+    plist::from_value(&plist::Value::Dictionary(root))
+        .map_err(|e| WrappedError::GenericError { msg: format!("Could not seed MobileMe delegate state: {}", e) })
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl WrappedTokenProvider {
     /// Get HTTP headers needed for iCloud MobileMe API calls.
@@ -1927,6 +2037,17 @@ impl WrappedTokenProvider {
     pub async fn get_mme_delegate_json(&self) -> Result<Option<String>, WrappedError> {
         let bytes_guard = self.mme_delegate_bytes.lock().await;
         Ok(bytes_guard.as_ref().map(|b| String::from_utf8_lossy(b).to_string()))
+    }
+
+    /// The latest account record and MobileMe delegate state rustpush
+    /// persisted, as one base64 binary plist for the Go session metadata.
+    /// Hand it back to `restore_token_provider` on the next start so tokens
+    /// that are still valid are reused instead of forcing a fresh SRP login.
+    /// None until a login or restore has populated it.
+    pub async fn get_account_persist_blob(&self) -> Result<Option<String>, WrappedError> {
+        let snapshot = self.persist_snapshot.lock()
+            .map_err(|_| WrappedError::GenericError { msg: "Account persist snapshot is poisoned".into() })?;
+        encode_persist_blob(&snapshot)
     }
 
     /// Seed the MobileMe delegate from persisted plist string. Validates as a
@@ -2353,6 +2474,7 @@ pub async fn restore_token_provider(
     hashed_password_hex: String,
     pet: String,
     spd_base64: String,
+    persist_blob: Option<String>,
 ) -> Result<Arc<WrappedTokenProvider>, WrappedError> {
     let os_config = config.config.clone();
     let conn = connection.inner.clone();
@@ -2384,11 +2506,37 @@ pub async fn restore_token_provider(
     let spd_bytes = base64_decode(&spd_base64);
     let spd: plist::Dictionary = plist::from_bytes(&spd_bytes)
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid SPD plist: {}", e) })?;
-    let mut persisted = persist_data_from_spd(&spd, &username, hashed_password)?;
+    let spd_persisted = persist_data_from_spd(&spd, &username, hashed_password.clone())?;
 
-    // Inject the persisted PET into the persisted tokens with an already-expired
-    // timestamp. Byte-for-byte port of the master-branch restore path
-    // (master's pkg/rustpushgo/src/lib.rs line 805).
+    // Prefer the blob rustpush itself persisted: it carries every token with
+    // its real expiration plus the MobileMe delegate state, so a restart
+    // reuses what is still valid instead of forcing a fresh SRP login. Fall
+    // back to the SPD rebuild for sessions that predate the blob, for a blob
+    // that no longer matches this session's account, or for one that fails to
+    // decode.
+    let (mut persisted, provider_state) = match persist_blob.as_deref().filter(|blob| !blob.is_empty()).map(decode_persist_blob) {
+        Some(Ok((account, provider))) if account.adsid == spd_persisted.adsid => {
+            info!("Restoring account state from the persisted rustpush blob");
+            (account, provider)
+        }
+        Some(Ok(_)) => {
+            warn!("Persisted rustpush blob belongs to a different account; rebuilding from SPD");
+            (spd_persisted, None)
+        }
+        Some(Err(e)) => {
+            warn!("Ignoring unreadable persisted rustpush blob; rebuilding from SPD: {}", e);
+            (spd_persisted, None)
+        }
+        None => (spd_persisted, None),
+    };
+    if persisted.hashed_password.is_empty() {
+        persisted.hashed_password = hashed_password;
+    }
+
+    // Unless the blob already carries a PET, inject the persisted PET into the
+    // persisted tokens with an already-expired timestamp. Byte-for-byte port
+    // of the master-branch restore path (master's pkg/rustpushgo/src/lib.rs
+    // line 805).
     //
     // Why: the `get_token` call short-circuits and returns None when
     // `tokens.is_empty() == false` AND the requested key is absent. So if
@@ -2421,35 +2569,43 @@ pub async fn restore_token_provider(
     // that appeared after the refactor migration to raw rustpush and
     // was never fully restored by the subsequent periodic-refresh commits
     // (66d6402, bdd4ebe).
-    persisted.tokens.insert(
-        "com.apple.gs.idms.pet".to_string(),
-        icloud_auth::FetchedToken {
-            token: pet,
-            expiration: std::time::UNIX_EPOCH,
-        },
-    );
+    if !persisted.tokens.contains_key("com.apple.gs.idms.pet") {
+        persisted.tokens.insert(
+            "com.apple.gs.idms.pet".to_string(),
+            icloud_auth::FetchedToken {
+                token: pet,
+                expiration: std::time::UNIX_EPOCH,
+            },
+        );
+    }
 
-    // The bridge keeps its own persistence (session metadata plus
-    // get_mme_delegate_json) and reads the state back through
-    // `account.persisted` when Go asks, so rustpush's update callbacks are
-    // no-ops here. The MobileMe delegate state likewise starts empty and
-    // rustpush refreshes it on first use, exactly as before.
-    let account = AppleAccount::new_with_anisette(client_info, anisette, Some(persisted), Box::new(|_| {}))
+    // Every change rustpush makes to the account record or the MobileMe
+    // delegate state lands in this snapshot; Go reads it back through
+    // get_account_persist_blob and stores it next to the legacy fields.
+    let snapshot: SharedPersistSnapshot = Arc::default();
+    record_account_persist(&snapshot, &persisted);
+    if let Some(state) = &provider_state {
+        record_provider_state(&snapshot, state);
+    }
+    let (update_persist, update_state) = persist_callbacks(&snapshot);
+    let account = AppleAccount::new_with_anisette(client_info, anisette, Some(persisted), update_persist)
         .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create account: {}", e) })?;
 
     let account = Arc::new(rustpush::DebugMutex::new(account));
+    // Without a persisted delegate state rustpush starts empty and refreshes
+    // the MobileMe delegate on first use, exactly as before.
     let token_provider = TokenProvider::new(
         account.clone(),
         os_config.clone(),
-        TokenProviderState::default(),
-        Box::new(|_| {}),
+        provider_state.unwrap_or_default(),
+        update_state,
     );
 
     info!("Restored TokenProvider from persisted credentials");
 
-    // Restore path does not have a MobileMe delegate — callers must
-    // seed_mme_delegate_json() from persisted state before using keychain/
-    // contacts features.
+    // The bridge's own MobileMe delegate cache (used by the keychain and
+    // CloudKit clients it builds itself) is still seeded by the caller through
+    // seed_mme_delegate_json() before keychain/contacts features are used.
     Ok(Arc::new(WrappedTokenProvider {
         inner: token_provider,
         account,
@@ -2457,6 +2613,7 @@ pub async fn restore_token_provider(
         mme_delegate_bytes: tokio::sync::Mutex::new(None),
         keychain_clients_cache: tokio::sync::Mutex::new(None),
         mme_self_heal_lock: tokio::sync::Mutex::new(()),
+        persist_snapshot: snapshot,
     }))
 }
 
@@ -5020,6 +5177,9 @@ pub struct LoginSession {
     // SMS (secondaryAuth) 2FA: the verify body returned by send_sms_2fa_to_devices,
     // consumed by submit_2fa via verify_sms_2fa. None for trusted-device 2FA.
     sms_verify_body: std::sync::Mutex<Option<icloud_auth::VerifyBody>>,
+    // Receives rustpush's persistence callbacks from login_start onward and
+    // moves into the WrappedTokenProvider that `finish` creates.
+    persist_snapshot: SharedPersistSnapshot,
 }
 
 /// Run a throwaway GSA `init` purely to capture the native-sync SIM
@@ -5141,7 +5301,9 @@ pub async fn login_start(
 
     let anisette = bridge_default_provider(client_info.clone(), anisette_state_path, os_config.get_device_uuid());
 
-    let mut account = AppleAccount::new_with_anisette(client_info, anisette, None, Box::new(|_| {}))
+    let persist_snapshot: SharedPersistSnapshot = Arc::default();
+    let (update_persist, _) = persist_callbacks(&persist_snapshot);
+    let mut account = AppleAccount::new_with_anisette(client_info, anisette, None, update_persist)
         .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create account: {}", e) })?;
 
     info!("login_start: calling login_email_pass for {}", user_trimmed);
@@ -5212,6 +5374,7 @@ pub async fn login_start(
         password_hash: pw_bytes,
         needs_2fa,
         sms_verify_body: std::sync::Mutex::new(sms_verify_body),
+        persist_snapshot,
     }))
 }
 
@@ -5411,13 +5574,20 @@ impl LoginSession {
         let owned_account = guard.take()
             .ok_or(WrappedError::GenericError { msg: "Account already consumed".to_string() })?;
         let account_arc = Arc::new(rustpush::DebugMutex::new(owned_account));
-        // The bridge persists the MobileMe delegate itself (see below), so the
-        // provider starts with empty state and no-op persistence callbacks.
+        // Seed rustpush's MobileMe delegate state with the delegate fetched a
+        // moment ago so the first get_mme_token call does not refetch it, and
+        // route later state updates into the persist snapshot Go stores.
+        let (_, update_state) = persist_callbacks(&self.persist_snapshot);
+        let provider_state = match &delegates.mobileme {
+            Some(mobileme) => provider_state_from_delegate(mobileme, std::time::SystemTime::now())?,
+            None => TokenProviderState::default(),
+        };
+        record_provider_state(&self.persist_snapshot, &provider_state);
         let token_provider = TokenProvider::new(
             account_arc.clone(),
             os_config.clone(),
-            TokenProviderState::default(),
-            Box::new(|_| {}),
+            provider_state,
+            update_state,
         );
 
         // Store the MobileMe delegate in the WrappedTokenProvider as opaque plist
@@ -5459,6 +5629,7 @@ impl LoginSession {
                 mme_delegate_bytes: tokio::sync::Mutex::new(mme_delegate_bytes),
                 keychain_clients_cache: tokio::sync::Mutex::new(None),
                 mme_self_heal_lock: tokio::sync::Mutex::new(()),
+                persist_snapshot: self.persist_snapshot.clone(),
             })),
             account_persist: Some(account_persist),
         })

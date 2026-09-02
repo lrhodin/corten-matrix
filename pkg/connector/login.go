@@ -840,6 +840,14 @@ func completeLoginWithMeta(
 				meta.MmeDelegateJSON = *delegateJSON
 				log.Info().Msg("Captured MobileMe delegate for persistence")
 			}
+			// And the account state rustpush persisted, so the next restart
+			// reuses tokens that are still valid instead of re-running SRP.
+			if blob, blobErr := tp.GetAccountPersistBlob(); blobErr == nil && blob != nil {
+				meta.AccountPersistBlob = *blob
+				log.Info().Msg("Captured rustpush account state for persistence")
+			} else if blobErr != nil {
+				log.Warn().Err(blobErr).Msg("Failed to capture rustpush account state for persistence")
+			}
 		}
 	} else {
 		log.Warn().Msg("No account persist data from login — cloud services will not be available")
@@ -861,6 +869,7 @@ func completeLoginWithMeta(
 		AccountDSID:              meta.AccountDSID,
 		AccountSPDBase64:         meta.AccountSPDBase64,
 		MmeDelegateJSON:          meta.MmeDelegateJSON,
+		AccountPersistBlob:       meta.AccountPersistBlob,
 	})
 
 	loginID := networkid.UserLoginID(result.Users.LoginId(0))

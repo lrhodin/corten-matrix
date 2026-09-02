@@ -52,6 +52,9 @@ type PersistedSessionState struct {
 	// Cached MobileMe delegate for seeding on restore
 	MmeDelegateJSON string `json:"mme_delegate_json,omitempty"`
 
+	// Opaque account state rustpush persisted; see UserLoginMetadata.
+	AccountPersistBlob string `json:"account_persist_blob,omitempty"`
+
 	// Opaque IDS delivery-key cache (base64). Bookkeeping that rides alongside
 	// the registration data and is preserved across saves (see saveSessionState).
 	IDSKeyCache string `json:"ids_key_cache,omitempty"`

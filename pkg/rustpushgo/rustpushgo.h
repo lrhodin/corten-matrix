@@ -970,6 +970,11 @@ void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_apple_account_full_name(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_get_account_persist_blob(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_get_contacts_url(
 	void* ptr,
 	RustCallStatus* out_status
@@ -1099,6 +1104,7 @@ void* uniffi_rustpushgo_fn_func_restore_token_provider(
 	RustBuffer hashed_password_hex,
 	RustBuffer pet,
 	RustBuffer spd_base64,
+	RustBuffer persist_blob,
 	RustCallStatus* out_status
 );
 
@@ -1946,6 +1952,10 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_announce_apple_d
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_apple_account_full_name(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_account_persist_blob(
 	RustCallStatus* out_status
 );
 

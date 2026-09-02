@@ -67,6 +67,13 @@ type UserLoginMetadata struct {
 	// Cached MobileMe delegate JSON — seeded on restore so contacts work
 	// without needing to refresh (which requires a still-valid PET).
 	MmeDelegateJSON string `json:"mme_delegate_json,omitempty"`
+
+	// Opaque account state rustpush persisted (base64 binary plist with the
+	// account record and MobileMe delegate state, see
+	// rustpushgo get_account_persist_blob). Handed back on restore so tokens
+	// that are still valid are reused; the legacy fields above stay as the
+	// fallback for sessions that predate it.
+	AccountPersistBlob string `json:"account_persist_blob,omitempty"`
 }
 
 func (c *IMConnector) GetDBMetaTypes() database.MetaTypes {
