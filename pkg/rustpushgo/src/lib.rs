@@ -1775,8 +1775,15 @@ fn persist_data_from_spd(spd: &plist::Dictionary, username: &str, hashed_passwor
         .ok_or(WrappedError::GenericError { msg: "SPD missing adsid".into() })?
         .to_string();
     let plist_string = |key: &str| spd.get(key).and_then(|v| v.as_string()).map(|v| v.to_string());
+    // Prefer the account name Apple returned (`acname`): upstream records it
+    // as the persisted username after every SRP exchange and refreshes with
+    // it, so restoring the same value keeps the two in step. Old sessions whose
+    // SPD lacks it fall back to what the user typed.
+    let acname = plist_string("acname")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| username.to_string());
     Ok(icloud_auth::PersistAccountData {
-        username: username.to_string(),
+        username: acname.clone(),
         first_name: plist_string("fn"),
         last_name: plist_string("ln"),
         hashed_password,
@@ -1784,7 +1791,7 @@ fn persist_data_from_spd(spd: &plist::Dictionary, username: &str, hashed_passwor
         tokens: HashMap::new(),
         adsid,
         dsid,
-        acname: plist_string("acname").unwrap_or_else(|| username.to_string()),
+        acname,
     })
 }
 
