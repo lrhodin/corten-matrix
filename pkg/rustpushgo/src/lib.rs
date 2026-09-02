@@ -2527,7 +2527,10 @@ pub async fn restore_token_provider(
             warn!("Ignoring unreadable persisted rustpush blob; rebuilding from SPD: {}", e);
             (spd_persisted, None)
         }
-        None => (spd_persisted, None),
+        None => {
+            info!("No persisted rustpush blob for this session; rebuilding account state from SPD");
+            (spd_persisted, None)
+        }
     };
     if persisted.hashed_password.is_empty() {
         persisted.hashed_password = hashed_password;
@@ -4307,7 +4310,16 @@ pub fn init_logger() {
             "warn,rustpush=warn,rustpushgo=info",
         );
     }
-    let _ = pretty_env_logger::try_init();
+    // Write to stdout, not stderr: the Go bridge's own logger writes to
+    // stdout, and that is the stream the service captures and the logs
+    // command shows. On stderr the wrapper's restore, refresh, and recovery
+    // lines were invisible to anyone reading the bridge log.
+    let mut builder = pretty_env_logger::formatted_builder();
+    if let Ok(filters) = std::env::var("RUST_LOG") {
+        builder.parse_filters(&filters);
+    }
+    builder.target(pretty_env_logger::env_logger::Target::Stdout);
+    let _ = builder.try_init();
 
     // Before anything talks to Apple.
     preflight_key_wrap_check();
