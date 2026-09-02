@@ -1688,43 +1688,55 @@ async fn join_keychain_with_bottles(
 /// NeedsExtraStep with a populated PET is treated as success (see
 /// LoginSession::finish / client.rs:1039).
 ///
-/// Infallible — any auth/network error is logged and swallowed so callers
-/// (especially the periodic tick) can retry on the next cycle.
+/// Never panics or propagates: any auth/network error is logged so callers
+/// (especially the periodic tick) can retry on the next cycle. Returns true
+/// only when Apple issued a fresh PET on this call, judged before the
+/// snapshot merge so a re-inserted stale PET is never mistaken for success.
 async fn refresh_pet_with_snapshot(
     account: &mut AppleAccount<BridgeDefaultAnisetteProvider>,
     username: &str,
     hashed_password: &[u8],
     context: &str,
-) {
+) -> bool {
     let snapshot = account.persisted.as_mut()
         .map(|persisted| std::mem::take(&mut persisted.tokens))
         .unwrap_or_default();
-    match account.login_email_pass(username, hashed_password).await {
+    let fresh_pet = |account: &AppleAccount<BridgeDefaultAnisetteProvider>| {
+        account.persisted.as_ref()
+            .map(|p| p.tokens.contains_key("com.apple.gs.idms.pet"))
+            .unwrap_or(false)
+    };
+    let refreshed = match account.login_email_pass(username, hashed_password).await {
         Ok(icloud_auth::LoginState::LoggedIn) => {
             info!("{}: proactive PET refresh succeeded", context);
+            fresh_pet(account)
         }
         Ok(state) => {
-            if account.persisted.as_ref().map(|p| p.tokens.contains_key("com.apple.gs.idms.pet")).unwrap_or(false) {
+            if fresh_pet(account) {
                 info!(
                     "{}: PET refresh returned {:?} but PET was populated — treating as success",
                     context, state
                 );
+                true
             } else {
                 warn!(
                     "{}: proactive PET refresh returned non-logged-in state: {:?} — manual re-login may be required",
                     context, state
                 );
+                false
             }
         }
         Err(err) => {
             warn!("{}: proactive PET refresh failed (non-fatal): {}", context, err);
+            false
         }
-    }
+    };
     if let Some(persisted) = account.persisted.as_mut() {
         for (k, v) in snapshot {
             persisted.tokens.entry(k).or_insert(v);
         }
     }
+    refreshed
 }
 
 /// The login credentials rustpush keeps on the account after a successful SRP
@@ -1943,15 +1955,20 @@ impl WrappedTokenProvider {
     /// a warm session) once per 12h tick. Not a new contention pattern —
     /// it's inherent to how rustpush serializes access to AppleAccount.
     ///
-    /// Non-fatal: any failure is logged inside `refresh_pet_with_snapshot`
-    /// and swallowed so the Go-side caller treats an Err return as "try
-    /// again next tick" rather than a hard failure.
+    /// Non-fatal on the Rust side: `refresh_pet_with_snapshot` never
+    /// propagates an auth/network failure, but this returns Err whenever
+    /// Apple did not issue a fresh PET so the Go caller logs the truth and
+    /// treats it as "try again next tick" instead of recording success.
     pub async fn refresh_pet_token(&self) -> Result<(), WrappedError> {
         let mut account = self.account.lock().await;
         let (username, hashed_password) = persisted_credentials(&*account).ok_or(WrappedError::GenericError {
             msg: "refresh_pet_token: account has no persisted username/hashed_password".into(),
         })?;
-        refresh_pet_with_snapshot(&mut account, &username, &hashed_password, "refresh_pet_token").await;
+        if !refresh_pet_with_snapshot(&mut account, &username, &hashed_password, "refresh_pet_token").await {
+            return Err(WrappedError::GenericError {
+                msg: "refresh_pet_token: Apple did not issue a fresh PET; manual re-login may be required".into(),
+            });
+        }
         Ok(())
     }
 
