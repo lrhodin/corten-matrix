@@ -1037,6 +1037,47 @@ func safeRestoreTokenProvider(
 	return rustpushgo.RestoreTokenProvider(config, conn, username, hashedPwHex, pet, spdBase64)
 }
 
+// safeLoginStart, safeSubmit2fa, and safeFinish wrap the interactive login
+// FFI calls with the same panic recovery as safeRestoreTokenProvider. An
+// unexpected Apple response that unwinds inside rustpush must surface as a
+// failed login step the user can retry, not take the bridge process down.
+func safeLoginStart(
+	username, password string,
+	config *rustpushgo.WrappedOsConfig,
+	conn *rustpushgo.WrappedApsConnection,
+) (session *rustpushgo.LoginSession, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("LoginStart panicked: %v", r)
+		}
+	}()
+	return rustpushgo.LoginStart(username, password, config, conn)
+}
+
+func safeSubmit2fa(session *rustpushgo.LoginSession, code string) (ok bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("Submit2fa panicked: %v", r)
+		}
+	}()
+	return session.Submit2fa(code)
+}
+
+func safeFinish(
+	session *rustpushgo.LoginSession,
+	config *rustpushgo.WrappedOsConfig,
+	conn *rustpushgo.WrappedApsConnection,
+	existingIdentity **rustpushgo.WrappedIdsngmIdentity,
+	existingUsers **rustpushgo.WrappedIdsUsers,
+) (result rustpushgo.IdsUsersWithIdentityRecord, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("Finish panicked: %v", r)
+		}
+	}()
+	return session.Finish(config, conn, existingIdentity, existingUsers)
+}
+
 func (c *IMClient) Connect(ctx context.Context) {
 	c.startupTime = time.Now()
 	log := c.UserLogin.Log.With().Str("component", "imessage").Logger()

@@ -121,7 +121,7 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 		}
 		l.username = username
 
-		session, err := rustpushgo.LoginStart(username, password, l.cfg, l.conn)
+		session, err := safeLoginStart(username, password, l.cfg, l.conn)
 		if err != nil {
 			l.Main.Bridge.Log.Error().Err(err).Str("username", username).Msg("Login failed")
 			return nil, fmt.Errorf("login failed: %w", err)
@@ -158,7 +158,7 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 		return nil, fmt.Errorf("2FA code is required")
 	}
 
-	success, err := l.session.Submit2fa(code)
+	success, err := safeSubmit2fa(l.session, code)
 	if err != nil {
 		return nil, fmt.Errorf("2FA verification failed: %w", err)
 	}
@@ -194,7 +194,7 @@ func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, er
 		log.Info().Msg("No existing users found, will register fresh (first login)")
 	}
 
-	result, err := l.session.Finish(l.cfg, l.conn, existingIdentityArg, existingUsersArg)
+	result, err := safeFinish(l.session, l.cfg, l.conn, existingIdentityArg, existingUsersArg)
 	if err != nil {
 		l.Main.Bridge.Log.Error().Err(err).Msg("IDS registration failed during finishLogin")
 		return nil, fmt.Errorf("login completion failed: %w", err)
@@ -367,7 +367,7 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 		}
 		l.username = username
 
-		session, err := rustpushgo.LoginStart(username, password, l.cfg, l.conn)
+		session, err := safeLoginStart(username, password, l.cfg, l.conn)
 		if err != nil {
 			l.Main.Bridge.Log.Error().Err(err).Str("username", username).Msg("Login failed")
 			return nil, fmt.Errorf("login failed: %w", err)
@@ -400,7 +400,7 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 		return nil, fmt.Errorf("2FA code is required")
 	}
 
-	success, err := l.session.Submit2fa(code)
+	success, err := safeSubmit2fa(l.session, code)
 	if err != nil {
 		return nil, fmt.Errorf("2FA verification failed: %w", err)
 	}
@@ -436,7 +436,7 @@ func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep
 		log.Info().Msg("No existing users found, will register fresh (first login)")
 	}
 
-	result, err := l.session.Finish(l.cfg, l.conn, existingIdentityArg, existingUsersArg)
+	result, err := safeFinish(l.session, l.cfg, l.conn, existingIdentityArg, existingUsersArg)
 	if err != nil {
 		l.Main.Bridge.Log.Error().Err(err).Msg("IDS registration failed during finishLogin")
 		return nil, fmt.Errorf("login completion failed: %w", err)
