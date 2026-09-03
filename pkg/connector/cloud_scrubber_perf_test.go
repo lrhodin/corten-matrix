@@ -532,6 +532,10 @@ func TestNormalizeGroupMessagePortalIDsUsesCloudChatMapping(t *testing.T) {
 		{CloudChatID: "CHAT-1", GroupID: "GROUP-1", PortalID: "gid:group-1", Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
 		{CloudChatID: "chat-2", GroupID: "", PortalID: "gid:chat-2", Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
 		{CloudChatID: "chat-3", GroupID: "group-3", PortalID: "", Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
+		// A chain: rows in gid:link-a belong in gid:link-b, and rows already in
+		// gid:link-b belong in gid:link-c. Each row must move exactly once.
+		{CloudChatID: "link-a", GroupID: "", PortalID: "gid:link-b", Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
+		{CloudChatID: "link-b", GroupID: "", PortalID: "gid:link-c", Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
 	}); err != nil {
 		t.Fatalf("upsertChatBatch: %v", err)
 	}
@@ -542,6 +546,8 @@ func TestNormalizeGroupMessagePortalIDsUsesCloudChatMapping(t *testing.T) {
 		{GUID: "self-mapping", PortalID: "gid:chat-2"},
 		{GUID: "unmapped-chat", PortalID: "gid:chat-3"},
 		{GUID: "dm", PortalID: "tel:+15550001111"},
+		{GUID: "chain-first", PortalID: "gid:link-a"},
+		{GUID: "chain-second", PortalID: "gid:link-b"},
 	}
 	for i := range rows {
 		rows[i].TimestampMS = now
@@ -552,8 +558,8 @@ func TestNormalizeGroupMessagePortalIDsUsesCloudChatMapping(t *testing.T) {
 	}
 
 	n, err := store.normalizeGroupMessagePortalIDs(ctx)
-	if err != nil || n != 2 {
-		t.Fatalf("normalizeGroupMessagePortalIDs = %d, %v; want 2", n, err)
+	if err != nil || n != 4 {
+		t.Fatalf("normalizeGroupMessagePortalIDs = %d, %v; want 4", n, err)
 	}
 	for guid, want := range map[string]string{
 		"by-chat-id":        "gid:group-1",
@@ -562,6 +568,8 @@ func TestNormalizeGroupMessagePortalIDsUsesCloudChatMapping(t *testing.T) {
 		"self-mapping":      "gid:chat-2",
 		"unmapped-chat":     "gid:chat-3",
 		"dm":                "tel:+15550001111",
+		"chain-first":       "gid:link-b",
+		"chain-second":      "gid:link-c",
 	} {
 		var got string
 		if err := db.QueryRow(ctx, `SELECT portal_id FROM cloud_message WHERE login_id=$1 AND guid=$2`, testSQLLoginID, guid).Scan(&got); err != nil {
@@ -571,7 +579,80 @@ func TestNormalizeGroupMessagePortalIDsUsesCloudChatMapping(t *testing.T) {
 			t.Errorf("%s portal_id = %q, want %q", guid, got, want)
 		}
 	}
+	// The chain's second hop is itself a stale portal, so a second run moves
+	// the rows that landed there in the first run: that is what the single
+	// statement did too, one hop per bootstrap.
+	if n, err := store.normalizeGroupMessagePortalIDs(ctx); err != nil || n != 1 {
+		t.Fatalf("second normalizeGroupMessagePortalIDs = %d, %v; want 1 (chain-first's second hop)", n, err)
+	}
 	if n, err := store.normalizeGroupMessagePortalIDs(ctx); err != nil || n != 0 {
-		t.Fatalf("second normalizeGroupMessagePortalIDs = %d, %v; want 0", n, err)
+		t.Fatalf("third normalizeGroupMessagePortalIDs = %d, %v; want 0", n, err)
+	}
+}
+
+func TestScrubBridgedBodiesDropsDeliveredSetWhenRebuildFails(t *testing.T) {
+	ctx, db, store, insertAged, scrubbed := scrubIncrementalFixture(t)
+	const bridgeID = "bridge"
+	insertAged("guid-1", "gid:p")
+	insertScrubberBridgeMessage(t, db, ctx, "guid-1", bridgeID, string(testSQLLoginID))
+	// An undelivered aged row keeps every later pass consulting the set.
+	insertAged("guid-undelivered", "gid:q")
+	if n, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil || n != 1 {
+		t.Fatalf("first pass = %d, %v; want 1", n, err)
+	}
+	first := store.bridged
+
+	// Plaintext is handed back, then the rebuild the invalidation demands
+	// fails. The stale set must not survive as if it were current.
+	store.invalidateBridgedGUIDSet()
+	if _, err := db.Exec(ctx, `ALTER TABLE message RENAME TO message_hidden`); err != nil {
+		t.Fatalf("hide message table: %v", err)
+	}
+	if _, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err == nil {
+		t.Fatal("pass without a message table succeeded")
+	}
+	if store.bridged != nil {
+		t.Fatal("failed rebuild left the previous delivered set in place")
+	}
+	if _, err := db.Exec(ctx, `ALTER TABLE message_hidden RENAME TO message`); err != nil {
+		t.Fatalf("restore message table: %v", err)
+	}
+
+	insertAged("guid-2", "gid:p")
+	insertScrubberBridgeMessage(t, db, ctx, "guid-2", bridgeID, string(testSQLLoginID))
+	if n, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil || n != 1 {
+		t.Fatalf("pass after recovery = %d, %v; want 1", n, err)
+	}
+	if store.bridged == nil || store.bridged == first || !scrubbed("guid-2") {
+		t.Fatal("pass after recovery did not rebuild the delivered set")
+	}
+}
+
+func TestExtendBridgedGUIDSetRechecksAnchorAfterRead(t *testing.T) {
+	ctx, db, store, insertAged, _ := scrubIncrementalFixture(t)
+	const bridgeID = "bridge"
+	insertAged("guid-1", "gid:p")
+	insertScrubberBridgeMessage(t, db, ctx, "guid-1", bridgeID, string(testSQLLoginID))
+	if n, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil || n != 1 {
+		t.Fatalf("first pass = %d, %v; want 1", n, err)
+	}
+	set := store.bridged
+
+	// A set whose anchor still holds extends and stays complete.
+	insertScrubberBridgeMessage(t, db, ctx, "guid-2", bridgeID, string(testSQLLoginID))
+	if complete, err := store.extendBridgedGUIDSet(ctx, set); err != nil || !complete {
+		t.Fatalf("extend with a valid anchor = %v, %v; want complete", complete, err)
+	}
+	if !set.contains("guid-2") || set.maxRowID != 2 {
+		t.Fatalf("extend did not fold the new row: contains=%v anchor=%d", set.contains("guid-2"), set.maxRowID)
+	}
+
+	// Once the anchor row is gone the extension is reported incomplete even
+	// though the range read itself succeeds.
+	if _, err := db.Exec(ctx, `DELETE FROM message WHERE rowid=2`); err != nil {
+		t.Fatal(err)
+	}
+	if complete, err := store.extendBridgedGUIDSet(ctx, set); err != nil || complete {
+		t.Fatalf("extend with a deleted anchor = %v, %v; want incomplete", complete, err)
 	}
 }

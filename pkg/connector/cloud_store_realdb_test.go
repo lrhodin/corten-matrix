@@ -23,34 +23,13 @@ import (
 //	CORTEN_TEST_REAL_DB=/tmp/copy-of-corten-matrix.db \
 //	  go test ./pkg/connector/ -run TestEnsureSchemaAgainstRealDatabase -v
 //
-// The test copies the file again into t.TempDir() before touching it, so the
-// path you pass is never written to. It asserts that ensureSchema succeeds
+// The test copies the database again into t.TempDir() before touching it
+// (see openRealDatabaseCopy), so the path you pass is never written to. It
+// asserts that ensureSchema succeeds
 // twice, that no rows are lost, and that the boolean predicates the queries
 // use still match rows written by older versions of the bridge as integers.
 func TestEnsureSchemaAgainstRealDatabase(t *testing.T) {
-	src := os.Getenv("CORTEN_TEST_REAL_DB")
-	if src == "" {
-		t.Skip("set CORTEN_TEST_REAL_DB to a copy of a real bridge database to run this")
-	}
-	data, err := os.ReadFile(src)
-	if err != nil {
-		t.Fatalf("read %s: %v", src, err)
-	}
-	path := filepath.Join(t.TempDir(), "realdb.db")
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatalf("copy database: %v", err)
-	}
-
-	raw, err := sql.Open("sqlite3", "file:"+path+"?_txlock=immediate")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	raw.SetMaxOpenConns(1)
-	defer raw.Close()
-	db, err := dbutil.NewWithDB(raw, "sqlite3")
-	if err != nil {
-		t.Fatalf("wrap in dbutil: %v", err)
-	}
+	db := openRealDatabaseCopy(t)
 
 	ctx := context.Background()
 	countBefore := map[string]int{}
@@ -141,28 +120,7 @@ func TestEnsureSchemaAgainstRealDatabase(t *testing.T) {
 // second pass over an unchanged database extends the set built by the first
 // pass instead of rebuilding it.
 func TestScrubberAgainstRealDatabase(t *testing.T) {
-	src := os.Getenv("CORTEN_TEST_REAL_DB")
-	if src == "" {
-		t.Skip("set CORTEN_TEST_REAL_DB to a copy of a real bridge database to run this")
-	}
-	data, err := os.ReadFile(src)
-	if err != nil {
-		t.Fatalf("read %s: %v", src, err)
-	}
-	path := filepath.Join(t.TempDir(), "realdb.db")
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatalf("copy database: %v", err)
-	}
-	raw, err := sql.Open("sqlite3", "file:"+path+"?_txlock=immediate")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	raw.SetMaxOpenConns(1)
-	defer raw.Close()
-	db, err := dbutil.NewWithDB(raw, "sqlite3")
-	if err != nil {
-		t.Fatalf("wrap in dbutil: %v", err)
-	}
+	db := openRealDatabaseCopy(t)
 
 	ctx := context.Background()
 	var loginID, bridgeID string
@@ -204,6 +162,48 @@ func TestScrubberAgainstRealDatabase(t *testing.T) {
 	).Scan(&pendingCandidates); err != nil {
 		t.Fatal(err)
 	}
+	if first == nil {
+		t.Logf("no scrub candidates, delivered-ID set never loaded; %d rows still unscrubbed", pendingCandidates)
+		return
+	}
 	t.Logf("delivered-ID set: %d ids anchored at rowid %d; %d rows still unscrubbed",
 		first.size(), first.maxRowID, pendingCandidates)
+}
+
+// openRealDatabaseCopy makes a standalone copy of the database named by
+// CORTEN_TEST_REAL_DB and returns it wrapped in dbutil, or skips the test when
+// the variable is unset. The copy is taken with VACUUM INTO on a read-only
+// connection, so a source that still carries committed WAL frames is copied
+// in full and is never written to; a byte copy of the main file alone would
+// silently drop everything since its last checkpoint.
+func openRealDatabaseCopy(t *testing.T) *dbutil.Database {
+	t.Helper()
+	src := os.Getenv("CORTEN_TEST_REAL_DB")
+	if src == "" {
+		t.Skip("set CORTEN_TEST_REAL_DB to a copy of a real bridge database to run this")
+	}
+	path := filepath.Join(t.TempDir(), "realdb.db")
+	source, err := sql.Open("sqlite3", "file:"+src+"?mode=ro")
+	if err != nil {
+		t.Fatalf("open %s: %v", src, err)
+	}
+	if _, err := source.Exec(`VACUUM INTO ?`, path); err != nil {
+		source.Close()
+		t.Fatalf("copy %s with VACUUM INTO: %v", src, err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatalf("close %s: %v", src, err)
+	}
+
+	raw, err := sql.Open("sqlite3", "file:"+path+"?_txlock=immediate")
+	if err != nil {
+		t.Fatalf("open copy: %v", err)
+	}
+	raw.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = raw.Close() })
+	db, err := dbutil.NewWithDB(raw, "sqlite3")
+	if err != nil {
+		t.Fatalf("wrap copy in dbutil: %v", err)
+	}
+	return db
 }

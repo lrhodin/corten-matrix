@@ -2012,10 +2012,16 @@ func (s *cloudBackfillStore) normalizeGroupMessagePortalIDs(ctx context.Context)
 	}
 
 	// Every distinct gid: portal a message references, straight from the
-	// (login_id, portal_id, ...) index.
+	// (login_id, portal_id, ...) index. SQLite compares bytes, so the prefix
+	// is a plain range; Postgres orders text by collation, where ':' and ';'
+	// need not bracket the prefix, so it keeps the LIKE.
+	prefixPredicate := `portal_id >= 'gid:' AND portal_id < 'gid;'`
+	if s.db.Dialect == dbutil.Postgres {
+		prefixPredicate = `portal_id LIKE 'gid:%'`
+	}
 	portals, err := s.db.Query(ctx, `
 		SELECT DISTINCT portal_id FROM cloud_message
-		WHERE login_id=$1 AND portal_id >= 'gid:' AND portal_id < 'gid;'`, s.loginID)
+		WHERE login_id=$1 AND `+prefixPredicate, s.loginID)
 	if err != nil {
 		return 0, fmt.Errorf("list gid portals in cloud_message: %w", err)
 	}
@@ -2037,6 +2043,30 @@ func (s *cloudBackfillStore) normalizeGroupMessagePortalIDs(ctx context.Context)
 	portals.Close()
 	if err := portals.Err(); err != nil {
 		return 0, fmt.Errorf("iterate gid portals: %w", err)
+	}
+
+	// The former single statement moved every row once, by its original
+	// portal. Sequential updates reproduce that only if a portal that is both
+	// a target and a source is drained before rows are moved into it, so
+	// prefer moves whose target no remaining move drains; a cycle (two
+	// portals mapping to each other) has no such order and is written as
+	// listed.
+	for done := 0; done < len(moves); done++ {
+		pick := done
+		for i := done; i < len(moves); i++ {
+			drainedLater := false
+			for j := done; j < len(moves); j++ {
+				if j != i && moves[j].from == moves[i].to {
+					drainedLater = true
+					break
+				}
+			}
+			if !drainedLater {
+				pick = i
+				break
+			}
+		}
+		moves[done], moves[pick] = moves[pick], moves[done]
 	}
 
 	var total int64
@@ -4064,7 +4094,9 @@ func (b *bridgedIDSet) size() int {
 
 // loadBridgedGUIDSet builds the delivered-ID set from scratch. Receiver
 // scoping prevents one login's delivery from making another login's CloudKit
-// row eligible for scrubbing.
+// row eligible for scrubbing. rowid is bridgev2's own column on both
+// dialects: the implicit INTEGER PRIMARY KEY on SQLite and a declared BIGINT
+// identity column on Postgres.
 func (s *cloudBackfillStore) loadBridgedGUIDSet(ctx context.Context, bridgeID string) (*bridgedIDSet, error) {
 	rows, err := s.db.Query(ctx, `
 		SELECT rowid, id FROM message
@@ -4107,26 +4139,30 @@ const bridgedGUIDSetReloadInterval = 6 * time.Hour
 // bridge ID, and after invalidateBridgedGUIDSet.
 //
 // Between rebuilds the set only grows: an id whose message row was deleted
-// since (an unsend, a portal teardown) is still reported as delivered. That is
-// deliberate. A body that was delivered and then removed does not need its
-// plaintext kept for backfill, and the one path that hands plaintext back to a
-// delivered row, clearBodyScrubByPortalID, invalidates the set first.
+// since (an unsend, a portal teardown) is still reported as delivered, and a
+// row whose id bridgev2 rewrote in place keeps its old id until the rebuild.
+// That is deliberate. A body that was delivered and then removed does not
+// need its plaintext kept for backfill, and the one path that hands plaintext
+// back to a delivered row, clearBodyScrubByPortalID, invalidates the set
+// first.
 func (s *cloudBackfillStore) refreshBridgedGUIDSet(ctx context.Context, bridgeID string) (*bridgedIDSet, error) {
+	// Consume the flag before reading anything, so an invalidation that lands
+	// while this pass reads is still pending for the next one.
 	invalidated := s.bridgedInvalid.Swap(false)
 	set := s.bridged
 	if set != nil && !invalidated && set.bridgeID == bridgeID &&
 		s.db.Dialect == dbutil.SQLite && time.Since(set.loadedAt) < bridgedGUIDSetReloadInterval {
-		anchored, err := s.bridgedAnchorHolds(ctx, set)
+		complete, err := s.extendBridgedGUIDSet(ctx, set)
 		if err != nil {
 			return nil, err
 		}
-		if anchored {
-			if err := s.foldNewBridgedIDs(ctx, set); err != nil {
-				return nil, err
-			}
+		if complete {
 			return set, nil
 		}
 	}
+	// Drop the old set before rebuilding: a rebuild that fails must not leave
+	// it looking current, whatever the flag says by then.
+	s.bridged = nil
 	set, err := s.loadBridgedGUIDSet(ctx, bridgeID)
 	if err != nil {
 		return nil, err
@@ -4142,22 +4178,39 @@ func (s *cloudBackfillStore) invalidateBridgedGUIDSet() {
 	s.bridgedInvalid.Store(true)
 }
 
-// bridgedAnchorHolds reports whether the newest row observed by set is still
-// the row it was, which is what makes a rowid range read complete.
-func (s *cloudBackfillStore) bridgedAnchorHolds(ctx context.Context, set *bridgedIDSet) (bool, error) {
-	if set.maxRowID == 0 {
+// extendBridgedGUIDSet folds the message rows above set's watermark and
+// reports whether the result is complete. The anchor row is checked both
+// before and after the range read: they are separate statements, so with the
+// pool serialized to one connection another goroutine can commit in between,
+// and a deletion that frees the anchor's rowid for reuse right then would
+// otherwise go unnoticed until the periodic rebuild.
+func (s *cloudBackfillStore) extendBridgedGUIDSet(ctx context.Context, set *bridgedIDSet) (bool, error) {
+	anchorRowID, anchorMsg := set.maxRowID, set.maxRowIDMsg
+	if holds, err := s.bridgedAnchorHolds(ctx, anchorRowID, anchorMsg); err != nil || !holds {
+		return false, err
+	}
+	if err := s.foldNewBridgedIDs(ctx, set); err != nil {
+		return false, err
+	}
+	return s.bridgedAnchorHolds(ctx, anchorRowID, anchorMsg)
+}
+
+// bridgedAnchorHolds reports whether the row that anchored the last read is
+// still the row it was, which is what makes a rowid range read complete.
+func (s *cloudBackfillStore) bridgedAnchorHolds(ctx context.Context, rowID int64, msg string) (bool, error) {
+	if rowID == 0 {
 		// Nothing observed yet: every message row is above the watermark.
 		return true, nil
 	}
 	var id string
-	err := s.db.QueryRow(ctx, `SELECT id FROM message WHERE rowid=$1`, set.maxRowID).Scan(&id)
+	err := s.db.QueryRow(ctx, `SELECT id FROM message WHERE rowid=$1`, rowID).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("check bridged guid set anchor: %w", err)
 	}
-	return id == set.maxRowIDMsg, nil
+	return id == msg, nil
 }
 
 // foldNewBridgedIDs adds the message rows above set's watermark. The query
