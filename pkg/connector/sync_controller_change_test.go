@@ -46,3 +46,27 @@ func TestCanSkipDelayedCloudReconciliation(t *testing.T) {
 		})
 	}
 }
+
+func TestShouldRunDelayedCloudReconciliation(t *testing.T) {
+	for _, tc := range []struct {
+		name                        string
+		counts                      cloudSyncCounters
+		currentPassFailed           bool
+		previousPassFailed          bool
+		portalReconciliationPending bool
+		want                        bool
+	}{
+		{"successful empty pass", cloudSyncCounters{}, false, false, false, false},
+		{"current pass failed after partial writes", cloudSyncCounters{}, true, false, false, true},
+		{"current failed pass reported writes", cloudSyncCounters{Imported: 1}, true, false, false, true},
+		{"previous pass failed", cloudSyncCounters{}, false, true, false, true},
+		{"portal scan pending", cloudSyncCounters{}, false, false, true, true},
+		{"successful pass wrote changes", cloudSyncCounters{Updated: 1}, false, false, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldRunDelayedCloudReconciliation(tc.counts, tc.currentPassFailed, tc.previousPassFailed, tc.portalReconciliationPending); got != tc.want {
+				t.Errorf("shouldRunDelayedCloudReconciliation() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
