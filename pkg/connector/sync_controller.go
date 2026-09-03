@@ -109,8 +109,12 @@ func (c *cloudSyncCounters) add(other cloudSyncCounters) {
 	c.Filtered += other.Filtered
 }
 
+// hasChanges reports whether the pass wrote anything to the cloud tables.
+// Filtered chats count: with bridge_filtered_chats on they are portal
+// candidates, and a delayed pass that skips its rescans must have had nothing
+// at all to act on.
 func (c cloudSyncCounters) hasChanges() bool {
-	return c.Imported+c.Updated+c.Deleted > 0
+	return c.Imported+c.Updated+c.Deleted+c.Filtered > 0
 }
 
 func (c *IMClient) setCloudSyncDone() {
@@ -2190,6 +2194,12 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// returned immediately after launching it — the defer cancel() killed
 	// the context, causing every re-sync to fail with "context canceled".
 	delays := []time.Duration{15 * time.Second, 60 * time.Second, 3 * time.Minute}
+	// syncCloudMessages saves its continuation token per page and returns the
+	// error after ingesting the earlier pages, so a failed pass can leave rows
+	// behind that still need portals and the recently-deleted soft-deletes.
+	// The pass after a failure therefore always runs the full path, whatever
+	// its own counts say.
+	previousPassFailed := false
 	for i, delay := range delays {
 		select {
 		case <-time.After(delay):
@@ -2211,9 +2221,10 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 			c.cloudSyncRunning = false
 			c.cloudSyncRunningLock.Unlock()
 			resyncLog.Warn().Err(err).Msg("Delayed incremental re-sync failed")
+			previousPassFailed = true
 			continue
 		}
-		if !counts.hasChanges() {
+		if !counts.hasChanges() && !previousPassFailed {
 			// The delayed passes usually confirm that CloudKit has no newly
 			// propagated records. Re-running the account-wide attachment and
 			// portal scans in that case used to monopolize Keith's one SQLite
@@ -2230,6 +2241,7 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 			c.cloudSyncRunningLock.Unlock()
 			continue
 		}
+		previousPassFailed = false
 		// Extend skipPortals with any portals deleted since bootstrap.
 		// The delayed re-sync may have imported new cloud_message records
 		// for these portals (deleted=FALSE). Soft-delete them now so they

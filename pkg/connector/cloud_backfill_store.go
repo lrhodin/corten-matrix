@@ -716,7 +716,7 @@ func (s *cloudBackfillStore) setChatSyncVersion(ctx context.Context, version int
 // cached chats, and cached messages. Used on fresh bootstrap when the bridge
 // DB was reset but the cloud tables survived.
 func (s *cloudBackfillStore) clearAllData(ctx context.Context) error {
-	for _, table := range []string{"cloud_sync_state", "cloud_chat", "cloud_message", "cloud_attachment_cache", "cloud_attachment_dead"} {
+	for _, table := range []string{"cloud_sync_state", "cloud_chat", "cloud_message", "cloud_attachment_cache", "cloud_attachment_dead", "cloud_maintenance"} {
 		if _, err := s.db.Exec(ctx,
 			fmt.Sprintf(`DELETE FROM %s WHERE login_id=$1`, table),
 			s.loginID,
@@ -2232,6 +2232,34 @@ func (s *cloudBackfillStore) normalizeGroupMessagePortalIDs(ctx context.Context)
 			linearMoves = append(linearMoves, m)
 		}
 	}
+	// Cycles are written first. Their CASE expressions all see the original
+	// portal_id, and a linear move that feeds a cycle member must land after
+	// the swap, or the swap would carry those rows one hop further than the
+	// former single statement did.
+	var total int64
+	for _, cycle := range cycles {
+		args := make([]any, 0, 1+2*len(cycle))
+		args = append(args, s.loginID)
+		whenClauses := make([]string, len(cycle))
+		fromPlaceholders := make([]string, len(cycle))
+		for i, m := range cycle {
+			fromPlaceholder := fmt.Sprintf("$%d", 2+i*2)
+			toPlaceholder := fmt.Sprintf("$%d", 3+i*2)
+			whenClauses[i] = "WHEN " + fromPlaceholder + " THEN " + toPlaceholder
+			fromPlaceholders[i] = fromPlaceholder
+			args = append(args, m.from, m.to)
+		}
+		res, err := s.db.Exec(ctx, `
+			UPDATE cloud_message
+			SET portal_id=CASE portal_id `+strings.Join(whenClauses, " ")+` ELSE portal_id END
+			WHERE login_id=$1 AND portal_id IN (`+strings.Join(fromPlaceholders, ",")+`)
+		`, args...)
+		if err != nil {
+			return total, fmt.Errorf("normalize portal mapping cycle: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		total += n
+	}
 	// Sequential updates reproduce the former single statement for acyclic
 	// mappings if a target that is also a source is drained first.
 	for done := 0; done < len(linearMoves); done++ {
@@ -2252,36 +2280,12 @@ func (s *cloudBackfillStore) normalizeGroupMessagePortalIDs(ctx context.Context)
 		linearMoves[done], linearMoves[pick] = linearMoves[pick], linearMoves[done]
 	}
 
-	var total int64
 	for _, m := range linearMoves {
 		res, err := s.db.Exec(ctx,
 			`UPDATE cloud_message SET portal_id=$3 WHERE login_id=$1 AND portal_id=$2`,
 			s.loginID, m.from, m.to)
 		if err != nil {
 			return total, fmt.Errorf("normalize portal %s to %s: %w", m.from, m.to, err)
-		}
-		n, _ := res.RowsAffected()
-		total += n
-	}
-	for _, cycle := range cycles {
-		args := make([]any, 0, 1+2*len(cycle))
-		args = append(args, s.loginID)
-		whenClauses := make([]string, len(cycle))
-		fromPlaceholders := make([]string, len(cycle))
-		for i, m := range cycle {
-			fromPlaceholder := fmt.Sprintf("$%d", 2+i*2)
-			toPlaceholder := fmt.Sprintf("$%d", 3+i*2)
-			whenClauses[i] = "WHEN " + fromPlaceholder + " THEN " + toPlaceholder
-			fromPlaceholders[i] = fromPlaceholder
-			args = append(args, m.from, m.to)
-		}
-		res, err := s.db.Exec(ctx, `
-			UPDATE cloud_message
-			SET portal_id=CASE portal_id `+strings.Join(whenClauses, " ")+` ELSE portal_id END
-			WHERE login_id=$1 AND portal_id IN (`+strings.Join(fromPlaceholders, ",")+`)
-		`, args...)
-		if err != nil {
-			return total, fmt.Errorf("normalize portal mapping cycle: %w", err)
 		}
 		n, _ := res.RowsAffected()
 		total += n

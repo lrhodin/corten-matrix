@@ -9460,6 +9460,46 @@ func (c *IMClient) downloadAttachmentToTempFile(recordName string) (string, int6
 
 // downloadAndUploadAttachment handles a single attachment: download from CloudKit,
 // upload to Matrix, return as a backfill message.
+// cachedAttachmentContent returns the Matrix content a CloudKit attachment was
+// already uploaded as, from memory first and then from cloud_attachment_cache.
+// The persisted table is authoritative across restarts: pre-upload only warms
+// memory for portals still awaiting their first forward backfill, so without
+// this fallback a completed portal's backward backfill after a restart would
+// download from CloudKit and upload to Matrix again every attachment it had
+// already bridged. A hit read from the table is kept in memory. A stale entry
+// for a video that still needs transcoding is reported as a miss and dropped
+// from memory so the caller re-downloads.
+func (c *IMClient) cachedAttachmentContent(ctx context.Context, recordName string) (*event.MessageEventContent, error) {
+	if cached, ok := c.attachmentContentCache.Load(recordName); ok {
+		content := cached.(*event.MessageEventContent)
+		if content.Info != nil && content.Info.MimeType == "video/quicktime" {
+			c.attachmentContentCache.Delete(recordName)
+			return nil, nil
+		}
+		return content, nil
+	}
+	if c.cloudStore == nil {
+		return nil, nil
+	}
+	cachedJSON, err := c.cloudStore.loadAttachmentCacheJSON(ctx, []string{recordName})
+	if err != nil {
+		return nil, err
+	}
+	raw, ok := cachedJSON[recordName]
+	if !ok {
+		return nil, nil
+	}
+	var content event.MessageEventContent
+	if err := json.Unmarshal(raw, &content); err != nil {
+		return nil, fmt.Errorf("decode cached attachment content: %w", err)
+	}
+	if content.Info != nil && content.Info.MimeType == "video/quicktime" {
+		return nil, nil
+	}
+	c.attachmentContentCache.Store(recordName, &content)
+	return &content, nil
+}
+
 func (c *IMClient) downloadAndUploadAttachment(
 	ctx context.Context,
 	row cloudMessageRow,
@@ -9515,12 +9555,13 @@ func (c *IMClient) downloadAndUploadAttachment(
 	// both still+video). Regular videos with HasAvid use the cache normally
 	// since we only bridge the lqa (the video itself), not the avid duplicate.
 	isLivePhoto := att.HasAvid && !strings.HasPrefix(att.MimeType, "video/")
-	if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok && !isLivePhoto {
-		cachedContent := cached.(*event.MessageEventContent)
-		if cachedContent.Info != nil && cachedContent.Info.MimeType == "video/quicktime" {
-			// Stale cache entry — video needs transcoding. Fall through to re-download.
-			c.attachmentContentCache.Delete(att.RecordName)
-		} else {
+	if !isLivePhoto {
+		cachedContent, err := c.cachedAttachmentContent(ctx, att.RecordName)
+		if err != nil {
+			log.Debug().Err(err).Str("record_name", att.RecordName).
+				Msg("Could not read the persisted attachment cache, downloading instead")
+		}
+		if cachedContent != nil {
 			return []*bridgev2.BackfillMessage{{
 				Sender:    sender,
 				ID:        makeMessageID(attID),
@@ -10165,7 +10206,12 @@ func (c *IMClient) preUploadChunkAttachments(ctx context.Context, rows []cloudMe
 			if att.RecordName == "" {
 				continue
 			}
-			if _, ok := c.attachmentContentCache.Load(att.RecordName); ok {
+			cached, err := c.cachedAttachmentContent(ctx, att.RecordName)
+			if err != nil {
+				log.Debug().Err(err).Str("record_name", att.RecordName).
+					Msg("Forward backfill: could not read the persisted attachment cache, treating as uncached")
+			}
+			if cached != nil {
 				continue
 			}
 			pending = append(pending, pendingAtt{

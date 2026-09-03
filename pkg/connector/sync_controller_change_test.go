@@ -10,7 +10,9 @@ func TestCloudSyncCountersHasChanges(t *testing.T) {
 	}{
 		{"empty", cloudSyncCounters{}, false},
 		{"skipped only", cloudSyncCounters{Skipped: 1}, false},
-		{"filtered only", cloudSyncCounters{Filtered: 1}, false},
+		// A filtered chat is still a written row, and a portal candidate when
+		// bridge_filtered_chats is on.
+		{"filtered only", cloudSyncCounters{Filtered: 1}, true},
 		{"imported", cloudSyncCounters{Imported: 1}, true},
 		{"updated", cloudSyncCounters{Updated: 1}, true},
 		{"deleted", cloudSyncCounters{Deleted: 1}, true},

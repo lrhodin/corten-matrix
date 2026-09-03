@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"maunium.net/go/mautrix/event"
 )
 
 func TestLegacySystemMessageCleanupIsTargetedAndOneShot(t *testing.T) {
@@ -191,5 +193,54 @@ func TestDeleteOrphanedMessagesPreservesLiveAndKnownPortalRows(t *testing.T) {
 		if got := count == 1; got != want {
 			t.Errorf("row %s exists = %v, want %v", guid, got, want)
 		}
+	}
+}
+
+func TestCachedAttachmentContentFallsBackToPersistedCache(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	store.saveAttachmentCacheEntry(ctx, "image-record",
+		[]byte(`{"msgtype":"m.image","body":"photo.png","url":"mxc://example/photo","info":{"mimetype":"image/png"}}`))
+	store.saveAttachmentCacheEntry(ctx, "stale-video-record",
+		[]byte(`{"msgtype":"m.video","body":"clip.mov","url":"mxc://example/clip","info":{"mimetype":"video/quicktime"}}`))
+
+	c := &IMClient{cloudStore: store}
+
+	// Nothing in memory yet: the persisted entry is the answer, and it is
+	// kept in memory afterwards.
+	content, err := c.cachedAttachmentContent(ctx, "image-record")
+	if err != nil || content == nil || content.Body != "photo.png" {
+		t.Fatalf("cachedAttachmentContent(image-record) = %+v, %v; want the persisted content", content, err)
+	}
+	if _, ok := c.attachmentContentCache.Load("image-record"); !ok {
+		t.Fatal("persisted hit was not kept in memory")
+	}
+	if _, err := db.Exec(ctx, `DELETE FROM cloud_attachment_cache WHERE record_name='image-record'`); err != nil {
+		t.Fatal(err)
+	}
+	if content, err := c.cachedAttachmentContent(ctx, "image-record"); err != nil || content == nil {
+		t.Fatalf("second lookup = %+v, %v; want the in-memory copy", content, err)
+	}
+
+	// A video that still needs transcoding is a miss wherever it came from.
+	if content, err := c.cachedAttachmentContent(ctx, "stale-video-record"); err != nil || content != nil {
+		t.Fatalf("stale video lookup = %+v, %v; want a miss", content, err)
+	}
+	c.attachmentContentCache.Store("stale-video-record", &event.MessageEventContent{
+		Info: &event.FileInfo{MimeType: "video/quicktime"},
+	})
+	if content, err := c.cachedAttachmentContent(ctx, "stale-video-record"); err != nil || content != nil {
+		t.Fatalf("stale in-memory video lookup = %+v, %v; want a miss", content, err)
+	}
+	if _, ok := c.attachmentContentCache.Load("stale-video-record"); ok {
+		t.Fatal("stale in-memory video entry was not dropped")
+	}
+
+	if content, err := c.cachedAttachmentContent(ctx, "unknown-record"); err != nil || content != nil {
+		t.Fatalf("unknown lookup = %+v, %v; want a miss", content, err)
 	}
 }
