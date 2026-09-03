@@ -3,8 +3,10 @@ package connector
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -247,6 +249,45 @@ func TestCloudHousekeepingAgainstRealDatabase(t *testing.T) {
 	timed("deleteOrphanedMessages", func() (int, error) {
 		n, err := store.deleteOrphanedMessages(ctx)
 		return int(n), err
+	})
+
+	// The scrub confirmation is only reached for rows a pass is about to
+	// scrub, so a drained database never exercises it and an earlier version
+	// of this benchmark reported nothing while the query took 1.5s per 200
+	// guids in production. Drive it directly with real delivered ids.
+	var bridgeID string
+	if err := db.QueryRow(ctx, `SELECT bridge_id FROM message LIMIT 1`).Scan(&bridgeID); err != nil {
+		t.Skipf("no bridgev2 message rows to confirm against: %v", err)
+	}
+	probe := make([]string, 0, 1000)
+	rows, err := db.Query(ctx, `SELECT id FROM message WHERE bridge_id=$1 LIMIT 1000`, bridgeID)
+	if err != nil {
+		t.Fatalf("read ids to confirm: %v", err)
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		_, normalized, _ := normalizeScrubGUID(id, true)
+		probe = append(probe, strings.ToUpper(normalized))
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	timed("confirmDeliveredGUIDs (1000 delivered)", func() (int, error) {
+		confirmed, err := store.confirmDeliveredGUIDs(ctx, bridgeID, probe)
+		return len(confirmed), err
+	})
+	missing := make([]string, 0, 1000)
+	for i := 0; i < 1000; i++ {
+		missing = append(missing, fmt.Sprintf("%08X-DEAD-4EAD-8EAD-DEADDEADDEAD", i))
+	}
+	timed("confirmDeliveredGUIDs (1000 absent)", func() (int, error) {
+		confirmed, err := store.confirmDeliveredGUIDs(ctx, bridgeID, missing)
+		return len(confirmed), err
 	})
 }
 

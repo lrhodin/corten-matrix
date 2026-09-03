@@ -5002,34 +5002,47 @@ func deliveryProbeForms(guid string) []string {
 // scrub write itself carries no delivery predicate, so without this a stale
 // entry would clear plaintext that nothing can deliver again. Re-reading the
 // whole table per pass is what this branch exists to avoid, so read only the
-// handful of rows a pass is actually about to scrub: each guid becomes one
-// index-backed range over the (bridge_id, room_receiver, id) unique index,
-// which covers both the bare guid and its `<guid>_<part>` spellings, and the
-// rows that come back are re-normalized in Go so a wider range cannot confirm
-// a guid it does not really belong to.
+// rows a pass is actually about to scrub.
+//
+// Two passes, because bridgev2 writes a message either under the bare guid or
+// under "<guid>_<part>". The first asks for the exact ids, which SQLite
+// answers as equality lookups on the (bridge_id, room_receiver, id) unique
+// index. Nearly every guid resolves there, because a message's first part
+// carries the bare guid. The second walks one prefix range per guid the first
+// did not find, which is an ordinary index seek.
+//
+// The ranges are deliberately NOT batched into one OR chain. SQLite does not
+// decompose a long chain of range terms into per-term seeks: it takes the
+// index for bridge_id and room_receiver, then evaluates every term against
+// every row in that range. The first version of this function did batch them,
+// and on a real database that was 1.5 seconds per 200 guids — 49 such queries
+// held the bridge's only connection for 75 seconds straight and every other
+// statement in that window queued behind them. The same lookups as an IN list
+// measure 0.5 ms.
 func (s *cloudBackfillStore) confirmDeliveredGUIDs(ctx context.Context, bridgeID string, guids []string) (map[string]struct{}, error) {
 	confirmed := make(map[string]struct{}, len(guids))
-	const chunkSize = 200
-	for start := 0; start < len(guids); start += chunkSize {
+	forms := make([]string, 0, 2*len(guids))
+	for _, guid := range guids {
+		forms = append(forms, deliveryProbeForms(guid)...)
+	}
+
+	const chunkSize = 400
+	for start := 0; start < len(forms); start += chunkSize {
 		end := start + chunkSize
-		if end > len(guids) {
-			end = len(guids)
+		if end > len(forms) {
+			end = len(forms)
 		}
-		args := make([]any, 0, 2+4*(end-start))
+		args := make([]any, 0, end-start+2)
 		args = append(args, bridgeID, string(s.loginID))
-		terms := make([]string, 0, 2*(end-start))
-		for _, guid := range guids[start:end] {
-			for _, form := range deliveryProbeForms(guid) {
-				// "`" is the byte after "_", so [form, form+"`") is exactly the
-				// ids that are the form itself or the form plus a part suffix.
-				args = append(args, form, form+"`")
-				terms = append(terms, fmt.Sprintf("(id >= $%d AND id < $%d)", len(args)-1, len(args)))
-			}
+		placeholders := make([]string, end-start)
+		for i, form := range forms[start:end] {
+			args = append(args, form)
+			placeholders[i] = fmt.Sprintf("$%d", i+3)
 		}
 		rows, err := s.db.Query(ctx, `
 			SELECT id FROM message
 			WHERE bridge_id=$1 AND (room_receiver=$2 OR room_receiver='')
-			  AND (`+strings.Join(terms, " OR ")+`)`, args...)
+			  AND id IN (`+strings.Join(placeholders, ",")+`)`, args...)
 		if err != nil {
 			return nil, fmt.Errorf("confirm delivered guids: %w", err)
 		}
@@ -5048,7 +5061,43 @@ func (s *cloudBackfillStore) confirmDeliveredGUIDs(ctx context.Context, bridgeID
 		}
 		rows.Close()
 	}
+
+	for _, guid := range guids {
+		_, normalized, _ := normalizeScrubGUID(guid, false)
+		if _, ok := confirmed[normalized]; ok {
+			continue
+		}
+		found, err := s.deliveredUnderPartSuffix(ctx, bridgeID, guid)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			confirmed[normalized] = struct{}{}
+		}
+	}
 	return confirmed, nil
+}
+
+// deliveredUnderPartSuffix reports whether a message row exists for guid under
+// a "<guid>_<part>" id. "`" is the byte after "_", so [form+"_", form+"`") is
+// exactly the part-suffixed spellings and nothing else.
+func (s *cloudBackfillStore) deliveredUnderPartSuffix(ctx context.Context, bridgeID, guid string) (bool, error) {
+	for _, form := range deliveryProbeForms(guid) {
+		var id string
+		err := s.db.QueryRow(ctx, `
+			SELECT id FROM message
+			WHERE bridge_id=$1 AND (room_receiver=$2 OR room_receiver='')
+			  AND id >= $3 AND id < $4
+			LIMIT 1`, bridgeID, string(s.loginID), form+"_", form+"`").Scan(&id)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("confirm part-suffixed delivery: %w", err)
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 // scrubBatchIfEligible filters one candidate chunk through the delivered set,
