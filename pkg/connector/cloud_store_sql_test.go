@@ -24,8 +24,8 @@ import (
 //
 // Making those portable meant touching statements that SQLite users depend on
 // every day, so the point of these tests is the other direction: proving the
-// portable spelling still behaves correctly on SQLite, which is the only
-// database this bridge supports.
+// portable spelling still behaves correctly on SQLite, the primary database
+// exercised by this test file.
 
 const testSQLLoginID = networkid.UserLoginID("test-login")
 
@@ -201,7 +201,7 @@ func TestExistingDatabaseSurvivesTheDialectChanges(t *testing.T) {
 	// Honest about what this proves: on SQLite, TRUE and FALSE are literally
 	// aliases for 1 and 0, so this assertion cannot fail there and reverting
 	// the boolean change would not break it. It is here to pin that the
-	// change is a genuine NO-OP on the supported database — which is the
+	// change is a genuine NO-OP on the primary database — which is the
 	// claim being made — not to catch a SQLite regression. The change exists
 	// for Postgres, where `BOOLEAN = 1` is a hard error and no test here can
 	// reach.

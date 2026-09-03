@@ -3933,7 +3933,7 @@ func (s *cloudBackfillStore) reconcileStrandedBackfills(ctx context.Context) (in
 		SELECT bt.portal_id, bt.portal_receiver, bt.bridge_id
 		FROM backfill_task bt
 		WHERE bt.user_login_id=$1
-		  AND bt.is_done=1
+		  AND bt.is_done=TRUE
 		  AND EXISTS (
 		    SELECT 1 FROM cloud_message cm
 		    WHERE cm.login_id=$1 AND cm.portal_id=bt.portal_id AND cm.deleted=FALSE
@@ -3997,7 +3997,7 @@ func (s *cloudBackfillStore) portalsFullyBackfilledNoNewContent(ctx context.Cont
 	rows, err := s.db.Query(ctx, `
 		SELECT bt.portal_id
 		FROM backfill_task bt
-		WHERE bt.user_login_id=$1 AND bt.is_done=1 AND bt.completed_at > 0
+		WHERE bt.user_login_id=$1 AND bt.is_done=TRUE AND bt.completed_at > 0
 		  AND NOT EXISTS (
 		    SELECT 1 FROM `+messageTable+`
 		    WHERE cm.login_id=$1 AND cm.portal_id=bt.portal_id AND cm.deleted=FALSE
