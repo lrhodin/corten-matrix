@@ -193,6 +193,48 @@ func TestScrubberAgainstRealDatabase(t *testing.T) {
 	}
 	timed("scrubReactionText", func() (int64, error) { return store.scrubReactionText(ctx, bodyScrubGracePeriod) })
 
+	// A drain is the case that actually hurts: thousands of delivered rows
+	// eligible at once. This database is normally already drained, so an
+	// earlier version of this benchmark reported a 2-row pass and missed a
+	// confirmation query that cost 1.5s per 200 guids in production.
+	// Manufacture the drain on the disposable copy and time a real pass.
+	// Sized to the drain actually observed on a live bridge (9,725 rows), not
+	// to the whole table: a full re-scrub only happens when an operator flips
+	// debug_disable_privacy back off, and its cost is dominated by the
+	// deliberate 50ms yield between chunks rather than by query time.
+	const drainSize = 10000
+	result, err := db.Exec(ctx, `
+		UPDATE cloud_message SET body_scrubbed=FALSE, updated_ts=$2
+		WHERE login_id=$1 AND guid IN (
+		  SELECT guid FROM cloud_message
+		  WHERE login_id=$1 AND body_scrubbed=TRUE
+		    AND (tapback_type IS NULL OR tapback_type < 2000)
+		  LIMIT $3
+		)
+	`, loginID, time.Now().Add(-24*time.Hour).UnixMilli(), drainSize)
+	if err != nil {
+		t.Fatalf("stage a drain: %v", err)
+	}
+	restored, _ := result.RowsAffected()
+	if restored > 0 {
+		store.invalidateBridgedGUIDSet()
+		drainStart := time.Now()
+		drained, err := store.scrubBridgedBodies(ctx, bridgeID, bodyScrubGracePeriod, nil)
+		if err != nil {
+			t.Fatalf("drain pass: %v", err)
+		}
+		elapsed := time.Since(drainStart)
+		t.Logf("%-32s %8d rows %10s  (%d eligible)", "scrubBridgedBodies drain", drained, elapsed.Round(time.Millisecond), restored)
+		// A drain of this size is 10 chunks, so about half a second of it is
+		// the deliberate 50ms yield between chunks. The per-guid OR chain this
+		// replaced needed roughly 75 seconds for the same work on a live
+		// bridge, so this bound is loose enough for a slow machine and still
+		// catches any return to a scan-per-chunk shape.
+		if elapsed > 10*time.Second {
+			t.Errorf("drain pass took %s for %d eligible rows; a pass must not hold the only connection that long", elapsed, restored)
+		}
+	}
+
 	var pendingCandidates int
 	if err := db.QueryRow(ctx,
 		`SELECT COUNT(*) FROM cloud_message WHERE login_id=$1 AND body_scrubbed=FALSE`, loginID,
