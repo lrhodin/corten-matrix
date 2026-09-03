@@ -4154,6 +4154,10 @@ func (s *cloudBackfillStore) refreshBridgedGUIDSet(ctx context.Context, bridgeID
 		s.db.Dialect == dbutil.SQLite && time.Since(set.loadedAt) < bridgedGUIDSetReloadInterval {
 		complete, err := s.extendBridgedGUIDSet(ctx, set)
 		if err != nil {
+			// The extension may have folded some rows before failing. That
+			// state is consistent, but do not build on it: start over next
+			// pass rather than reason about how far a failed read got.
+			s.bridged = nil
 			return nil, err
 		}
 		if complete {
@@ -4216,10 +4220,12 @@ func (s *cloudBackfillStore) bridgedAnchorHolds(ctx context.Context, rowID int64
 // foldNewBridgedIDs adds the message rows above set's watermark. The query
 // constrains only rowid so SQLite walks the primary key from the watermark
 // instead of re-reading the whole (bridge_id, room_receiver, id) index; the
-// bridge and receiver scoping is applied here.
+// bridge and receiver scoping is applied here. Rows arrive in rowid order,
+// so if the read fails partway the anchor still names a row that was read
+// together with everything below it.
 func (s *cloudBackfillStore) foldNewBridgedIDs(ctx context.Context, set *bridgedIDSet) error {
 	rows, err := s.db.Query(ctx,
-		`SELECT rowid, id, bridge_id, room_receiver FROM message WHERE rowid > $1`,
+		`SELECT rowid, id, bridge_id, room_receiver FROM message WHERE rowid > $1 ORDER BY rowid`,
 		set.maxRowID)
 	if err != nil {
 		return fmt.Errorf("failed to read new bridged guids: %w", err)

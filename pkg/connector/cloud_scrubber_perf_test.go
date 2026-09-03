@@ -628,6 +628,40 @@ func TestScrubBridgedBodiesDropsDeliveredSetWhenRebuildFails(t *testing.T) {
 	}
 }
 
+func TestScrubBridgedBodiesDropsDeliveredSetWhenExtensionFails(t *testing.T) {
+	ctx, db, store, insertAged, scrubbed := scrubIncrementalFixture(t)
+	const bridgeID = "bridge"
+	insertAged("guid-1", "gid:p")
+	insertScrubberBridgeMessage(t, db, ctx, "guid-1", bridgeID, string(testSQLLoginID))
+	insertAged("guid-undelivered", "gid:q")
+	if n, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil || n != 1 {
+		t.Fatalf("first pass = %d, %v; want 1", n, err)
+	}
+	first := store.bridged
+
+	// No invalidation this time: the incremental read itself fails.
+	if _, err := db.Exec(ctx, `ALTER TABLE message RENAME TO message_hidden`); err != nil {
+		t.Fatalf("hide message table: %v", err)
+	}
+	if _, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err == nil {
+		t.Fatal("pass without a message table succeeded")
+	}
+	if store.bridged != nil {
+		t.Fatal("failed extension left the previous delivered set in place")
+	}
+	if _, err := db.Exec(ctx, `ALTER TABLE message_hidden RENAME TO message`); err != nil {
+		t.Fatalf("restore message table: %v", err)
+	}
+	insertAged("guid-2", "gid:p")
+	insertScrubberBridgeMessage(t, db, ctx, "guid-2", bridgeID, string(testSQLLoginID))
+	if n, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil || n != 1 {
+		t.Fatalf("pass after recovery = %d, %v; want 1", n, err)
+	}
+	if store.bridged == nil || store.bridged == first || !scrubbed("guid-2") {
+		t.Fatal("pass after recovery did not rebuild the delivered set")
+	}
+}
+
 func TestExtendBridgedGUIDSetRechecksAnchorAfterRead(t *testing.T) {
 	ctx, db, store, insertAged, _ := scrubIncrementalFixture(t)
 	const bridgeID = "bridge"
