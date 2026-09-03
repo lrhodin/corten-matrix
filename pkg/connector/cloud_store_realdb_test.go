@@ -180,7 +180,13 @@ func TestScrubberAgainstRealDatabase(t *testing.T) {
 	timed("scrubBridgedBodies pass 2", func() (int64, error) {
 		return store.scrubBridgedBodies(ctx, bridgeID, bodyScrubGracePeriod, nil)
 	})
-	if first != nil && store.bridged != first {
+	if first == nil {
+		// Every candidate was deleted or the backlog was empty, so no pass
+		// ever loaded a set. Say so: the assertion below silently proves
+		// nothing in that case, which is the steady state on a drained
+		// database.
+		t.Log("no pass loaded a delivered-ID set; the extension assertion did not run")
+	} else if store.bridged != first {
 		t.Fatal("second pass rebuilt the delivered-ID set on an unchanged database")
 	}
 	timed("scrubReactionText", func() (int64, error) { return store.scrubReactionText(ctx, bodyScrubGracePeriod) })

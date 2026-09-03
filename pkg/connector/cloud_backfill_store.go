@@ -4308,16 +4308,23 @@ func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (
 		}
 	}
 
+	// The reference scan above is paged, so unlike the former single statement
+	// it cannot see a message inserted below its cursor while it ran. Ignore
+	// cache entries that appeared after it started: those belong to exactly
+	// the messages it could have missed. An older entry whose only message
+	// arrived mid-scan is still prunable, which costs one re-download and
+	// never content.
+	scanStart := time.Now().UnixMilli()
 	const deleteChunkSize = 250
 	var total int64
 	lastRecordName := ""
 	for {
 		rows, err := s.db.Query(ctx, `
 			SELECT record_name FROM cloud_attachment_cache
-			WHERE login_id=$1 AND record_name > $2
+			WHERE login_id=$1 AND record_name > $2 AND created_ts < $4
 			ORDER BY record_name
 			LIMIT $3
-		`, s.loginID, lastRecordName, readChunkSize)
+		`, s.loginID, lastRecordName, readChunkSize, scanStart)
 		if err != nil {
 			return total, fmt.Errorf("failed to list attachment cache entries: %w", err)
 		}
@@ -4848,7 +4855,7 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		if end > len(candidates) {
 			end = len(candidates)
 		}
-		n, err := s.scrubBatchIfEligible(ctx, cutoff, bridged, candidates[start:end])
+		n, err := s.scrubBatchIfEligible(ctx, cutoff, bridgeID, bridged, candidates[start:end])
 		if err != nil {
 			return total, err
 		}
@@ -4918,6 +4925,12 @@ func (s *cloudBackfillStore) scrubCandidates(ctx context.Context, cutoff int64, 
 		if _, skip := exclude[candidate.portalID]; skip {
 			continue
 		}
+		// A row with no portal matched the former SQL's "portal_id NOT IN (…)"
+		// as NULL, which is never true, so an active restore took it out of
+		// the candidate set entirely. Keep that.
+		if candidate.portalID == "" && len(exclude) > 0 {
+			continue
+		}
 		if !candidate.deleted {
 			if _, isPending := pending[candidate.portalID]; isPending && !delivered[candidate.portalID] {
 				continue
@@ -4964,15 +4977,108 @@ func (s *cloudBackfillStore) pendingBackfillGatePortals(ctx context.Context, hol
 	return pending, delivered, nil
 }
 
-// scrubBatchIfEligible filters one candidate chunk through the delivered set
-// and applies a small UPDATE. The write rechecks both the grace-window state
-// and the pending-backfill gate, so a concurrent re-ingest or newly-created
-// pending portal cannot be scrubbed based on stale candidate state.
-func (s *cloudBackfillStore) scrubBatchIfEligible(ctx context.Context, cutoff int64, bridged *bridgedIDSet, candidates []cloudScrubCandidate) (int64, error) {
+// deliveryProbeForms returns the spellings of a cloud guid worth probing the
+// message table for. CloudKit stores guids uppercase and bridgev2 has always
+// written them back in that case, but the set's own matching is
+// case-insensitive, so cover the other spelling rather than silently stop
+// confirming deliveries on a database that disagrees.
+func deliveryProbeForms(guid string) []string {
+	forms := []string{guid}
+	if lower := strings.ToLower(guid); lower != guid {
+		forms = append(forms, lower)
+	}
+	if upper := strings.ToUpper(guid); upper != guid && upper != forms[len(forms)-1] {
+		forms = append(forms, upper)
+	}
+	return forms
+}
+
+// confirmDeliveredGUIDs returns the guids that still have a bridgev2 message
+// row, normalized the way bridgedIDSet normalizes them.
+//
+// The resident set is a prefilter, not the authority. It only grows between
+// rebuilds, so it still answers "delivered" for a message whose Matrix event
+// was redacted or whose room was torn down outside the restore pipeline; the
+// scrub write itself carries no delivery predicate, so without this a stale
+// entry would clear plaintext that nothing can deliver again. Re-reading the
+// whole table per pass is what this branch exists to avoid, so read only the
+// handful of rows a pass is actually about to scrub: each guid becomes one
+// index-backed range over the (bridge_id, room_receiver, id) unique index,
+// which covers both the bare guid and its `<guid>_<part>` spellings, and the
+// rows that come back are re-normalized in Go so a wider range cannot confirm
+// a guid it does not really belong to.
+func (s *cloudBackfillStore) confirmDeliveredGUIDs(ctx context.Context, bridgeID string, guids []string) (map[string]struct{}, error) {
+	confirmed := make(map[string]struct{}, len(guids))
+	const chunkSize = 200
+	for start := 0; start < len(guids); start += chunkSize {
+		end := start + chunkSize
+		if end > len(guids) {
+			end = len(guids)
+		}
+		args := make([]any, 0, 2+4*(end-start))
+		args = append(args, bridgeID, string(s.loginID))
+		terms := make([]string, 0, 2*(end-start))
+		for _, guid := range guids[start:end] {
+			for _, form := range deliveryProbeForms(guid) {
+				// "`" is the byte after "_", so [form, form+"`") is exactly the
+				// ids that are the form itself or the form plus a part suffix.
+				args = append(args, form, form+"`")
+				terms = append(terms, fmt.Sprintf("(id >= $%d AND id < $%d)", len(args)-1, len(args)))
+			}
+		}
+		rows, err := s.db.Query(ctx, `
+			SELECT id FROM message
+			WHERE bridge_id=$1 AND (room_receiver=$2 OR room_receiver='')
+			  AND (`+strings.Join(terms, " OR ")+`)`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("confirm delivered guids: %w", err)
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan delivered guid: %w", err)
+			}
+			_, normalized, _ := normalizeScrubGUID(id, true)
+			confirmed[normalized] = struct{}{}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("iterate delivered guids: %w", err)
+		}
+		rows.Close()
+	}
+	return confirmed, nil
+}
+
+// scrubBatchIfEligible filters one candidate chunk through the delivered set,
+// confirms those deliveries against the message table, and applies a small
+// UPDATE. The write rechecks both the grace-window state and the
+// pending-backfill gate, so a concurrent re-ingest or newly-created pending
+// portal cannot be scrubbed based on stale candidate state.
+func (s *cloudBackfillStore) scrubBatchIfEligible(ctx context.Context, cutoff int64, bridgeID string, bridged *bridgedIDSet, candidates []cloudScrubCandidate) (int64, error) {
 	guids := make([]string, 0, len(candidates))
+	probe := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
-		if candidate.deleted || bridged.contains(candidate.guid) {
+		if candidate.deleted {
+			// A deleted row needs no delivery: nothing can bridge it again.
 			guids = append(guids, candidate.guid)
+			continue
+		}
+		if bridged.contains(candidate.guid) {
+			probe = append(probe, candidate.guid)
+		}
+	}
+	if len(probe) > 0 {
+		confirmed, err := s.confirmDeliveredGUIDs(ctx, bridgeID, probe)
+		if err != nil {
+			return 0, err
+		}
+		for _, guid := range probe {
+			_, normalized, _ := normalizeScrubGUID(guid, false)
+			if _, ok := confirmed[normalized]; ok {
+				guids = append(guids, guid)
+			}
 		}
 	}
 	if len(guids) == 0 {

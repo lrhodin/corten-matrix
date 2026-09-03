@@ -261,11 +261,15 @@ func TestScrubBatchRechecksPendingBackfillAtWriteTime(t *testing.T) {
 	if err := store.ensureSchema(ctx); err != nil {
 		t.Fatalf("ensureSchema: %v", err)
 	}
+	createScrubberBridgeMessageTable(t, db, ctx)
 
 	now := time.Now().UnixMilli()
 	old := now - int64(time.Hour/time.Millisecond)
 	const portalID = "gid:newly-pending"
 	const guid = "pending-race-guid"
+	// Genuinely delivered, so the pending gate is the only thing that can
+	// hold it back.
+	insertScrubberBridgeMessage(t, db, ctx, guid, "bridge", string(testSQLLoginID))
 	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
 		GUID: guid, PortalID: portalID, CloudChatID: "pending-race-chat",
 		TimestampMS: old, Text: "must survive", Service: "iMessage", HasBody: true,
@@ -299,7 +303,7 @@ func TestScrubBatchRechecksPendingBackfillAtWriteTime(t *testing.T) {
 	}
 	bridged := newBridgedIDSet("bridge")
 	bridged.add(guid)
-	scrubbed, err := store.scrubBatchIfEligible(ctx, cutoff, bridged, candidates)
+	scrubbed, err := store.scrubBatchIfEligible(ctx, cutoff, "bridge", bridged, candidates)
 	if err != nil {
 		t.Fatalf("scrubBatchIfEligible: %v", err)
 	}
@@ -732,5 +736,99 @@ func TestExtendBridgedGUIDSetRechecksAnchorAfterRead(t *testing.T) {
 	}
 	if complete, err := store.extendBridgedGUIDSet(ctx, set); err != nil || complete {
 		t.Fatalf("extend with a deleted anchor = %v, %v; want incomplete", complete, err)
+	}
+}
+
+func TestScrubBridgedBodiesConfirmsDeliveryAgainstTheMessageTable(t *testing.T) {
+	ctx, db, store, insertAged, scrubbed := scrubIncrementalFixture(t)
+	const bridgeID = "bridge"
+
+	// Two delivered rows, one of them through a part-suffixed id.
+	insertAged("11111111-1111-4111-8111-111111111111", "gid:p")
+	insertAged("22222222-2222-4222-8222-222222222222", "gid:p")
+	insertScrubberBridgeMessage(t, db, ctx, "11111111-1111-4111-8111-111111111111", bridgeID, string(testSQLLoginID))
+	insertScrubberBridgeMessage(t, db, ctx, "22222222-2222-4222-8222-222222222222_att0", bridgeID, string(testSQLLoginID))
+	// An undelivered aged row keeps every later pass consulting the set.
+	insertAged("99999999-9999-4999-8999-999999999999", "gid:q")
+
+	if n, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil || n != 2 {
+		t.Fatalf("first pass = %d, %v; want 2", n, err)
+	}
+	set := store.bridged
+	if set == nil {
+		t.Fatal("first pass loaded no delivered-ID set")
+	}
+
+	// A third row is delivered, enters the resident set, and is then removed
+	// from Matrix before any pass could scrub it. The set still answers
+	// "delivered" for it; the database no longer does, and the database wins.
+	insertAged("33333333-3333-4333-8333-333333333333", "gid:p")
+	insertScrubberBridgeMessage(t, db, ctx, "33333333-3333-4333-8333-333333333333", bridgeID, string(testSQLLoginID))
+	// A later delivery moves the rowid anchor past it, so removing it is
+	// invisible to the anchor check — deleting the newest row instead would
+	// force a rebuild and never exercise the confirmation.
+	insertScrubberBridgeMessage(t, db, ctx, "44444444-4444-4444-8444-444444444444", bridgeID, string(testSQLLoginID))
+	if _, err := store.refreshBridgedGUIDSet(ctx, bridgeID); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if !set.contains("33333333-3333-4333-8333-333333333333") {
+		t.Fatal("the delivered row never entered the set")
+	}
+	if _, err := db.Exec(ctx, `DELETE FROM message WHERE id='33333333-3333-4333-8333-333333333333'`); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil || n != 0 {
+		t.Fatalf("pass after the redaction = %d, %v; want 0", n, err)
+	}
+	if scrubbed("33333333-3333-4333-8333-333333333333") {
+		t.Fatal("a row whose Matrix event was removed was scrubbed on the stale set alone")
+	}
+	if store.bridged != set || !set.contains("33333333-3333-4333-8333-333333333333") {
+		t.Fatal("the confirmation was expected to leave the resident set alone")
+	}
+
+	// Restoring the Matrix event makes it eligible again, proving the
+	// confirmation is a live check and not a permanent veto.
+	insertScrubberBridgeMessage(t, db, ctx, "33333333-3333-4333-8333-333333333333", bridgeID, string(testSQLLoginID))
+	if n, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil || n != 1 {
+		t.Fatalf("pass after redelivery = %d, %v; want 1", n, err)
+	}
+	if !scrubbed("33333333-3333-4333-8333-333333333333") {
+		t.Fatal("the redelivered row was not scrubbed")
+	}
+}
+
+func TestConfirmDeliveredGUIDsMatchesTheSetNormalization(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	createScrubberBridgeMessageTable(t, db, ctx)
+	const bridgeID = "bridge"
+
+	insertScrubberBridgeMessage(t, db, ctx, "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", bridgeID, string(testSQLLoginID))
+	insertScrubberBridgeMessage(t, db, ctx, "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB_att2", bridgeID, "")
+	insertScrubberBridgeMessage(t, db, ctx, strings.ToLower("CCCCCCCC-CCCC-4CCC-8CCC-CCCCCCCCCCCC"), bridgeID, string(testSQLLoginID))
+	insertScrubberBridgeMessage(t, db, ctx, "DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD", "other-bridge", string(testSQLLoginID))
+	insertScrubberBridgeMessage(t, db, ctx, "EEEEEEEE-EEEE-4EEE-8EEE-EEEEEEEEEEEE", bridgeID, "other-login")
+
+	probe := []string{
+		"AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+		"BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB",
+		"CCCCCCCC-CCCC-4CCC-8CCC-CCCCCCCCCCCC",
+		"DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD",
+		"EEEEEEEE-EEEE-4EEE-8EEE-EEEEEEEEEEEE",
+		"FFFFFFFF-FFFF-4FFF-8FFF-FFFFFFFFFFFF",
+	}
+	confirmed, err := store.confirmDeliveredGUIDs(ctx, bridgeID, probe)
+	if err != nil {
+		t.Fatalf("confirmDeliveredGUIDs: %v", err)
+	}
+	for _, guid := range probe {
+		_, normalized, _ := normalizeScrubGUID(guid, false)
+		_, got := confirmed[normalized]
+		want := strings.HasPrefix(guid, "A") || strings.HasPrefix(guid, "B") || strings.HasPrefix(guid, "C")
+		if got != want {
+			t.Errorf("confirmed %s = %v, want %v", guid[:8], got, want)
+		}
 	}
 }

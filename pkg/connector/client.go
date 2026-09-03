@@ -95,10 +95,15 @@ type recycleBinCandidate struct {
 // session. Deleting it (the old behavior) reset the counter and made the same
 // dead attachment re-download on every sync sweep — an infinite loop.
 type failedAttachmentEntry struct {
-	lastError  string
-	retries    int
-	abandoned  bool
+	lastError string
+	retries   int
+	abandoned bool
+	// row is kept so a later pass can retry without re-reading the message
+	// table. Its body is stripped first: the scrubber clears plaintext from
+	// cloud_message once a message is delivered, and it cannot reach a copy
+	// held here. hasText carries the one thing the retry needed the body for.
 	row        cloudMessageRow
+	hasText    bool
 	index      int
 	attachment cloudAttachmentRow
 }
@@ -137,10 +142,14 @@ const maxAttachmentRetries = 3
 // Returns the updated entry so callers can log the retry count.
 func (c *IMClient) recordAttachmentFailure(row cloudMessageRow, index int, attachment cloudAttachmentRow, errMsg string) *failedAttachmentEntry {
 	recordName := attachment.RecordName
+	retained := row
+	retained.Text = ""
+	retained.Subject = ""
 	entry := &failedAttachmentEntry{
 		lastError:  errMsg,
 		retries:    1,
-		row:        row,
+		row:        retained,
+		hasText:    strings.TrimSpace(strings.Trim(row.Text, "\ufffc \n")) != "",
 		index:      index,
 		attachment: attachment,
 	}
@@ -10050,7 +10059,7 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context, includePending
 			row: row, idx: entry.index, att: att,
 			sender:  c.makeCloudSender(row),
 			ts:      time.UnixMilli(row.TimestampMS),
-			hasText: strings.TrimSpace(strings.Trim(row.Text, "\ufffc \n")) != "",
+			hasText: entry.hasText,
 		})
 		return true
 	})
