@@ -124,12 +124,42 @@ func TestPruneOrphanedAttachmentCacheUsesLiveReferences(t *testing.T) {
 		t.Errorf("deleted attachment reference = %v, %v; want false", live, err)
 	}
 
+	// An unreferenced entry newer than the prune's cutoff must survive: the
+	// paged reference scan cannot see a message inserted below its cursor, so
+	// a fresh entry is assumed to belong to one of those.
+	//
+	// Honest about what this pins: it fails if the cutoff is dropped, but not
+	// if the cutoff is captured at the wrong moment. The entry is dated a
+	// minute ahead, so it survives whether the timestamp is taken before or
+	// after a scan that finishes in microseconds. Capturing it after the scan
+	// is a real bug — it lets through exactly the entries written while the
+	// scan ran — and catching that would need a scan slow enough to insert
+	// into concurrently, which is not worth the flakiness here.
+	if _, err := db.Exec(ctx, `
+		INSERT INTO cloud_attachment_cache (login_id, record_name, content_json, created_ts)
+		VALUES ($1, 'written-during-scan', '{}', $2)
+	`, testSQLLoginID, time.Now().Add(time.Minute).UnixMilli()); err != nil {
+		t.Fatalf("insert concurrent cache entry: %v", err)
+	}
+
 	pruned, err := store.pruneOrphanedAttachmentCache(ctx)
 	if err != nil {
 		t.Fatalf("pruneOrphanedAttachmentCache: %v", err)
 	}
 	if pruned != 2 {
 		t.Errorf("pruned = %d, want 2", pruned)
+	}
+	var survived int
+	if err := db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM cloud_attachment_cache WHERE record_name='written-during-scan'`,
+	).Scan(&survived); err != nil {
+		t.Fatal(err)
+	}
+	if survived != 1 {
+		t.Error("an entry written after the reference scan started was pruned")
+	}
+	if _, err := db.Exec(ctx, `DELETE FROM cloud_attachment_cache WHERE record_name='written-during-scan'`); err != nil {
+		t.Fatal(err)
 	}
 	var remaining string
 	if err := db.QueryRow(ctx, `SELECT record_name FROM cloud_attachment_cache`).Scan(&remaining); err != nil {

@@ -4256,6 +4256,10 @@ func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (
 	// statement. On a slow host it held SQLite's write lock for minutes. Build
 	// the reference set through short indexed reads, then perform keyed deletes
 	// in small transactions instead.
+	// Captured before the reference scan begins, not after: an entry written
+	// while the scan runs is exactly the kind the scan can miss, so the cutoff
+	// has to predate the reads it is protecting against.
+	scanStart := time.Now().UnixMilli()
 	referenced := make(map[string]struct{})
 	const readChunkSize = 500
 	var lastTimestamp int64
@@ -4309,12 +4313,11 @@ func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (
 	}
 
 	// The reference scan above is paged, so unlike the former single statement
-	// it cannot see a message inserted below its cursor while it ran. Ignore
-	// cache entries that appeared after it started: those belong to exactly
-	// the messages it could have missed. An older entry whose only message
-	// arrived mid-scan is still prunable, which costs one re-download and
-	// never content.
-	scanStart := time.Now().UnixMilli()
+	// it cannot see a message inserted below its cursor while it ran. Entries
+	// written since scanStart are skipped below, because they belong to
+	// exactly the messages it could have missed. An older entry whose only
+	// message arrived mid-scan is still prunable, which costs one re-download
+	// and never content.
 	const deleteChunkSize = 250
 	var total int64
 	lastRecordName := ""
