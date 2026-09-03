@@ -23,6 +23,11 @@ APA_DIR      := $(RUSTPUSH_DIR)/third_party/apple-private-apis
 RUSTPUSH_PIN_FILE := third_party/rustpush-upstream.sha
 RUSTPUSH_PIN      := $(shell cat $(RUSTPUSH_PIN_FILE) 2>/dev/null)
 RUSTPUSH_SRC:= $(shell find $(RUSTPUSH_DIR)/src $(APA_DIR) $(RUSTPUSH_DIR)/open-absinthe/src -name '*.rs' -o -name '*.s' 2>/dev/null) $(wildcard $(RUSTPUSH_DIR)/open-absinthe/build.rs)
+# Patches applied to the pinned tree by ensure-rustpush-source. They and this
+# Makefile are prerequisites of the Rust archive because make stats the tree's
+# .rs files before that recipe patches them: a patch that lands during the run
+# would otherwise not rebuild the archive until the next invocation.
+PATCH_FILES := $(shell find third_party/patches -name '*.patch' 2>/dev/null)
 CARGO_FILES := $(shell find . -name 'Cargo.toml' -o -name 'Cargo.lock' 2>/dev/null | grep -v target)
 GO_SRC      := $(shell find pkg/ cmd/ -name '*.go' 2>/dev/null)
 
@@ -153,6 +158,16 @@ FAIRPLAY_CERTS := 4056631661436364584235346952193 \
 # upstream relocated apple-private-apis under third_party/ that turned four
 # patches into no-ops with no output at all. Anything that does not land now
 # stops the build and names the patch.
+#
+# Changes too large for a substitution live as unified diffs under
+# third_party/patches/ and go through rp_apply, which proves the same end state
+# with the same three outcomes, using the complete patch as the test:
+#
+#   rp_apply <label> <apply-root> <patch-file> <verify-file-relative-to-root> <verify-ere>
+#
+#   patch reverse-applies and marker present -> skip  (already adopted upstream)
+#   marker present but patch does not reverse-apply -> FAIL (partial tree; reset it)
+#   otherwise `git apply --check`, apply, marker must appear -> else FAIL
 RP_PATCH = rp_patch() { \
 	  rp_label="$$1"; rp_file="$$2"; rp_expr="$$3"; rp_verify="$$4"; \
 	  if [ ! -f "$$rp_file" ]; then \
@@ -167,6 +182,39 @@ RP_PATCH = rp_patch() { \
 	    || { echo "error: rustpush patch '$$rp_label': perl failed on $$rp_file" >&2; return 1; }; \
 	  if ! grep -qE "$$rp_verify" "$$rp_file"; then \
 	    echo "error: rustpush patch '$$rp_label' did not apply to $$rp_file — the anchor no longer matches upstream" >&2; \
+	    return 1; \
+	  fi; \
+	  echo "  patch $$rp_label"; \
+	}; \
+	rp_apply() { \
+	  rp_label="$$1"; rp_root="$$2"; rp_file="$$3"; rp_target="$$2/$$4"; rp_verify="$$5"; \
+	  case "$$rp_file" in /*) ;; *) rp_file="$$PWD/$$rp_file" ;; esac; \
+	  if [ ! -f "$$rp_file" ]; then \
+	    echo "error: rustpush patch '$$rp_label': patch file missing: $$rp_file" >&2; \
+	    return 1; \
+	  fi; \
+	  if [ ! -f "$$rp_target" ]; then \
+	    echo "error: rustpush patch '$$rp_label': target file missing: $$rp_target (did upstream move it?)" >&2; \
+	    return 1; \
+	  fi; \
+	  if git -C "$$rp_root" apply --reverse --unidiff-zero --whitespace=fix --check "$$rp_file" >/dev/null 2>&1; then \
+	    if ! grep -qE "$$rp_verify" "$$rp_target"; then \
+	      echo "error: rustpush patch '$$rp_label' is fully present but its end-state marker is absent from $$rp_target" >&2; \
+	      return 1; \
+	    fi; \
+	    echo "  patch $$rp_label (already satisfied upstream)"; \
+	    return 0; \
+	  fi; \
+	  if grep -qE "$$rp_verify" "$$rp_target"; then \
+	    echo "error: rustpush patch '$$rp_label' is only partly present in $$rp_root — delete $(RUSTPUSH_DIR) and rebuild" >&2; \
+	    return 1; \
+	  fi; \
+	  git -C "$$rp_root" apply --unidiff-zero --whitespace=fix --check "$$rp_file" \
+	    || { echo "error: rustpush patch '$$rp_label' does not apply to the pinned tree — refresh $$rp_file" >&2; return 1; }; \
+	  git -C "$$rp_root" apply --unidiff-zero --whitespace=fix "$$rp_file" \
+	    || { echo "error: rustpush patch '$$rp_label' failed after a successful preflight" >&2; return 1; }; \
+	  if ! grep -qE "$$rp_verify" "$$rp_target"; then \
+	    echo "error: rustpush patch '$$rp_label' applied but did not produce its end state in $$rp_target" >&2; \
 	    return 1; \
 	  fi; \
 	  echo "  patch $$rp_label"; \
@@ -252,6 +300,15 @@ ensure-rustpush-source:
 	@$(RP_PATCH) rp_patch "FetchedToken.expiration pub" $(APA_DIR)/icloud-auth/src/client.rs \
 	  's/^    expiration: SystemTime,$$/    pub expiration: SystemTime,/' \
 	  '^    pub expiration: SystemTime,'
+# Upstream unwraps the base64, the UTF-8, the token field, and the expiry of
+# every X-Apple-GS/HB/PE-Token header, and reads the HB expiry as now plus a
+# raw epoch-millisecond value. One fallible parser turns a malformed header
+# into Error::BadTokenHeader instead of a panic that unwinds through the Go
+# host. Too large for a substitution; the release build lane carries the same
+# diff. Applied after the two field patches above, which it does not touch.
+	@$(RP_PATCH) rp_apply "fallible GSA token header parsing" $(APA_DIR) \
+	  third_party/patches/apple-private-apis/fallible-gsa-token-header-parsing.patch \
+	  icloud-auth/src/client.rs '^fn parse_token_header\('
 # Ignore self-exclusion in fast_forward_trust (Clique self-eviction fix; ports 9f29ff1).
 	@$(RP_PATCH) rp_patch "keychain self-exclusion" $(RUSTPUSH_DIR)/src/icloud/keychain.rs \
 	  's/^            for excluded in &trust\.excludeds \{$$/            let my_id = &state.user_identity.as_ref().unwrap().identifier;\n            for excluded in &trust.excludeds {\n                if excluded == my_id {\n                    warn!(\n                        "Ignoring exclusion of ourselves ({}) from peer {}",\n                        excluded,\n                        peer.0.hash.as_ref().unwrap()\n                    );\n                    continue;\n                }/' \
@@ -321,7 +378,7 @@ ensure-rustpush-source:
 # timestamp doesn't force $(RUST_LIB) to rebuild on every `make` invocation.
 # Only actual Rust source changes / Cargo.toml changes should trigger a
 # rebuild; the pinned SHA + submodule setup is idempotent once done.
-$(RUST_LIB): $(RUST_SRC) $(RUSTPUSH_SRC) $(CARGO_FILES) | ensure-rustpush-source
+$(RUST_LIB): $(RUST_SRC) $(RUSTPUSH_SRC) $(CARGO_FILES) $(PATCH_FILES) Makefile | ensure-rustpush-source
 	cd pkg/rustpushgo && $(CARGO_ENV) cargo build --release $(CARGO_FEATURES)
 	cp pkg/rustpushgo/target/release/librustpushgo.a .
 
