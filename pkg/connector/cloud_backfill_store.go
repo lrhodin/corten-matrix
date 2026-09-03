@@ -3,11 +3,14 @@ package connector
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -18,6 +21,14 @@ import (
 type cloudBackfillStore struct {
 	db      *dbutil.Database
 	loginID networkid.UserLoginID
+
+	// scrubMu serializes body-scrub passes, which the periodic ticker and
+	// post-sync housekeeping can otherwise run concurrently, and guards bridged.
+	scrubMu sync.Mutex
+	// bridged is the delivered-ID set the scrubber keeps between passes; see
+	// refreshBridgedGUIDSet. bridgedInvalid asks the next pass to rebuild it.
+	bridged        *bridgedIDSet
+	bridgedInvalid atomic.Bool
 }
 
 type cloudMessageRow struct {
@@ -315,14 +326,21 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		}
 	}
 
-	// Privacy-scrubber fast path: both body and reaction scrubs select old,
-	// un-scrubbed rows by login. Keep this partial so its steady-state size is
-	// proportional to the pending plaintext backlog rather than all history.
-	// It must be created after the column migrations above because legacy
-	// databases do not have body_scrubbed until those migrations complete.
-	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_message_scrub_idx
-		ON cloud_message (login_id, updated_ts) WHERE body_scrubbed=FALSE`); err != nil {
-		return fmt.Errorf("failed to create cloud_message_scrub_idx: %w", err)
+	// Privacy-scrubber fast path: both body and reaction scrubs enumerate old,
+	// un-scrubbed rows by login, and every column those enumerations read or
+	// filter on is in the index so they never touch the table. Partial, so its
+	// steady-state size is proportional to the pending plaintext backlog rather
+	// than all history. It must be created after the column migrations above
+	// because legacy databases do not have body_scrubbed until those migrations
+	// complete. The earlier two-column form is dropped so no database carries
+	// both.
+	if _, err := s.db.Exec(ctx, `DROP INDEX IF EXISTS cloud_message_scrub_idx`); err != nil {
+		return fmt.Errorf("failed to drop cloud_message_scrub_idx: %w", err)
+	}
+	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_message_scrub_cover_idx
+		ON cloud_message (login_id, updated_ts, guid, deleted, tapback_type, portal_id)
+		WHERE body_scrubbed=FALSE`); err != nil {
+		return fmt.Errorf("failed to create cloud_message_scrub_cover_idx: %w", err)
 	}
 
 	// Privacy migration: pre-existing soft-deleted rows from before the
@@ -1954,36 +1972,85 @@ func (s *cloudBackfillStore) normalizeGroupChatPortalIDs(ctx context.Context) (i
 // cloud_chat. This happens when resolveConversationID used the CloudKit chat_id
 // UUID (before the getChatPortalID-first fix) instead of the group_id UUID.
 // Returns the number of rows updated.
+//
+// The mapping is resolved in Go, one cloud_chat read plus one index-only read
+// of the distinct gid: portals messages reference, and only portals that
+// actually need to move are written. The former single UPDATE correlated every
+// gid: message row against every cloud_chat row through LOWER(), which SQLite
+// cannot index; on a 278k-message database that held the write lock for 33
+// minutes at every bootstrap to change nothing.
 func (s *cloudBackfillStore) normalizeGroupMessagePortalIDs(ctx context.Context) (int64, error) {
-	// Find cloud_message rows with gid: portal_ids where the UUID matches
-	// a cloud_chat row's group_id but the portal_id doesn't match.
-	// Update them to use the canonical portal_id from cloud_chat.
-	res, err := s.db.Exec(ctx, `
-		UPDATE cloud_message
-		SET portal_id = (
-			SELECT cc.portal_id FROM cloud_chat cc
-			WHERE cc.login_id = cloud_message.login_id
-			  AND (LOWER(cc.group_id) = LOWER(SUBSTR(cloud_message.portal_id, 5))
-			       OR LOWER(cc.cloud_chat_id) = LOWER(SUBSTR(cloud_message.portal_id, 5)))
-			  AND cc.portal_id <> cloud_message.portal_id
-			  AND cc.portal_id <> ''
-			LIMIT 1
-		)
-		WHERE login_id = $1
-		  AND portal_id LIKE 'gid:%'
-		  AND EXISTS (
-			SELECT 1 FROM cloud_chat cc
-			WHERE cc.login_id = cloud_message.login_id
-			  AND (LOWER(cc.group_id) = LOWER(SUBSTR(cloud_message.portal_id, 5))
-			       OR LOWER(cc.cloud_chat_id) = LOWER(SUBSTR(cloud_message.portal_id, 5)))
-			  AND cc.portal_id <> cloud_message.portal_id
-			  AND cc.portal_id <> ''
-		  )
-	`, s.loginID)
+	// Canonical portal candidates per UUID. The order mirrors the scan order
+	// of the former correlated subquery (cloud_chat_portal_idx), so the same
+	// portal wins when several chats share a UUID.
+	chats, err := s.db.Query(ctx, `
+		SELECT portal_id, LOWER(group_id), LOWER(cloud_chat_id) FROM cloud_chat
+		WHERE login_id=$1 AND portal_id <> ''
+		ORDER BY portal_id, cloud_chat_id`, s.loginID)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("list cloud_chat portal mappings: %w", err)
 	}
-	return res.RowsAffected()
+	canonical := make(map[string][]string)
+	for chats.Next() {
+		var portalID, groupID, chatID string
+		if err := chats.Scan(&portalID, &groupID, &chatID); err != nil {
+			chats.Close()
+			return 0, fmt.Errorf("scan cloud_chat portal mapping: %w", err)
+		}
+		for _, key := range []string{groupID, chatID} {
+			if key != "" {
+				canonical[key] = append(canonical[key], portalID)
+			}
+		}
+	}
+	chats.Close()
+	if err := chats.Err(); err != nil {
+		return 0, fmt.Errorf("iterate cloud_chat portal mappings: %w", err)
+	}
+	if len(canonical) == 0 {
+		return 0, nil
+	}
+
+	// Every distinct gid: portal a message references, straight from the
+	// (login_id, portal_id, ...) index.
+	portals, err := s.db.Query(ctx, `
+		SELECT DISTINCT portal_id FROM cloud_message
+		WHERE login_id=$1 AND portal_id >= 'gid:' AND portal_id < 'gid;'`, s.loginID)
+	if err != nil {
+		return 0, fmt.Errorf("list gid portals in cloud_message: %w", err)
+	}
+	type move struct{ from, to string }
+	var moves []move
+	for portals.Next() {
+		var portalID string
+		if err := portals.Scan(&portalID); err != nil {
+			portals.Close()
+			return 0, fmt.Errorf("scan gid portal: %w", err)
+		}
+		for _, target := range canonical[strings.ToLower(strings.TrimPrefix(portalID, "gid:"))] {
+			if target != portalID {
+				moves = append(moves, move{from: portalID, to: target})
+				break
+			}
+		}
+	}
+	portals.Close()
+	if err := portals.Err(); err != nil {
+		return 0, fmt.Errorf("iterate gid portals: %w", err)
+	}
+
+	var total int64
+	for _, m := range moves {
+		res, err := s.db.Exec(ctx,
+			`UPDATE cloud_message SET portal_id=$3 WHERE login_id=$1 AND portal_id=$2`,
+			s.loginID, m.from, m.to)
+		if err != nil {
+			return total, fmt.Errorf("normalize portal %s to %s: %w", m.from, m.to, err)
+		}
+		n, _ := res.RowsAffected()
+		total += n
+	}
+	return total, nil
 }
 
 // getMessageRecordNamesByGroupID returns all non-empty message record_names
@@ -3315,6 +3382,10 @@ func (s *cloudBackfillStore) clearBodyScrubByPortalID(ctx context.Context, porta
 	// clearBodyScrubByPortalID and the restore's CloudKit upsert would
 	// see body_scrubbed=FALSE + old updated_ts and re-scrub before upsert
 	// could repopulate text.
+	// The scrubber's delivered-ID set may still count these rows as
+	// delivered from before the portal was torn down; make it re-read the
+	// message table before it can act on the restored plaintext.
+	s.invalidateBridgedGUIDSet()
 	nowMS := time.Now().UnixMilli()
 	result, err := s.db.Exec(ctx,
 		`UPDATE cloud_message SET body_scrubbed=FALSE, updated_ts=$3
@@ -3372,6 +3443,7 @@ func (s *cloudBackfillStore) rescrubEmptyRowsSince(ctx context.Context, portalID
 // grace-window predicate skips these rows (the scrubber is disabled in this
 // mode anyway, but this keeps the helper correct in isolation).
 func (s *cloudBackfillStore) clearAllBodyScrub(ctx context.Context) (int64, error) {
+	s.invalidateBridgedGUIDSet()
 	nowMS := time.Now().UnixMilli()
 	result, err := s.db.Exec(ctx,
 		`UPDATE cloud_message SET body_scrubbed=FALSE, updated_ts=$2
@@ -3887,14 +3959,115 @@ func pendingBackfillGateSQL(holdPlaceholder string) string {
 		      )`
 }
 
-// loadBridgedGUIDSet materializes bridgev2's delivered message IDs once per
-// scrub pass. IDs are normalized exactly like the former SQL UNION: matching
-// is case-insensitive, and part-suffixed IDs (<guid>_<part>) also contribute
-// their base GUID. Receiver scoping prevents one login's delivery from making
-// another login's CloudKit row eligible for scrubbing.
-func (s *cloudBackfillStore) loadBridgedGUIDSet(ctx context.Context, bridgeID string) (map[string]struct{}, error) {
+// bridgedIDSet is the scrubber's in-memory image of bridgev2's delivered
+// message IDs. IDs are normalized exactly like the former SQL UNION: matching
+// is case-insensitive, and a part-suffixed ID (<guid>_<part>) also counts as
+// its base GUID. UUID-shaped IDs are packed into 16 bytes so that keeping the
+// whole history resident between passes costs a few tens of bytes per message;
+// anything else is kept as a lowercased string.
+type bridgedIDSet struct {
+	bridgeID string
+	uuids    map[[16]byte]struct{}
+	other    map[string]struct{}
+
+	// maxRowID is the highest message.rowid observed while filling the set and
+	// maxRowIDMsg the id that row carried when it was read. Together they are
+	// the anchor that lets refreshBridgedGUIDSet read only newer rows.
+	maxRowID    int64
+	maxRowIDMsg string
+	// loadedAt is when the set was last built from scratch.
+	loadedAt time.Time
+}
+
+func newBridgedIDSet(bridgeID string) *bridgedIDSet {
+	return &bridgedIDSet{
+		bridgeID: bridgeID,
+		uuids:    make(map[[16]byte]struct{}),
+		other:    make(map[string]struct{}),
+		loadedAt: time.Now(),
+	}
+}
+
+// normalizeScrubGUID lowercases id, optionally strips a part suffix, and packs
+// a UUID-shaped result into 16 bytes. packed is false when the ID is not a
+// UUID, in which case the caller keys on the returned string instead.
+func normalizeScrubGUID(id string, stripPartSuffix bool) (key [16]byte, raw string, packed bool) {
+	raw = strings.ToLower(id)
+	if stripPartSuffix {
+		if suffix := strings.IndexByte(raw, '_'); suffix > 0 {
+			raw = raw[:suffix]
+		}
+	}
+	if len(raw) != 36 || raw[8] != '-' || raw[13] != '-' || raw[18] != '-' || raw[23] != '-' {
+		return key, raw, false
+	}
+	var compact [32]byte
+	n := 0
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '-' {
+			continue
+		}
+		if n == len(compact) {
+			return key, raw, false
+		}
+		compact[n] = raw[i]
+		n++
+	}
+	if n != len(compact) {
+		return key, raw, false
+	}
+	if _, err := hex.Decode(key[:], compact[:]); err != nil {
+		return key, raw, false
+	}
+	return key, raw, true
+}
+
+// observe advances the rowid anchor. Every row read from the message table
+// counts, whichever bridge or receiver it belongs to, because rowids are
+// allocated table-wide.
+func (b *bridgedIDSet) observe(rowID int64, id string) {
+	if rowID > b.maxRowID {
+		b.maxRowID = rowID
+		b.maxRowIDMsg = id
+	}
+}
+
+// add records a delivered message ID for this bridge and receiver.
+func (b *bridgedIDSet) add(id string) {
+	if key, raw, packed := normalizeScrubGUID(id, true); packed {
+		b.uuids[key] = struct{}{}
+	} else {
+		b.other[raw] = struct{}{}
+	}
+}
+
+// contains reports whether a cloud_message guid has a delivered message row.
+func (b *bridgedIDSet) contains(guid string) bool {
+	if b == nil {
+		return false
+	}
+	key, raw, packed := normalizeScrubGUID(guid, false)
+	if packed {
+		_, ok := b.uuids[key]
+		return ok
+	}
+	_, ok := b.other[raw]
+	return ok
+}
+
+func (b *bridgedIDSet) size() int {
+	if b == nil {
+		return 0
+	}
+	return len(b.uuids) + len(b.other)
+}
+
+// loadBridgedGUIDSet builds the delivered-ID set from scratch. Receiver
+// scoping prevents one login's delivery from making another login's CloudKit
+// row eligible for scrubbing.
+func (s *cloudBackfillStore) loadBridgedGUIDSet(ctx context.Context, bridgeID string) (*bridgedIDSet, error) {
 	rows, err := s.db.Query(ctx, `
-		SELECT id FROM message
+		SELECT rowid, id FROM message
 		WHERE bridge_id=$1 AND (room_receiver=$2 OR room_receiver='')`,
 		bridgeID, string(s.loginID))
 	if err != nil {
@@ -3902,22 +4075,118 @@ func (s *cloudBackfillStore) loadBridgedGUIDSet(ctx context.Context, bridgeID st
 	}
 	defer rows.Close()
 
-	set := make(map[string]struct{})
+	set := newBridgedIDSet(bridgeID)
 	for rows.Next() {
+		var rowID int64
 		var id string
-		if err := rows.Scan(&id); err != nil {
+		if err := rows.Scan(&rowID, &id); err != nil {
 			return nil, fmt.Errorf("scan bridged guid: %w", err)
 		}
-		normalized := strings.ToLower(id)
-		set[normalized] = struct{}{}
-		if suffix := strings.IndexByte(normalized, '_'); suffix > 0 {
-			set[normalized[:suffix]] = struct{}{}
-		}
+		set.observe(rowID, id)
+		set.add(id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate bridged guid set: %w", err)
 	}
 	return set, nil
+}
+
+// bridgedGUIDSetReloadInterval bounds how long the scrubber extends its
+// delivered-ID set incrementally before rebuilding it from scratch.
+const bridgedGUIDSetReloadInterval = 6 * time.Hour
+
+// refreshBridgedGUIDSet returns the delivered-ID set for this pass. On SQLite
+// it normally reads only the message rows that appeared since the previous
+// pass: rows are appended with rowid = MAX(rowid)+1, so while the row that was
+// newest at the last read is still there with the same id, everything
+// committed since has a higher rowid and one primary-key range read finds it.
+// If that anchor row is gone, or its rowid now carries another id, SQLite may
+// have handed lower rowids to newer rows and the set is rebuilt. The set is
+// also rebuilt on other dialects (identity columns do not promise commit
+// order), after bridgedGUIDSetReloadInterval as a backstop, for a different
+// bridge ID, and after invalidateBridgedGUIDSet.
+//
+// Between rebuilds the set only grows: an id whose message row was deleted
+// since (an unsend, a portal teardown) is still reported as delivered. That is
+// deliberate. A body that was delivered and then removed does not need its
+// plaintext kept for backfill, and the one path that hands plaintext back to a
+// delivered row, clearBodyScrubByPortalID, invalidates the set first.
+func (s *cloudBackfillStore) refreshBridgedGUIDSet(ctx context.Context, bridgeID string) (*bridgedIDSet, error) {
+	invalidated := s.bridgedInvalid.Swap(false)
+	set := s.bridged
+	if set != nil && !invalidated && set.bridgeID == bridgeID &&
+		s.db.Dialect == dbutil.SQLite && time.Since(set.loadedAt) < bridgedGUIDSetReloadInterval {
+		anchored, err := s.bridgedAnchorHolds(ctx, set)
+		if err != nil {
+			return nil, err
+		}
+		if anchored {
+			if err := s.foldNewBridgedIDs(ctx, set); err != nil {
+				return nil, err
+			}
+			return set, nil
+		}
+	}
+	set, err := s.loadBridgedGUIDSet(ctx, bridgeID)
+	if err != nil {
+		return nil, err
+	}
+	s.bridged = set
+	return set, nil
+}
+
+// invalidateBridgedGUIDSet makes the next scrub pass rebuild its delivered-ID
+// set from the message table. Call it whenever plaintext is handed back to
+// rows the set may already count as delivered.
+func (s *cloudBackfillStore) invalidateBridgedGUIDSet() {
+	s.bridgedInvalid.Store(true)
+}
+
+// bridgedAnchorHolds reports whether the newest row observed by set is still
+// the row it was, which is what makes a rowid range read complete.
+func (s *cloudBackfillStore) bridgedAnchorHolds(ctx context.Context, set *bridgedIDSet) (bool, error) {
+	if set.maxRowID == 0 {
+		// Nothing observed yet: every message row is above the watermark.
+		return true, nil
+	}
+	var id string
+	err := s.db.QueryRow(ctx, `SELECT id FROM message WHERE rowid=$1`, set.maxRowID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check bridged guid set anchor: %w", err)
+	}
+	return id == set.maxRowIDMsg, nil
+}
+
+// foldNewBridgedIDs adds the message rows above set's watermark. The query
+// constrains only rowid so SQLite walks the primary key from the watermark
+// instead of re-reading the whole (bridge_id, room_receiver, id) index; the
+// bridge and receiver scoping is applied here.
+func (s *cloudBackfillStore) foldNewBridgedIDs(ctx context.Context, set *bridgedIDSet) error {
+	rows, err := s.db.Query(ctx,
+		`SELECT rowid, id, bridge_id, room_receiver FROM message WHERE rowid > $1`,
+		set.maxRowID)
+	if err != nil {
+		return fmt.Errorf("failed to read new bridged guids: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rowID int64
+		var id, bridgeID, receiver string
+		if err := rows.Scan(&rowID, &id, &bridgeID, &receiver); err != nil {
+			return fmt.Errorf("scan new bridged guid: %w", err)
+		}
+		set.observe(rowID, id)
+		if bridgeID == set.bridgeID && (receiver == string(s.loginID) || receiver == "") {
+			set.add(id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate new bridged guids: %w", err)
+	}
+	return nil
 }
 
 // scrubBridgedBodies nulls plaintext message content (text, subject, sender,
@@ -3962,10 +4231,16 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	if debugDisablePrivacy {
 		return 0, nil
 	}
+	// The periodic ticker and post-sync housekeeping both run passes. They
+	// share the delivered-ID set, and overlapping passes would only double the
+	// reads without scrubbing anything extra.
+	s.scrubMu.Lock()
+	defer s.scrubMu.Unlock()
+
 	cutoff := time.Now().Add(-graceWindow).UnixMilli()
 	const chunkSize = 1000
 
-	// Candidate enumeration is one index-backed pass, so undelivered rows cannot
+	// Candidate enumeration is one index-only pass, so undelivered rows cannot
 	// be re-scanned forever. Avoid touching bridgev2's large message table at all
 	// when this pass has no eligible rows (the normal steady-state case).
 	candidates, err := s.scrubCandidates(ctx, cutoff, excludePortals)
@@ -3977,14 +4252,15 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	}
 
 	// The delivered set replaces the old per-chunk UNION over the entire
-	// bridgev2 message table. Deleted candidates do not require this membership
-	// check, so a deleted-only pass can skip the message scan too.
-	bridged := make(map[string]struct{})
+	// bridgev2 message table, and after the first pass it is extended rather
+	// than rebuilt. Deleted candidates do not require this membership check,
+	// so a deleted-only pass can skip the message table entirely.
+	var bridged *bridgedIDSet
 	for _, candidate := range candidates {
 		if candidate.deleted {
 			continue
 		}
-		bridged, err = s.loadBridgedGUIDSet(ctx, bridgeID)
+		bridged, err = s.refreshBridgedGUIDSet(ctx, bridgeID)
 		if err != nil {
 			return 0, err
 		}
@@ -4005,6 +4281,13 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		if end == len(candidates) {
 			break
 		}
+		// Yield between writes so live traffic gets the database in between,
+		// but not after a chunk that wrote nothing: in the steady state most
+		// chunks are undelivered rows that stay put, and sleeping through them
+		// would turn a millisecond pass into most of a second.
+		if n == 0 {
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return total, ctx.Err()
@@ -4015,38 +4298,37 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 }
 
 type cloudScrubCandidate struct {
-	guid    string
-	deleted bool
+	guid     string
+	deleted  bool
+	portalID string
 }
 
-// scrubCandidates lists the finite set of rows this pass may scrub. The
-// partial index serves the login/body_scrubbed/updated_ts prefix. Pending
-// initial backfills and active restore portals retain the protections used by
-// the former per-chunk query; deleted rows deliberately bypass the pending
-// hold because no backfill reader can deliver them.
+// scrubCandidates lists the finite set of rows this pass may scrub. The whole
+// enumeration is served from cloud_message_scrub_cover_idx without touching the
+// table. Pending initial backfills and active restore portals retain the
+// protections of the former per-chunk query, evaluated here against the two
+// small cloud_chat portal sets that pendingBackfillGateSQL consults; deleted
+// rows deliberately bypass the pending hold because no backfill reader can
+// deliver them. The write in scrubBatchIfEligible rechecks the gate in SQL.
 func (s *cloudBackfillStore) scrubCandidates(ctx context.Context, cutoff int64, excludePortals []string) ([]cloudScrubCandidate, error) {
 	holdCutoff := time.Now().Add(-pendingBackfillScrubHold).UnixMilli()
-	args := []any{s.loginID, cutoff, holdCutoff}
-	pendingGate := pendingBackfillGateSQL("$3")
-	exclusionSQL := ""
-	if len(excludePortals) > 0 {
-		placeholders := make([]string, 0, len(excludePortals))
-		for _, portalID := range excludePortals {
-			args = append(args, portalID)
-			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
-		}
-		exclusionSQL = " AND portal_id NOT IN (" + strings.Join(placeholders, ",") + ")"
+	pending, delivered, err := s.pendingBackfillGatePortals(ctx, holdCutoff)
+	if err != nil {
+		return nil, err
+	}
+	exclude := make(map[string]struct{}, len(excludePortals))
+	for _, portalID := range excludePortals {
+		exclude[portalID] = struct{}{}
 	}
 
 	rows, err := s.db.Query(ctx, `
-		SELECT guid, COALESCE(deleted, FALSE)
+		SELECT guid, COALESCE(deleted, FALSE), COALESCE(portal_id, '')
 		FROM cloud_message
 		WHERE login_id=$1
 		  AND body_scrubbed=FALSE
 		  AND (tapback_type IS NULL OR tapback_type < 2000)
 		  AND updated_ts < $2
-		  AND (deleted=TRUE OR (`+pendingGate+`))`+exclusionSQL+`
-		ORDER BY updated_ts ASC`, args...)
+		ORDER BY updated_ts ASC`, s.loginID, cutoff)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list scrub candidates: %w", err)
 	}
@@ -4055,8 +4337,16 @@ func (s *cloudBackfillStore) scrubCandidates(ctx context.Context, cutoff int64, 
 	var candidates []cloudScrubCandidate
 	for rows.Next() {
 		var candidate cloudScrubCandidate
-		if err := rows.Scan(&candidate.guid, &candidate.deleted); err != nil {
+		if err := rows.Scan(&candidate.guid, &candidate.deleted, &candidate.portalID); err != nil {
 			return nil, fmt.Errorf("scan scrub candidate: %w", err)
+		}
+		if _, skip := exclude[candidate.portalID]; skip {
+			continue
+		}
+		if !candidate.deleted {
+			if _, isPending := pending[candidate.portalID]; isPending && !delivered[candidate.portalID] {
+				continue
+			}
 		}
 		candidates = append(candidates, candidate)
 	}
@@ -4066,18 +4356,47 @@ func (s *cloudBackfillStore) scrubCandidates(ctx context.Context, cutoff int64, 
 	return candidates, nil
 }
 
+// pendingBackfillGatePortals materializes the two cloud_chat portal sets that
+// pendingBackfillGateSQL consults: portals known to be waiting for their first
+// forward backfill and first seen inside the hold window, and portals whose
+// forward backfill has completed at least once. The gate holds a portal that is
+// in the first set but not the second.
+func (s *cloudBackfillStore) pendingBackfillGatePortals(ctx context.Context, holdCutoff int64) (pending map[string]struct{}, delivered map[string]bool, err error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT DISTINCT portal_id FROM cloud_chat
+		WHERE login_id=$1 AND deleted=FALSE AND COALESCE(is_filtered, 0) = 0
+		  AND fwd_backfill_done=FALSE AND COALESCE(created_ts, 0) >= $2`,
+		s.loginID, holdCutoff)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list pending-backfill portals: %w", err)
+	}
+	defer rows.Close()
+	pending = make(map[string]struct{})
+	for rows.Next() {
+		var portalID string
+		if err := rows.Scan(&portalID); err != nil {
+			return nil, nil, fmt.Errorf("scan pending-backfill portal: %w", err)
+		}
+		pending[portalID] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("iterate pending-backfill portals: %w", err)
+	}
+	delivered, err = s.getForwardBackfillDonePortals(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list delivered-backfill portals: %w", err)
+	}
+	return pending, delivered, nil
+}
+
 // scrubBatchIfEligible filters one candidate chunk through the delivered set
 // and applies a small UPDATE. The write rechecks both the grace-window state
 // and the pending-backfill gate, so a concurrent re-ingest or newly-created
 // pending portal cannot be scrubbed based on stale candidate state.
-func (s *cloudBackfillStore) scrubBatchIfEligible(ctx context.Context, cutoff int64, bridged map[string]struct{}, candidates []cloudScrubCandidate) (int64, error) {
+func (s *cloudBackfillStore) scrubBatchIfEligible(ctx context.Context, cutoff int64, bridged *bridgedIDSet, candidates []cloudScrubCandidate) (int64, error) {
 	guids := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
-		if candidate.deleted {
-			guids = append(guids, candidate.guid)
-			continue
-		}
-		if _, ok := bridged[strings.ToLower(candidate.guid)]; ok {
+		if candidate.deleted || bridged.contains(candidate.guid) {
 			guids = append(guids, candidate.guid)
 		}
 	}
@@ -4122,6 +4441,12 @@ func (s *cloudBackfillStore) scrubBatchIfEligible(ctx context.Context, cutoff in
 // clearing it past the grace window is safe whether or not it was delivered.
 // sender and tapback_emoji are preserved so re-backfill still attributes and
 // renders the reaction (including custom emoji).
+//
+// Candidates are listed first and written by guid afterwards: the listing walks
+// the partial scrub index (tapback_type is in it, so non-reaction rows are
+// rejected without touching the table) and takes no write lock, and in the
+// steady state, where nothing needs scrubbing, no write transaction is opened
+// at all.
 func (s *cloudBackfillStore) scrubReactionText(ctx context.Context, graceWindow time.Duration) (int64, error) {
 	// DEVELOPMENT-ONLY: when privacy is disabled, leave plaintext in place.
 	if debugDisablePrivacy {
@@ -4131,26 +4456,36 @@ func (s *cloudBackfillStore) scrubReactionText(ctx context.Context, graceWindow 
 	const chunkSize = 1000
 	var total int64
 	for {
+		guids, err := s.reactionScrubCandidates(ctx, cutoff, chunkSize)
+		if err != nil {
+			return total, err
+		}
+		if len(guids) == 0 {
+			return total, nil
+		}
+		args := make([]any, 0, len(guids)+2)
+		args = append(args, s.loginID, cutoff)
+		placeholders := make([]string, len(guids))
+		for i, guid := range guids {
+			args = append(args, guid)
+			placeholders[i] = fmt.Sprintf("$%d", i+3)
+		}
 		result, err := s.db.Exec(ctx, `
 			UPDATE cloud_message
 			SET text=NULL, subject=NULL, body_scrubbed=TRUE
 			WHERE login_id=$1 AND tapback_type >= 2000
 			  AND body_scrubbed=FALSE AND updated_ts < $2
-			  AND guid IN (
-			    SELECT guid FROM cloud_message
-			    WHERE login_id=$1 AND tapback_type >= 2000
-			      AND body_scrubbed=FALSE AND updated_ts < $2
-			      AND (COALESCE(text, '') <> '' OR COALESCE(subject, '') <> '')
-			    LIMIT $3
-			  )
-		`, s.loginID, cutoff, chunkSize)
+			  AND guid IN (`+strings.Join(placeholders, ",")+`)`, args...)
 		if err != nil {
 			return total, fmt.Errorf("failed to scrub reaction text: %w", err)
 		}
 		n, _ := result.RowsAffected()
 		total += n
-		if n < chunkSize {
-			break
+		// A short chunk means the backlog is drained. A chunk that scrubbed
+		// nothing means every listed row was re-ingested under us; leave the
+		// rest to the next pass rather than spin on the same list.
+		if len(guids) < chunkSize || n == 0 {
+			return total, nil
 		}
 		select {
 		case <-ctx.Done():
@@ -4158,7 +4493,33 @@ func (s *cloudBackfillStore) scrubReactionText(ctx context.Context, graceWindow 
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
-	return total, nil
+}
+
+// reactionScrubCandidates lists up to limit reaction rows that still carry a
+// descriptor and are past the grace window.
+func (s *cloudBackfillStore) reactionScrubCandidates(ctx context.Context, cutoff int64, limit int) ([]string, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT guid FROM cloud_message
+		WHERE login_id=$1 AND body_scrubbed=FALSE
+		  AND tapback_type >= 2000 AND updated_ts < $2
+		  AND (COALESCE(text, '') <> '' OR COALESCE(subject, '') <> '')
+		LIMIT $3`, s.loginID, cutoff, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list reaction scrub candidates: %w", err)
+	}
+	defer rows.Close()
+	var guids []string
+	for rows.Next() {
+		var guid string
+		if err := rows.Scan(&guid); err != nil {
+			return nil, fmt.Errorf("scan reaction scrub candidate: %w", err)
+		}
+		guids = append(guids, guid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate reaction scrub candidates: %w", err)
+	}
+	return guids, nil
 }
 
 // scrubUnbridgedTail nulls plaintext on cloud_message rows that fall OUTSIDE

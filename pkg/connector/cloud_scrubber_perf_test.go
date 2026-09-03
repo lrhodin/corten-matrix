@@ -45,12 +45,31 @@ func TestEnsureSchemaCreatesScrubIndex(t *testing.T) {
 
 	var indexSQL string
 	if err := db.QueryRow(ctx,
-		`SELECT COALESCE(sql, '') FROM sqlite_master WHERE type='index' AND name='cloud_message_scrub_idx'`,
+		`SELECT COALESCE(sql, '') FROM sqlite_master WHERE type='index' AND name='cloud_message_scrub_cover_idx'`,
 	).Scan(&indexSQL); err != nil {
-		t.Fatalf("read cloud_message_scrub_idx: %v", err)
+		t.Fatalf("read cloud_message_scrub_cover_idx: %v", err)
 	}
 	if !strings.Contains(indexSQL, "WHERE body_scrubbed") {
-		t.Fatalf("cloud_message_scrub_idx is not partial: %s", indexSQL)
+		t.Fatalf("cloud_message_scrub_cover_idx is not partial: %s", indexSQL)
+	}
+
+	// A database that already carries the earlier two-column index must end
+	// up with only the covering one.
+	if _, err := db.Exec(ctx, `CREATE INDEX cloud_message_scrub_idx
+		ON cloud_message (login_id, updated_ts) WHERE body_scrubbed=FALSE`); err != nil {
+		t.Fatalf("create legacy index: %v", err)
+	}
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("second ensureSchema: %v", err)
+	}
+	var legacy int
+	if err := db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='cloud_message_scrub_idx'`,
+	).Scan(&legacy); err != nil {
+		t.Fatalf("count legacy index: %v", err)
+	}
+	if legacy != 0 {
+		t.Fatal("legacy cloud_message_scrub_idx survived ensureSchema")
 	}
 
 	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
@@ -63,8 +82,11 @@ func TestEnsureSchemaCreatesScrubIndex(t *testing.T) {
 		t.Fatalf("ANALYZE: %v", err)
 	}
 	rows, err := db.Query(ctx,
-		`EXPLAIN QUERY PLAN SELECT guid FROM cloud_message
-		 WHERE login_id=$1 AND body_scrubbed=FALSE AND updated_ts < $2`,
+		`EXPLAIN QUERY PLAN SELECT guid, COALESCE(deleted, FALSE), COALESCE(portal_id, '')
+		 FROM cloud_message
+		 WHERE login_id=$1 AND body_scrubbed=FALSE
+		   AND (tapback_type IS NULL OR tapback_type < 2000) AND updated_ts < $2
+		 ORDER BY updated_ts ASC`,
 		testSQLLoginID, time.Now().UnixMilli(),
 	)
 	if err != nil {
@@ -85,8 +107,8 @@ func TestEnsureSchemaCreatesScrubIndex(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate plan rows: %v", err)
 	}
-	if got := plan.String(); !strings.Contains(got, "cloud_message_scrub_idx") {
-		t.Fatalf("candidate query does not use cloud_message_scrub_idx; plan:\n%s", got)
+	if got := plan.String(); !strings.Contains(got, "COVERING INDEX cloud_message_scrub_cover_idx") {
+		t.Fatalf("candidate query is not served from cloud_message_scrub_cover_idx alone; plan:\n%s", got)
 	}
 }
 
@@ -109,14 +131,37 @@ func TestLoadBridgedGUIDSetNormalizesAndScopesIDs(t *testing.T) {
 	}
 	for guid, want := range map[string]bool{
 		"abc-1":        true,
+		"ABC-1":        true,
 		"guid-2":       true,
 		"guid-3":       true,
 		"wrong-bridge": false,
 		"wrong-login":  false,
 	} {
-		_, got := set[guid]
-		if got != want {
+		if got := set.contains(guid); got != want {
 			t.Errorf("set contains %q = %v, want %v", guid, got, want)
+		}
+	}
+	if set.size() != 3 {
+		t.Errorf("set size = %d, want 3", set.size())
+	}
+}
+
+func TestNormalizeScrubGUIDPacksUUIDs(t *testing.T) {
+	const upper = "0F0E0D0C-0B0A-0908-0706-050403020100"
+	key, _, packed := normalizeScrubGUID(upper, false)
+	if !packed {
+		t.Fatalf("%s was not packed", upper)
+	}
+	lowerKey, _, packed := normalizeScrubGUID(strings.ToLower(upper)+"_att3", true)
+	if !packed || lowerKey != key {
+		t.Fatalf("lowercase part-suffixed form packed to %x, want %x", lowerKey, key)
+	}
+	if _, _, packed := normalizeScrubGUID(upper+"_att3", false); packed {
+		t.Fatal("part suffix must not be stripped from a cloud guid")
+	}
+	for _, id := range []string{"", "not-a-uuid", "0F0E0D0C-0B0A-0908-0706-05040302010G", "0F0E0D0C0B0A09080706050403020100"} {
+		if _, raw, packed := normalizeScrubGUID(id, true); packed || raw != strings.ToLower(id) {
+			t.Errorf("%q: packed=%v raw=%q", id, packed, raw)
 		}
 	}
 }
@@ -252,8 +297,9 @@ func TestScrubBatchRechecksPendingBackfillAtWriteTime(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("upsert pending chat: %v", err)
 	}
-	scrubbed, err := store.scrubBatchIfEligible(ctx, cutoff,
-		map[string]struct{}{guid: {}}, candidates)
+	bridged := newBridgedIDSet("bridge")
+	bridged.add(guid)
+	scrubbed, err := store.scrubBatchIfEligible(ctx, cutoff, bridged, candidates)
 	if err != nil {
 		t.Fatalf("scrubBatchIfEligible: %v", err)
 	}
@@ -269,5 +315,263 @@ func TestScrubBatchRechecksPendingBackfillAtWriteTime(t *testing.T) {
 	}
 	if !text.Valid || text.String != "must survive" {
 		t.Fatalf("message text = %q (valid=%v), want preserved", text.String, text.Valid)
+	}
+}
+
+// scrubIncrementalFixture returns a store with the scrubber schema and a
+// bridgev2 message table, plus helpers that insert an aged plaintext row and
+// read a row's body_scrubbed flag.
+func scrubIncrementalFixture(t *testing.T) (context.Context, *dbutil.Database, *cloudBackfillStore, func(guid, portal string), func(guid string) bool) {
+	t.Helper()
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	createScrubberBridgeMessageTable(t, db, ctx)
+	old := time.Now().Add(-time.Hour).UnixMilli()
+	insertAged := func(guid, portal string) {
+		t.Helper()
+		if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+			GUID: guid, PortalID: portal, TimestampMS: old,
+			Text: "secret " + guid, Service: "iMessage", HasBody: true,
+		}}); err != nil {
+			t.Fatalf("upsert %s: %v", guid, err)
+		}
+		if _, err := db.Exec(ctx,
+			`UPDATE cloud_message SET updated_ts=$1 WHERE login_id=$2 AND guid=$3`,
+			old, testSQLLoginID, guid,
+		); err != nil {
+			t.Fatalf("age %s: %v", guid, err)
+		}
+	}
+	scrubbed := func(guid string) bool {
+		t.Helper()
+		var flag bool
+		if err := db.QueryRow(ctx,
+			`SELECT body_scrubbed FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+			testSQLLoginID, guid,
+		).Scan(&flag); err != nil {
+			t.Fatalf("read body_scrubbed of %s: %v", guid, err)
+		}
+		return flag
+	}
+	return ctx, db, store, insertAged, scrubbed
+}
+
+func TestScrubBridgedBodiesExtendsDeliveredSetIncrementally(t *testing.T) {
+	ctx, db, store, insertAged, scrubbed := scrubIncrementalFixture(t)
+	const bridgeID = "bridge"
+
+	insertAged("11111111-1111-4111-8111-111111111111", "gid:p")
+	insertAged("22222222-2222-4222-8222-222222222222", "gid:p")
+	insertScrubberBridgeMessage(t, db, ctx, "11111111-1111-4111-8111-111111111111", bridgeID, string(testSQLLoginID))
+
+	if n, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil || n != 1 {
+		t.Fatalf("first pass = %d, %v; want 1 row", n, err)
+	}
+	first := store.bridged
+	if first == nil || first.maxRowID != 1 || first.size() != 1 {
+		t.Fatalf("first pass set = %+v, want one id anchored at rowid 1", first)
+	}
+
+	// Delivered since the last pass: a part-suffixed lowercase id for the
+	// second row, then a row for another login that must move the rowid
+	// anchor without counting as delivered here.
+	insertScrubberBridgeMessage(t, db, ctx, "22222222-2222-4222-8222-222222222222_att0", bridgeID, "")
+	insertScrubberBridgeMessage(t, db, ctx, "33333333-3333-4333-8333-333333333333", bridgeID, "other-login")
+	insertAged("33333333-3333-4333-8333-333333333333", "gid:p")
+
+	if n, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil || n != 1 {
+		t.Fatalf("second pass = %d, %v; want 1 row", n, err)
+	}
+	if store.bridged != first {
+		t.Fatal("second pass rebuilt the delivered set instead of extending it")
+	}
+	if first.maxRowID != 3 || first.maxRowIDMsg != "33333333-3333-4333-8333-333333333333" {
+		t.Fatalf("anchor = (%d, %q), want (3, other login's row)", first.maxRowID, first.maxRowIDMsg)
+	}
+	if !scrubbed("22222222-2222-4222-8222-222222222222") || scrubbed("33333333-3333-4333-8333-333333333333") {
+		t.Fatal("second pass scrubbed the wrong rows")
+	}
+
+	// A message row can land before CloudKit hands over the cloud row. The set
+	// must still know about it when the cloud row finally ages into range.
+	insertScrubberBridgeMessage(t, db, ctx, "44444444-4444-4444-8444-444444444444", bridgeID, string(testSQLLoginID))
+	if n, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil || n != 0 {
+		t.Fatalf("pass with no cloud row = %d, %v; want 0", n, err)
+	}
+	insertAged("44444444-4444-4444-8444-444444444444", "gid:p")
+	if n, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil || n != 1 {
+		t.Fatalf("late cloud row pass = %d, %v; want 1", n, err)
+	}
+	if store.bridged != first || !scrubbed("44444444-4444-4444-8444-444444444444") {
+		t.Fatal("late cloud row was not scrubbed from the retained set")
+	}
+}
+
+func TestScrubBridgedBodiesRebuildsDeliveredSetAfterRowIDReuse(t *testing.T) {
+	ctx, db, store, insertAged, scrubbed := scrubIncrementalFixture(t)
+	const bridgeID = "bridge"
+	for _, guid := range []string{"guid-1", "guid-2", "guid-3"} {
+		insertAged(guid, "gid:p")
+		insertScrubberBridgeMessage(t, db, ctx, guid, bridgeID, string(testSQLLoginID))
+	}
+	if n, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil || n != 3 {
+		t.Fatalf("first pass = %d, %v; want 3", n, err)
+	}
+	first := store.bridged
+
+	// Removing the newest rows makes SQLite hand their rowids to the next
+	// inserts, so a plain "rowid above the watermark" read would miss them.
+	if _, err := db.Exec(ctx, `DELETE FROM message WHERE rowid >= 2`); err != nil {
+		t.Fatalf("delete newest message rows: %v", err)
+	}
+	insertScrubberBridgeMessage(t, db, ctx, "guid-4", bridgeID, string(testSQLLoginID))
+	insertScrubberBridgeMessage(t, db, ctx, "guid-5", bridgeID, string(testSQLLoginID))
+	var maxRowID int64
+	if err := db.QueryRow(ctx, `SELECT MAX(rowid) FROM message`).Scan(&maxRowID); err != nil {
+		t.Fatal(err)
+	}
+	if maxRowID != 3 {
+		t.Fatalf("max rowid after reinsert = %d, want 3 (rowids were not reused)", maxRowID)
+	}
+	insertAged("guid-4", "gid:p")
+	insertAged("guid-5", "gid:p")
+
+	if n, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil || n != 2 {
+		t.Fatalf("pass after rowid reuse = %d, %v; want 2", n, err)
+	}
+	if store.bridged == first {
+		t.Fatal("anchor mismatch did not rebuild the delivered set")
+	}
+	if !scrubbed("guid-4") || !scrubbed("guid-5") {
+		t.Fatal("rows delivered under reused rowids were not scrubbed")
+	}
+}
+
+func TestClearBodyScrubInvalidatesDeliveredSet(t *testing.T) {
+	ctx, db, store, insertAged, _ := scrubIncrementalFixture(t)
+	const bridgeID = "bridge"
+	insertAged("guid-1", "gid:p")
+	insertScrubberBridgeMessage(t, db, ctx, "guid-1", bridgeID, string(testSQLLoginID))
+	// An undelivered aged row keeps every later pass consulting the set.
+	insertAged("guid-undelivered", "gid:q")
+	if n, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil || n != 1 {
+		t.Fatalf("first pass = %d, %v; want 1", n, err)
+	}
+	first := store.bridged
+	if n, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil || n != 0 || store.bridged != first {
+		t.Fatalf("steady-state pass = %d, %v, rebuilt=%v; want 0 and the same set", n, err, store.bridged != first)
+	}
+
+	if _, err := store.clearBodyScrubByPortalID(ctx, "gid:p"); err != nil {
+		t.Fatalf("clearBodyScrubByPortalID: %v", err)
+	}
+	if _, err := store.scrubBridgedBodies(ctx, bridgeID, time.Minute, nil); err != nil {
+		t.Fatalf("pass after clear: %v", err)
+	}
+	if store.bridged == first {
+		t.Fatal("clearBodyScrubByPortalID did not force the delivered set to be rebuilt")
+	}
+}
+
+func TestScrubReactionTextClearsDescriptorsByGUID(t *testing.T) {
+	ctx, db, store, _, scrubbed := scrubIncrementalFixture(t)
+	old := time.Now().Add(-time.Hour).UnixMilli()
+	tapback := uint32(2001)
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
+		{GUID: "react-text", PortalID: "gid:p", TimestampMS: old, Service: "iMessage",
+			TapbackType: &tapback, Text: "Loved 'the secret'", Sender: "tel:+1555", TapbackEmoji: "x"},
+		{GUID: "react-subject", PortalID: "gid:p", TimestampMS: old, Service: "iMessage",
+			TapbackType: &tapback, Subject: "Loved 'the secret'"},
+		{GUID: "react-empty", PortalID: "gid:p", TimestampMS: old, Service: "iMessage",
+			TapbackType: &tapback},
+		{GUID: "plain", PortalID: "gid:p", TimestampMS: old, Service: "iMessage",
+			Text: "not a reaction", HasBody: true},
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if _, err := db.Exec(ctx, `UPDATE cloud_message SET updated_ts=$1 WHERE login_id=$2`, old, testSQLLoginID); err != nil {
+		t.Fatalf("age rows: %v", err)
+	}
+
+	n, err := store.scrubReactionText(ctx, time.Minute)
+	if err != nil || n != 2 {
+		t.Fatalf("scrubReactionText = %d, %v; want 2", n, err)
+	}
+	if !scrubbed("react-text") || !scrubbed("react-subject") || scrubbed("react-empty") || scrubbed("plain") {
+		t.Fatal("reaction scrub touched the wrong rows")
+	}
+	var text, subject sql.NullString
+	var sender, emoji string
+	if err := db.QueryRow(ctx,
+		`SELECT text, subject, COALESCE(sender, ''), COALESCE(tapback_emoji, '') FROM cloud_message WHERE login_id=$1 AND guid='react-text'`,
+		testSQLLoginID,
+	).Scan(&text, &subject, &sender, &emoji); err != nil {
+		t.Fatal(err)
+	}
+	if text.Valid || subject.Valid || sender != "tel:+1555" || emoji != "x" {
+		t.Fatalf("react-text after scrub: text=%v subject=%v sender=%q emoji=%q", text, subject, sender, emoji)
+	}
+	if n, err := store.scrubReactionText(ctx, time.Minute); err != nil || n != 0 {
+		t.Fatalf("second scrubReactionText = %d, %v; want 0", n, err)
+	}
+}
+
+func TestNormalizeGroupMessagePortalIDsUsesCloudChatMapping(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	now := time.Now().UnixMilli()
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
+		{CloudChatID: "CHAT-1", GroupID: "GROUP-1", PortalID: "gid:group-1", Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
+		{CloudChatID: "chat-2", GroupID: "", PortalID: "gid:chat-2", Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
+		{CloudChatID: "chat-3", GroupID: "group-3", PortalID: "", Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
+	}); err != nil {
+		t.Fatalf("upsertChatBatch: %v", err)
+	}
+	rows := []cloudMessageRow{
+		{GUID: "by-chat-id", PortalID: "gid:chat-1"},
+		{GUID: "by-group-id-case", PortalID: "gid:GROUP-1"},
+		{GUID: "already-canonical", PortalID: "gid:group-1"},
+		{GUID: "self-mapping", PortalID: "gid:chat-2"},
+		{GUID: "unmapped-chat", PortalID: "gid:chat-3"},
+		{GUID: "dm", PortalID: "tel:+15550001111"},
+	}
+	for i := range rows {
+		rows[i].TimestampMS = now
+		rows[i].Service = "iMessage"
+	}
+	if err := store.upsertMessageBatch(ctx, rows); err != nil {
+		t.Fatalf("upsertMessageBatch: %v", err)
+	}
+
+	n, err := store.normalizeGroupMessagePortalIDs(ctx)
+	if err != nil || n != 2 {
+		t.Fatalf("normalizeGroupMessagePortalIDs = %d, %v; want 2", n, err)
+	}
+	for guid, want := range map[string]string{
+		"by-chat-id":        "gid:group-1",
+		"by-group-id-case":  "gid:group-1",
+		"already-canonical": "gid:group-1",
+		"self-mapping":      "gid:chat-2",
+		"unmapped-chat":     "gid:chat-3",
+		"dm":                "tel:+15550001111",
+	} {
+		var got string
+		if err := db.QueryRow(ctx, `SELECT portal_id FROM cloud_message WHERE login_id=$1 AND guid=$2`, testSQLLoginID, guid).Scan(&got); err != nil {
+			t.Fatalf("read %s: %v", guid, err)
+		}
+		if got != want {
+			t.Errorf("%s portal_id = %q, want %q", guid, got, want)
+		}
+	}
+	if n, err := store.normalizeGroupMessagePortalIDs(ctx); err != nil || n != 0 {
+		t.Fatalf("second normalizeGroupMessagePortalIDs = %d, %v; want 0", n, err)
 	}
 }

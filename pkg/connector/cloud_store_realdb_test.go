@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"go.mau.fi/util/dbutil"
@@ -128,4 +129,81 @@ func TestEnsureSchemaAgainstRealDatabase(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestScrubberAgainstRealDatabase runs the privacy scrubber's steady-state
+// passes and the group portal normalization against a copy of a real bridge
+// database, so their cost on a production-sized history can be read off the
+// test log before shipping a change to them. Skipped unless
+// CORTEN_TEST_REAL_DB is set; see TestEnsureSchemaAgainstRealDatabase.
+//
+// Beyond timing, it asserts what the incremental delivered-ID set promises: a
+// second pass over an unchanged database extends the set built by the first
+// pass instead of rebuilding it.
+func TestScrubberAgainstRealDatabase(t *testing.T) {
+	src := os.Getenv("CORTEN_TEST_REAL_DB")
+	if src == "" {
+		t.Skip("set CORTEN_TEST_REAL_DB to a copy of a real bridge database to run this")
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("read %s: %v", src, err)
+	}
+	path := filepath.Join(t.TempDir(), "realdb.db")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("copy database: %v", err)
+	}
+	raw, err := sql.Open("sqlite3", "file:"+path+"?_txlock=immediate")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	raw.SetMaxOpenConns(1)
+	defer raw.Close()
+	db, err := dbutil.NewWithDB(raw, "sqlite3")
+	if err != nil {
+		t.Fatalf("wrap in dbutil: %v", err)
+	}
+
+	ctx := context.Background()
+	var loginID, bridgeID string
+	if err := db.QueryRow(ctx, `SELECT login_id FROM cloud_message LIMIT 1`).Scan(&loginID); err != nil {
+		t.Skipf("no cloud_message rows to scrub: %v", err)
+	}
+	if err := db.QueryRow(ctx, `SELECT bridge_id FROM message LIMIT 1`).Scan(&bridgeID); err != nil {
+		t.Skipf("no bridgev2 message rows: %v", err)
+	}
+	store := newCloudBackfillStore(db, networkid.UserLoginID(loginID))
+
+	timed := func(name string, fn func() (int64, error)) int64 {
+		t.Helper()
+		start := time.Now()
+		n, err := fn()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		t.Logf("%-32s %8d rows %10s", name, n, time.Since(start).Round(time.Millisecond))
+		return n
+	}
+	timed("ensureSchema", func() (int64, error) { return 0, store.ensureSchema(ctx) })
+	timed("normalizeGroupMessagePortalIDs", func() (int64, error) { return store.normalizeGroupMessagePortalIDs(ctx) })
+	timed("scrubBridgedBodies pass 1", func() (int64, error) {
+		return store.scrubBridgedBodies(ctx, bridgeID, bodyScrubGracePeriod, nil)
+	})
+	first := store.bridged
+	timed("scrubBridgedBodies pass 2", func() (int64, error) {
+		return store.scrubBridgedBodies(ctx, bridgeID, bodyScrubGracePeriod, nil)
+	})
+	if first != nil && store.bridged != first {
+		t.Fatal("second pass rebuilt the delivered-ID set on an unchanged database")
+	}
+	timed("scrubReactionText", func() (int64, error) { return store.scrubReactionText(ctx, bodyScrubGracePeriod) })
+
+	var pendingCandidates int
+	if err := db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM cloud_message WHERE login_id=$1 AND body_scrubbed=FALSE`, loginID,
+	).Scan(&pendingCandidates); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("delivered-ID set: %d ids anchored at rowid %d; %d rows still unscrubbed",
+		first.size(), first.maxRowID, pendingCandidates)
 }
