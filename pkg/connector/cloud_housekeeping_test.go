@@ -259,6 +259,15 @@ func TestPreUploadChunkAttachmentsBulkRestoresPersistedCache(t *testing.T) {
 		[]byte(`{"msgtype":"m.audio","body":"voice.ogg","url":"mxc://example/voice","info":{"mimetype":"audio/ogg"}}`))
 
 	c := &IMClient{cloudStore: store}
+	// This client has no Main, so reaching the download path would panic on
+	// the bridge logger. That only happens if the bulk restore left something
+	// uncached, which is the failure this test exists to catch — report it as
+	// one instead of a stack trace.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("preUploadChunkAttachments tried to download an attachment, so the persisted cache was not restored: %v", r)
+		}
+	}()
 	c.preUploadChunkAttachments(ctx, []cloudMessageRow{{
 		GUID: "message-with-cached-attachments",
 		AttachmentsJSON: `[

@@ -2170,6 +2170,8 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// Create portals and queue forward backfill for all of them.
 	// Skip portals that are tombstoned or recently deleted this session.
 	portalStart := time.Now()
+	// Tracks a failed portal candidate scan, not a failed individual portal;
+	// see createPortalsFromCloudSync.
 	portalReconciliationPending := !c.createPortalsFromCloudSync(ctx, log, skipPortals)
 	c.setCloudSyncDone()
 
@@ -2177,7 +2179,7 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		log.Warn().
 			Dur("portal_creation_elapsed", time.Since(portalStart)).
 			Dur("total_elapsed", time.Since(controllerStart)).
-			Msg("CloudKit bootstrap complete but portal reconciliation is pending — delayed sync will retry")
+			Msg("CloudKit bootstrap complete but the portal candidate scan failed — the delayed passes below will retry it")
 	} else {
 		log.Info().
 			Dur("portal_creation_elapsed", time.Since(portalStart)).
@@ -2282,6 +2284,13 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		c.cloudSyncRunningLock.Lock()
 		c.cloudSyncRunning = false
 		c.cloudSyncRunningLock.Unlock()
+	}
+	if portalReconciliationPending {
+		// The delayed passes are a fixed, short sequence. Once they are spent
+		// nothing reconciles portals again until another CloudKit record
+		// arrives or the bridge restarts, so this is the last chance to say so.
+		log.Warn().Msg("Delayed CloudKit re-syncs finished with the portal candidate scan still failing — " +
+			"cloud rows may have no portal until the next sync with changes or a restart")
 	}
 }
 
@@ -4015,9 +4024,15 @@ func (c *IMClient) countBridgedMessages(ctx context.Context, portalID string) in
 }
 
 // createPortalsFromCloudSync returns whether the portal candidate scan
-// completed. A false result must be retried even when the next CloudKit pass
-// contains no changes: otherwise a transient database error can leave existing
-// cloud rows without portals until another record arrives or the bridge restarts.
+// completed, meaning the listing succeeded and every candidate was considered.
+// A false result must be retried even when the next CloudKit pass contains no
+// changes: otherwise a transient database error can leave existing cloud rows
+// without portals until another record arrives or the bridge restarts.
+//
+// It reports only the scan, not the outcome of each candidate. A portal whose
+// own creation fails is logged and skipped, and the scan still counts as
+// complete, exactly as it did before this returned anything — those failures
+// are retried by the ordinary sync path rather than by re-running the scan.
 func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger, pendingDeletePortals map[string]bool) bool {
 	if c.cloudStore == nil {
 		return true
