@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/event"
 )
 
@@ -242,5 +243,33 @@ func TestCachedAttachmentContentFallsBackToPersistedCache(t *testing.T) {
 
 	if content, err := c.cachedAttachmentContent(ctx, "unknown-record"); err != nil || content != nil {
 		t.Fatalf("unknown lookup = %+v, %v; want a miss", content, err)
+	}
+}
+
+func TestPreUploadChunkAttachmentsBulkRestoresPersistedCache(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	store.saveAttachmentCacheEntry(ctx, "image-record",
+		[]byte(`{"msgtype":"m.image","body":"photo.png","url":"mxc://example/photo","info":{"mimetype":"image/png"}}`))
+	store.saveAttachmentCacheEntry(ctx, "audio-record",
+		[]byte(`{"msgtype":"m.audio","body":"voice.ogg","url":"mxc://example/voice","info":{"mimetype":"audio/ogg"}}`))
+
+	c := &IMClient{cloudStore: store}
+	c.preUploadChunkAttachments(ctx, []cloudMessageRow{{
+		GUID: "message-with-cached-attachments",
+		AttachmentsJSON: `[
+			{"record_name":"image-record","file_size":1},
+			{"record_name":"audio-record","file_size":1}
+		]`,
+	}}, zerolog.Nop())
+
+	for _, recordName := range []string{"image-record", "audio-record"} {
+		if _, ok := c.attachmentContentCache.Load(recordName); !ok {
+			t.Errorf("persisted %s was not restored into the in-memory cache", recordName)
+		}
 	}
 }

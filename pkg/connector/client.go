@@ -10188,7 +10188,9 @@ func (c *IMClient) preUploadChunkAttachments(ctx context.Context, rows []cloudMe
 		ts      time.Time
 		hasText bool
 	}
-	var pending []pendingAtt
+	var candidates []pendingAtt
+	cacheNames := make([]string, 0)
+	cacheNamesSeen := make(map[string]struct{})
 	for _, row := range rows {
 		if row.AttachmentsJSON == "" {
 			continue
@@ -10206,19 +10208,55 @@ func (c *IMClient) preUploadChunkAttachments(ctx context.Context, rows []cloudMe
 			if att.RecordName == "" {
 				continue
 			}
-			cached, err := c.cachedAttachmentContent(ctx, att.RecordName)
-			if err != nil {
-				log.Debug().Err(err).Str("record_name", att.RecordName).
-					Msg("Forward backfill: could not read the persisted attachment cache, treating as uncached")
+			if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok {
+				content := cached.(*event.MessageEventContent)
+				if content.Info == nil || content.Info.MimeType != "video/quicktime" {
+					continue
+				}
+				// A stale non-MP4 video must be downloaded and transcoded again.
+				c.attachmentContentCache.Delete(att.RecordName)
 			}
-			if cached != nil {
-				continue
+			if _, seen := cacheNamesSeen[att.RecordName]; !seen {
+				cacheNamesSeen[att.RecordName] = struct{}{}
+				cacheNames = append(cacheNames, att.RecordName)
 			}
-			pending = append(pending, pendingAtt{
+			candidates = append(candidates, pendingAtt{
 				row: row, idx: i, att: att,
 				sender: sender, ts: ts, hasText: hasText,
 			})
 		}
+	}
+
+	// Restore all persisted hits for this chunk in bounded IN queries. The
+	// previous per-attachment fallback was correct but issued one SQLite query
+	// for every cold memory-cache entry, which adds up on large portals.
+	if len(cacheNames) > 0 && c.cloudStore != nil {
+		cachedJSON, err := c.cloudStore.loadAttachmentCacheJSON(ctx, cacheNames)
+		if err != nil {
+			log.Debug().Err(err).
+				Msg("Forward backfill: could not bulk-load the persisted attachment cache, treating entries as uncached")
+		} else {
+			for recordName, raw := range cachedJSON {
+				var content event.MessageEventContent
+				if err := json.Unmarshal(raw, &content); err != nil {
+					log.Debug().Err(err).Str("record_name", recordName).
+						Msg("Forward backfill: skipping corrupted attachment cache entry")
+					continue
+				}
+				if content.Info != nil && content.Info.MimeType == "video/quicktime" {
+					continue
+				}
+				c.attachmentContentCache.Store(recordName, &content)
+			}
+		}
+	}
+
+	pending := make([]pendingAtt, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, ok := c.attachmentContentCache.Load(candidate.att.RecordName); ok {
+			continue
+		}
+		pending = append(pending, candidate)
 	}
 	if len(pending) == 0 {
 		return

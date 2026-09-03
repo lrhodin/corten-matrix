@@ -117,6 +117,14 @@ func (c cloudSyncCounters) hasChanges() bool {
 	return c.Imported+c.Updated+c.Deleted+c.Filtered > 0
 }
 
+// canSkipDelayedCloudReconciliation permits the cheap no-change path only
+// after both CloudKit ingestion and the most recent portal candidate scan
+// completed. A successful empty CloudKit pass is not evidence that portal rows
+// left behind by either kind of failure have already been reconciled.
+func canSkipDelayedCloudReconciliation(counts cloudSyncCounters, previousPassFailed, portalReconciliationPending bool) bool {
+	return !counts.hasChanges() && !previousPassFailed && !portalReconciliationPending
+}
+
 func (c *IMClient) setCloudSyncDone() {
 	c.cloudSyncDoneLock.Lock()
 	c.cloudSyncDone = true
@@ -2162,13 +2170,20 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// Create portals and queue forward backfill for all of them.
 	// Skip portals that are tombstoned or recently deleted this session.
 	portalStart := time.Now()
-	c.createPortalsFromCloudSync(ctx, log, skipPortals)
+	portalReconciliationPending := !c.createPortalsFromCloudSync(ctx, log, skipPortals)
 	c.setCloudSyncDone()
 
-	log.Info().
-		Dur("portal_creation_elapsed", time.Since(portalStart)).
-		Dur("total_elapsed", time.Since(controllerStart)).
-		Msg("CloudKit bootstrap complete — all portals queued, APNs portal creation enabled")
+	if portalReconciliationPending {
+		log.Warn().
+			Dur("portal_creation_elapsed", time.Since(portalStart)).
+			Dur("total_elapsed", time.Since(controllerStart)).
+			Msg("CloudKit bootstrap complete but portal reconciliation is pending — delayed sync will retry")
+	} else {
+		log.Info().
+			Dur("portal_creation_elapsed", time.Since(portalStart)).
+			Dur("total_elapsed", time.Since(controllerStart)).
+			Msg("CloudKit bootstrap complete — all portals queued, APNs portal creation enabled")
+	}
 
 	// Notify the user about chats blocked from Apple's recycle bin.
 	c.notifyRecycleBinCandidates(log)
@@ -2224,7 +2239,7 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 			previousPassFailed = true
 			continue
 		}
-		if !counts.hasChanges() && !previousPassFailed {
+		if canSkipDelayedCloudReconciliation(counts, previousPassFailed, portalReconciliationPending) {
 			// The delayed passes usually confirm that CloudKit has no newly
 			// propagated records. Re-running the account-wide attachment and
 			// portal scans in that case used to monopolize Keith's one SQLite
@@ -2263,7 +2278,7 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		// Pre-upload any new attachments discovered by this re-sync;
 		// already-cached record_names are skipped instantly.
 		c.preUploadCloudAttachments(ctx, true)
-		c.createPortalsFromCloudSync(ctx, resyncLog, skipPortals)
+		portalReconciliationPending = !c.createPortalsFromCloudSync(ctx, resyncLog, skipPortals)
 		c.cloudSyncRunningLock.Lock()
 		c.cloudSyncRunning = false
 		c.cloudSyncRunningLock.Unlock()
@@ -3999,9 +4014,13 @@ func (c *IMClient) countBridgedMessages(ctx context.Context, portalID string) in
 	return n
 }
 
-func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger, pendingDeletePortals map[string]bool) {
+// createPortalsFromCloudSync returns whether the portal candidate scan
+// completed. A false result must be retried even when the next CloudKit pass
+// contains no changes: otherwise a transient database error can leave existing
+// cloud rows without portals until another record arrives or the bridge restarts.
+func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger, pendingDeletePortals map[string]bool) bool {
 	if c.cloudStore == nil {
-		return
+		return true
 	}
 
 	// Get portal IDs sorted by newest message timestamp (most recent first).
@@ -4012,11 +4031,11 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	portalInfos, err := c.cloudStore.listPortalIDsWithNewestTimestamp(ctx, c.Main.Config.BridgeFilteredChats)
 	if err != nil {
 		log.Err(err).Msg("Failed to list cloud portal IDs with timestamps")
-		return
+		return false
 	}
 
 	if len(portalInfos) == 0 {
-		return
+		return true
 	}
 
 	// Tombstoned (deleted) chats are already removed from cloud_chat/cloud_message
@@ -4311,6 +4330,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			c.Main.Bridge.WakeupBackfillQueue()
 		}
 	}
+	return true
 }
 
 func (c *IMClient) ensureCloudSyncStore(ctx context.Context) error {
