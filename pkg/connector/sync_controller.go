@@ -109,6 +109,10 @@ func (c *cloudSyncCounters) add(other cloudSyncCounters) {
 	c.Filtered += other.Filtered
 }
 
+func (c cloudSyncCounters) hasChanges() bool {
+	return c.Imported+c.Updated+c.Deleted > 0
+}
+
 func (c *IMClient) setCloudSyncDone() {
 	c.cloudSyncDoneLock.Lock()
 	c.cloudSyncDone = true
@@ -2071,7 +2075,7 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		c.cloudSyncRunningLock.Unlock()
 	}()
 	for {
-		err := c.runCloudSyncOnceSerialized(ctx, log, true)
+		_, err := c.runCloudSyncOnceSerialized(ctx, log, true)
 		if err != nil {
 			log.Error().Err(err).
 				Dur("retry_in", cloudSyncRetryInterval).
@@ -2111,7 +2115,7 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// creation. This populates attachmentContentCache so that FetchMessages
 	// (which runs inside the portal event loop goroutine) gets instant cache
 	// hits instead of blocking on CloudKit for 30+ minutes.
-	c.preUploadCloudAttachments(ctx)
+	c.preUploadCloudAttachments(ctx, true)
 
 	// Seed delete knowledge from Apple's recycle bin BEFORE creating portals.
 	// Must run after runCloudSyncOnce (PCS keys needed) but before
@@ -2201,11 +2205,29 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		c.cloudSyncRunningLock.Lock()
 		c.cloudSyncRunning = true
 		c.cloudSyncRunningLock.Unlock()
-		if err := c.runCloudSyncOnceSerialized(ctx, resyncLog, false); err != nil {
+		counts, err := c.runCloudSyncOnceSerialized(ctx, resyncLog, false)
+		if err != nil {
 			c.cloudSyncRunningLock.Lock()
 			c.cloudSyncRunning = false
 			c.cloudSyncRunningLock.Unlock()
 			resyncLog.Warn().Err(err).Msg("Delayed incremental re-sync failed")
+			continue
+		}
+		if !counts.hasChanges() {
+			// The delayed passes usually confirm that CloudKit has no newly
+			// propagated records. Re-running the account-wide attachment and
+			// portal scans in that case used to monopolize Keith's one SQLite
+			// connection for minutes despite having no work to discover. Failed
+			// attachments are the only useful retry work that can exist without a
+			// new CloudKit record; their descriptors are retained in memory, so
+			// retry them without touching the message tables.
+			if c.hasRetryableAttachmentFailures() {
+				c.preUploadCloudAttachments(ctx, false)
+			}
+			resyncLog.Debug().Msg("Delayed CloudKit re-sync returned no changes; skipped attachment-message and portal rescans")
+			c.cloudSyncRunningLock.Lock()
+			c.cloudSyncRunning = false
+			c.cloudSyncRunningLock.Unlock()
 			continue
 		}
 		// Extend skipPortals with any portals deleted since bootstrap.
@@ -2228,7 +2250,7 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		c.recentlyDeletedPortalsMu.RUnlock()
 		// Pre-upload any new attachments discovered by this re-sync;
 		// already-cached record_names are skipped instantly.
-		c.preUploadCloudAttachments(ctx)
+		c.preUploadCloudAttachments(ctx, true)
 		c.createPortalsFromCloudSync(ctx, resyncLog, skipPortals)
 		c.cloudSyncRunningLock.Lock()
 		c.cloudSyncRunning = false
@@ -2285,7 +2307,7 @@ func (c *IMClient) runPostSyncHousekeeping(ctx context.Context, log zerolog.Logg
 	}
 }
 
-func (c *IMClient) runCloudSyncOnceSerialized(ctx context.Context, log zerolog.Logger, isBootstrap bool) error {
+func (c *IMClient) runCloudSyncOnceSerialized(ctx context.Context, log zerolog.Logger, isBootstrap bool) (cloudSyncCounters, error) {
 	c.cloudSyncRunMu.Lock()
 	defer c.cloudSyncRunMu.Unlock()
 	return c.runCloudSyncOnce(ctx, log, isBootstrap)
@@ -2295,7 +2317,7 @@ func (c *IMClient) runCloudSyncOnceSerialized(ctx context.Context, log zerolog.L
 // (isBootstrap=true) it detects fresh vs. interrupted state and clears stale
 // data if needed. On subsequent runs it's purely incremental — the saved
 // continuation tokens mean CloudKit only returns changes since last sync.
-func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isBootstrap bool) error {
+func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isBootstrap bool) (cloudSyncCounters, error) {
 	if isBootstrap {
 		// DEVELOPMENT-ONLY re-fill: when privacy is disabled, undo the scrubber's
 		// NULLing so plaintext returns to the local cache. clearAllBodyScrub flips
@@ -2402,7 +2424,7 @@ func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isB
 	backfillStart := time.Now()
 	counts, err := c.runCloudKitBackfill(ctx, log)
 	if err != nil {
-		return fmt.Errorf("CloudKit sync failed after %s: %w", time.Since(backfillStart).Round(time.Second), err)
+		return counts, fmt.Errorf("CloudKit sync failed after %s: %w", time.Since(backfillStart).Round(time.Second), err)
 	}
 
 	log.Info().
@@ -2459,7 +2481,7 @@ func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isB
 		// avoids the trigger.)
 	}
 
-	return nil
+	return counts, nil
 }
 
 func (c *IMClient) runCloudKitBackfill(ctx context.Context, log zerolog.Logger) (cloudSyncCounters, error) {

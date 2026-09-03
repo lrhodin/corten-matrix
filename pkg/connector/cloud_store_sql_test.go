@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -309,6 +310,191 @@ func TestBatchUpsertsUseWorkingPlaceholders(t *testing.T) {
 	if text != "hello" {
 		t.Errorf("text = %q, want %q — placeholders may be binding out of order", text, "hello")
 	}
+}
+
+func TestPendingAttachmentMessagesExcludeCompletedPortals(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	now := time.Now().UnixMilli()
+	for _, chat := range []struct {
+		id, portal string
+		done       bool
+	}{
+		{"pending-chat", "gid:pending", false},
+		{"done-chat", "gid:done", true},
+		// One completed sibling makes the whole portal complete, matching
+		// getForwardBackfillDonePortals and markForwardBackfillDone.
+		{"mixed-pending", "gid:mixed", false},
+		{"mixed-done", "gid:mixed", true},
+	} {
+		if _, err := db.Exec(ctx, `
+			INSERT INTO cloud_chat
+				(login_id, cloud_chat_id, portal_id, created_ts, fwd_backfill_done)
+			VALUES ($1, $2, $3, $4, $5)
+		`, testSQLLoginID, chat.id, chat.portal, now, chat.done); err != nil {
+			t.Fatalf("insert chat %s: %v", chat.id, err)
+		}
+	}
+
+	attachmentJSON := `[{"guid":"att-guid","record_name":"attachment-record","file_size":1}]`
+	for i, portal := range []string{"gid:pending", "gid:done", "gid:mixed", "gid:no-chat"} {
+		if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+			GUID:            "attachment-message-" + portal,
+			RecordName:      "message-record-" + portal,
+			PortalID:        portal,
+			TimestampMS:     now + int64(i),
+			AttachmentsJSON: attachmentJSON,
+			HasBody:         true,
+		}}); err != nil {
+			t.Fatalf("insert message for %s: %v", portal, err)
+		}
+	}
+
+	rows, err := store.listPendingAttachmentMessages(ctx)
+	if err != nil {
+		t.Fatalf("listPendingAttachmentMessages: %v", err)
+	}
+	got := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		got[row.PortalID] = true
+	}
+	if !got["gid:pending"] || !got["gid:no-chat"] {
+		t.Errorf("pending rows = %v, want pending and chatless portals", got)
+	}
+	if got["gid:done"] || got["gid:mixed"] {
+		t.Errorf("pending rows = %v, completed portal leaked in", got)
+	}
+}
+
+func TestLoadAttachmentCacheJSONIsSelectiveAndChunked(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	for _, name := range []string{"wanted-first", "wanted-second", "not-wanted"} {
+		if _, err := db.Exec(ctx, `
+			INSERT INTO cloud_attachment_cache (login_id, record_name, content_json, created_ts)
+			VALUES ($1, $2, $3, $4)
+		`, testSQLLoginID, name, []byte(`{"body":"`+name+`"}`), time.Now().UnixMilli()); err != nil {
+			t.Fatalf("insert cache entry %s: %v", name, err)
+		}
+	}
+
+	// Cross the function's 400-name boundary so both queries execute.
+	names := make([]string, 0, 402)
+	names = append(names, "wanted-first")
+	for i := 0; i < 400; i++ {
+		names = append(names, fmt.Sprintf("absent-%d", i))
+	}
+	names = append(names, "wanted-second")
+
+	got, err := store.loadAttachmentCacheJSON(ctx, names)
+	if err != nil {
+		t.Fatalf("loadAttachmentCacheJSON: %v", err)
+	}
+	if len(got) != 2 || got["wanted-first"] == nil || got["wanted-second"] == nil {
+		t.Errorf("loaded cache entries = %v, want exactly both requested entries", got)
+	}
+	if got["not-wanted"] != nil {
+		t.Error("loadAttachmentCacheJSON returned an unrequested entry")
+	}
+}
+
+func TestListPortalIDsWithNewestTimestampPreservesFilteringSemantics(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+
+	for _, chat := range []struct {
+		id, portal string
+		updated    int64
+		filtered   int
+		deleted    bool
+	}{
+		{"filtered", "message-filtered", 10, 1, false},
+		{"mixed-filtered", "message-mixed", 20, 1, false},
+		{"mixed-live", "message-mixed", 21, 0, false},
+		{"deleted-filtered", "message-deleted-filtered", 30, 1, true},
+		{"chat-live", "chat-only-live", 40, 0, false},
+		{"chat-filtered", "chat-only-filtered", 50, 1, false},
+		{"chat-deleted", "chat-only-deleted", 60, 0, true},
+		{"stub-live", "stub-with-chat", 70, 0, false},
+	} {
+		if _, err := db.Exec(ctx, `
+			INSERT INTO cloud_chat
+				(login_id, cloud_chat_id, portal_id, updated_ts, created_ts, is_filtered, deleted)
+			VALUES ($1, $2, $3, $4, $4, $5, $6)
+		`, testSQLLoginID, chat.id, chat.portal, chat.updated, chat.filtered, chat.deleted); err != nil {
+			t.Fatalf("insert chat %s: %v", chat.id, err)
+		}
+	}
+
+	for i, message := range []struct {
+		portal, recordName string
+		ts                 int64
+	}{
+		{"message-no-chat", "record-1", 100},
+		{"message-filtered", "record-2", 110},
+		{"message-mixed", "record-3", 120},
+		{"message-deleted-filtered", "record-4", 130},
+		{"stub-with-chat", "", 140},
+	} {
+		if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{
+			GUID: "portal-list-message-" + fmt.Sprint(i), RecordName: message.recordName,
+			PortalID: message.portal, TimestampMS: message.ts, HasBody: true,
+		}}); err != nil {
+			t.Fatalf("insert message for %s: %v", message.portal, err)
+		}
+	}
+
+	assertPortals := func(bridgeFiltered bool, want map[string]portalWithNewestMessage) {
+		t.Helper()
+		gotRows, err := store.listPortalIDsWithNewestTimestamp(ctx, bridgeFiltered)
+		if err != nil {
+			t.Fatalf("listPortalIDsWithNewestTimestamp(%v): %v", bridgeFiltered, err)
+		}
+		got := make(map[string]portalWithNewestMessage, len(gotRows))
+		for i, row := range gotRows {
+			got[row.PortalID] = row
+			if i > 0 && gotRows[i-1].NewestTS < row.NewestTS {
+				t.Errorf("rows not sorted newest first: %v", gotRows)
+			}
+		}
+		if len(got) != len(want) {
+			t.Errorf("bridgeFiltered=%v portals = %v, want %v", bridgeFiltered, got, want)
+			return
+		}
+		for portalID, expected := range want {
+			if actual, ok := got[portalID]; !ok || actual != expected {
+				t.Errorf("bridgeFiltered=%v portal %s = %+v, want %+v", bridgeFiltered, portalID, actual, expected)
+			}
+		}
+	}
+
+	assertPortals(false, map[string]portalWithNewestMessage{
+		"message-no-chat": {PortalID: "message-no-chat", NewestTS: 100, MessageCount: 1},
+		"message-mixed":   {PortalID: "message-mixed", NewestTS: 120, MessageCount: 1},
+		"chat-only-live":  {PortalID: "chat-only-live", NewestTS: 40},
+	})
+	assertPortals(true, map[string]portalWithNewestMessage{
+		"message-no-chat":          {PortalID: "message-no-chat", NewestTS: 100, MessageCount: 1},
+		"message-filtered":         {PortalID: "message-filtered", NewestTS: 110, MessageCount: 1},
+		"message-mixed":            {PortalID: "message-mixed", NewestTS: 120, MessageCount: 1},
+		"message-deleted-filtered": {PortalID: "message-deleted-filtered", NewestTS: 130, MessageCount: 1},
+		"chat-only-live":           {PortalID: "chat-only-live", NewestTS: 40},
+		"chat-only-filtered":       {PortalID: "chat-only-filtered", NewestTS: 50},
+	})
 }
 
 // TestInsertOrIgnoreReplacementsAreNoOpOnConflict covers the four statements

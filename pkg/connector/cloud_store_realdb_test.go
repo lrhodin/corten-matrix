@@ -25,13 +25,18 @@ import (
 //
 // The test copies the database again into t.TempDir() before touching it
 // (see openRealDatabaseCopy), so the path you pass is never written to. It
-// asserts that ensureSchema succeeds
-// twice, that no rows are lost, and that the boolean predicates the queries
+// asserts that ensureSchema succeeds twice, that only the explicitly targeted
+// legacy system rows are removed, and that the boolean predicates the queries
 // use still match rows written by older versions of the bridge as integers.
 func TestEnsureSchemaAgainstRealDatabase(t *testing.T) {
 	db := openRealDatabaseCopy(t)
 
 	ctx := context.Background()
+	// Whichever login the database already has; the migrations are not
+	// login-scoped, but the cleanup and boolean checks below need a real one.
+	var loginID string
+	_ = db.QueryRow(ctx, `SELECT login_id FROM cloud_chat LIMIT 1`).Scan(&loginID)
+
 	countBefore := map[string]int{}
 	for _, table := range []string{"cloud_chat", "cloud_message", "shared_profiles", "group_photo_cache"} {
 		var n int
@@ -43,10 +48,29 @@ func TestEnsureSchemaAgainstRealDatabase(t *testing.T) {
 	}
 	t.Logf("row counts before migration: %v", countBefore)
 
-	// Whichever login the database already has; the migrations are not
-	// login-scoped, but the boolean checks below need a real one.
-	var loginID string
-	_ = db.QueryRow(ctx, `SELECT login_id FROM cloud_chat LIMIT 1`).Scan(&loginID)
+	legacySystemRows := 0
+	if hasBody, _ := columnExists(ctx, db, "cloud_message", "has_body"); hasBody {
+		if err := db.QueryRow(ctx, `
+			SELECT COUNT(*) FROM cloud_message
+			WHERE login_id=$1
+			  AND COALESCE(attachments_json, '') = ''
+			  AND tapback_type IS NULL
+			  AND (
+			    has_body=FALSE
+			    OR (
+			      text IS NOT NULL AND text <> ''
+			      AND portal_id IN (
+			        SELECT portal_id FROM cloud_chat c
+			        WHERE c.login_id=$1
+			          AND c.display_name IS NOT NULL AND c.display_name <> ''
+			          AND c.display_name=cloud_message.text
+			      )
+			    )
+			  )
+		`, loginID).Scan(&legacySystemRows); err != nil {
+			t.Fatalf("count intentional legacy system cleanup rows: %v", err)
+		}
+	}
 
 	backfill := newCloudBackfillStore(db, networkid.UserLoginID(loginID))
 	profiles := newSharedProfileStore(db, networkid.UserLoginID(loginID))
@@ -68,8 +92,13 @@ func TestEnsureSchemaAgainstRealDatabase(t *testing.T) {
 		if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM `+table).Scan(&after); err != nil {
 			t.Fatalf("count %s after migration: %v", table, err)
 		}
-		if after != before {
-			t.Errorf("%s row count changed across migration: %d -> %d", table, before, after)
+		want := before
+		if table == "cloud_message" {
+			want -= legacySystemRows
+		}
+		if after != want {
+			t.Errorf("%s row count after migration = %d, want %d (before=%d, intentional cleanup=%d)",
+				table, after, want, before, legacySystemRows)
 		}
 	}
 
@@ -168,6 +197,51 @@ func TestScrubberAgainstRealDatabase(t *testing.T) {
 	}
 	t.Logf("delivered-ID set: %d ids anchored at rowid %d; %d rows still unscrubbed",
 		first.size(), first.maxRowID, pendingCandidates)
+}
+
+// TestCloudHousekeepingAgainstRealDatabase exercises the account-wide reads
+// and cleanup writes that previously monopolized Keith's one SQLite connection.
+// The individual operations are logged so regressions are visible before a
+// branch is shipped to a slow host.
+func TestCloudHousekeepingAgainstRealDatabase(t *testing.T) {
+	db := openRealDatabaseCopy(t)
+	ctx := context.Background()
+	var loginID string
+	if err := db.QueryRow(ctx, `SELECT login_id FROM cloud_message LIMIT 1`).Scan(&loginID); err != nil {
+		t.Skipf("no cloud_message rows: %v", err)
+	}
+	store := newCloudBackfillStore(db, networkid.UserLoginID(loginID))
+
+	timed := func(name string, fn func() (int, error)) {
+		t.Helper()
+		start := time.Now()
+		n, err := fn()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		t.Logf("%-36s %8d rows %10s", name, n, time.Since(start).Round(time.Millisecond))
+	}
+	timed("ensureSchema", func() (int, error) { return 0, store.ensureSchema(ctx) })
+	timed("listPortalIDsWithNewestTimestamp", func() (int, error) {
+		rows, err := store.listPortalIDsWithNewestTimestamp(ctx, false)
+		return len(rows), err
+	})
+	timed("listPendingAttachmentMessages", func() (int, error) {
+		rows, err := store.listPendingAttachmentMessages(ctx)
+		return len(rows), err
+	})
+	timed("portalsFullyBackfilledNoNewContent", func() (int, error) {
+		rows, err := store.portalsFullyBackfilledNoNewContent(ctx)
+		return len(rows), err
+	})
+	timed("pruneOrphanedAttachmentCache", func() (int, error) {
+		n, err := store.pruneOrphanedAttachmentCache(ctx)
+		return int(n), err
+	})
+	timed("deleteOrphanedMessages", func() (int, error) {
+		n, err := store.deleteOrphanedMessages(ctx)
+		return int(n), err
+	})
 }
 
 // openRealDatabaseCopy makes a standalone copy of the database named by

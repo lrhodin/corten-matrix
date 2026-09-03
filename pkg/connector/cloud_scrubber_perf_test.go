@@ -590,6 +590,45 @@ func TestNormalizeGroupMessagePortalIDsUsesCloudChatMapping(t *testing.T) {
 	}
 }
 
+func TestNormalizeGroupMessagePortalIDsHandlesMappingCycleAtomically(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatalf("ensureSchema: %v", err)
+	}
+	now := time.Now().UnixMilli()
+	if err := store.upsertChatBatch(ctx, []cloudChatUpsertRow{
+		{CloudChatID: "cycle-a", PortalID: "gid:cycle-b", Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
+		{CloudChatID: "cycle-b", PortalID: "gid:cycle-a", Service: "iMessage", ParticipantsJSON: "[]", UpdatedTS: now},
+	}); err != nil {
+		t.Fatalf("upsert cycle chats: %v", err)
+	}
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
+		{GUID: "from-cycle-a", PortalID: "gid:cycle-a", TimestampMS: now, Service: "iMessage"},
+		{GUID: "from-cycle-b", PortalID: "gid:cycle-b", TimestampMS: now, Service: "iMessage"},
+	}); err != nil {
+		t.Fatalf("upsert cycle messages: %v", err)
+	}
+
+	if n, err := store.normalizeGroupMessagePortalIDs(ctx); err != nil || n != 2 {
+		t.Fatalf("normalizeGroupMessagePortalIDs = %d, %v; want 2", n, err)
+	}
+	for guid, want := range map[string]string{
+		"from-cycle-a": "gid:cycle-b",
+		"from-cycle-b": "gid:cycle-a",
+	} {
+		var got string
+		if err := db.QueryRow(ctx, `SELECT portal_id FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+			testSQLLoginID, guid).Scan(&got); err != nil {
+			t.Fatalf("read %s: %v", guid, err)
+		}
+		if got != want {
+			t.Errorf("%s portal_id = %q, want %q", guid, got, want)
+		}
+	}
+}
+
 func TestScrubBridgedBodiesDropsDeliveredSetWhenRebuildFails(t *testing.T) {
 	ctx, db, store, insertAged, scrubbed := scrubIncrementalFixture(t)
 	const bridgeID = "bridge"
