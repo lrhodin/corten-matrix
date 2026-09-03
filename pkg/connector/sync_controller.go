@@ -2243,6 +2243,16 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		c.cloudSyncRunningLock.Unlock()
 		counts, err := c.runCloudSyncOnceSerialized(ctx, resyncLog, false)
 		currentPassFailed := err != nil
+		if ctx.Err() != nil {
+			// Shutdown cancelled the pass. Reconciling now would run every
+			// scan against a dead context, and the warnings after this loop
+			// would report a stopping bridge as unrecovered data loss.
+			c.cloudSyncRunningLock.Lock()
+			c.cloudSyncRunning = false
+			c.cloudSyncRunningLock.Unlock()
+			resyncLog.Debug().Msg("Delayed CloudKit re-sync interrupted by shutdown")
+			return
+		}
 		if currentPassFailed {
 			resyncLog.Warn().Err(err).
 				Msg("Delayed incremental re-sync failed; reconciling any CloudKit rows saved before the failure")
