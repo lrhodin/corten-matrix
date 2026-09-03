@@ -242,16 +242,16 @@ ensure-rustpush-source:
 	  's/^mod ids;$$/pub mod ids;/' \
 	  '^pub mod ids;'
 # FetchedToken's fields are private upstream; we construct one to replay the
-# persisted PET on session restore (breaks the daily-2FA loop).
+# persisted PET on session restore (breaks the daily-2FA loop). The type itself
+# has been re-exported from icloud-auth since the 7725a32 pin (apple-private-apis
+# b8598d2), so only the field visibility still needs patching here; the private
+# build lane retired its re-export patch at the same bump.
 	@$(RP_PATCH) rp_patch "FetchedToken.token pub" $(APA_DIR)/icloud-auth/src/client.rs \
 	  's/^    token: String,$$/    pub token: String,/' \
 	  '^    pub token: String,'
 	@$(RP_PATCH) rp_patch "FetchedToken.expiration pub" $(APA_DIR)/icloud-auth/src/client.rs \
 	  's/^    expiration: SystemTime,$$/    pub expiration: SystemTime,/' \
 	  '^    pub expiration: SystemTime,'
-	@$(RP_PATCH) rp_patch "FetchedToken re-export" $(APA_DIR)/icloud-auth/src/lib.rs \
-	  's/^pub use client::\{AppleAccount, LoginState,/pub use client::{AppleAccount, FetchedToken, LoginState,/' \
-	  'pub use client::\{AppleAccount, FetchedToken,'
 # Ignore self-exclusion in fast_forward_trust (Clique self-eviction fix; ports 9f29ff1).
 	@$(RP_PATCH) rp_patch "keychain self-exclusion" $(RUSTPUSH_DIR)/src/icloud/keychain.rs \
 	  's/^            for excluded in &trust\.excludeds \{$$/            let my_id = &state.user_identity.as_ref().unwrap().identifier;\n            for excluded in &trust.excludeds {\n                if excluded == my_id {\n                    warn!(\n                        "Ignoring exclusion of ourselves ({}) from peer {}",\n                        excluded,\n                        peer.0.hash.as_ref().unwrap()\n                    );\n                    continue;\n                }/' \
