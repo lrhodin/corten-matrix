@@ -1742,6 +1742,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_messagecallback_on_connection_event(uniffiStatus)
+		})
+		if checksum != 3920 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_messagecallback_on_connection_event: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_rustlogsink_log(uniffiStatus)
 		})
 		if checksum != 29422 {
@@ -7456,6 +7465,38 @@ func (_ FfiDestroyerTypeWrappedStickerExtension) Destroy(value WrappedStickerExt
 	value.Destroy()
 }
 
+type ApsConnectionEvent uint
+
+const (
+	ApsConnectionEventInterrupted ApsConnectionEvent = 1
+	ApsConnectionEventRetryFailed ApsConnectionEvent = 2
+)
+
+type FfiConverterTypeAPSConnectionEvent struct{}
+
+var FfiConverterTypeAPSConnectionEventINSTANCE = FfiConverterTypeAPSConnectionEvent{}
+
+func (c FfiConverterTypeAPSConnectionEvent) Lift(rb RustBufferI) ApsConnectionEvent {
+	return LiftFromRustBuffer[ApsConnectionEvent](c, rb)
+}
+
+func (c FfiConverterTypeAPSConnectionEvent) Lower(value ApsConnectionEvent) RustBuffer {
+	return LowerIntoRustBuffer[ApsConnectionEvent](c, value)
+}
+func (FfiConverterTypeAPSConnectionEvent) Read(reader io.Reader) ApsConnectionEvent {
+	id := readInt32(reader)
+	return ApsConnectionEvent(id)
+}
+
+func (FfiConverterTypeAPSConnectionEvent) Write(writer io.Writer, value ApsConnectionEvent) {
+	writeInt32(writer, int32(value))
+}
+
+type FfiDestroyerTypeApsConnectionEvent struct{}
+
+func (_ FfiDestroyerTypeApsConnectionEvent) Destroy(value ApsConnectionEvent) {
+}
+
 type WrappedError struct {
 	err error
 }
@@ -7656,6 +7697,8 @@ func (c *FfiConverterCallbackInterface[CallbackInterface]) Write(writer io.Write
 
 type MessageCallback interface {
 	OnMessage(msg WrappedMessage)
+
+	OnConnectionEvent(event ApsConnectionEvent)
 }
 
 // foreignCallbackCallbackInterfaceMessageCallback cannot be callable be a compiled function at a same time
@@ -7677,6 +7720,11 @@ func rustpushgo_cgo_MessageCallback(handle C.uint64_t, method C.int32_t, argsPtr
 		args := unsafe.Slice((*byte)(argsPtr), argsLen)
 		result = foreignCallbackCallbackInterfaceMessageCallback{}.InvokeOnMessage(cb, args, outBuf)
 		return C.int32_t(result)
+	case 2:
+		var result uniffiCallbackResult
+		args := unsafe.Slice((*byte)(argsPtr), argsLen)
+		result = foreignCallbackCallbackInterfaceMessageCallback{}.InvokeOnConnectionEvent(cb, args, outBuf)
+		return C.int32_t(result)
 
 	default:
 		// This should never happen, because an out of bounds method index won't
@@ -7689,6 +7737,12 @@ func rustpushgo_cgo_MessageCallback(handle C.uint64_t, method C.int32_t, argsPtr
 func (foreignCallbackCallbackInterfaceMessageCallback) InvokeOnMessage(callback MessageCallback, args []byte, outBuf *C.RustBuffer) uniffiCallbackResult {
 	reader := bytes.NewReader(args)
 	callback.OnMessage(FfiConverterTypeWrappedMessageINSTANCE.Read(reader))
+
+	return uniffiCallbackResultSuccess
+}
+func (foreignCallbackCallbackInterfaceMessageCallback) InvokeOnConnectionEvent(callback MessageCallback, args []byte, outBuf *C.RustBuffer) uniffiCallbackResult {
+	reader := bytes.NewReader(args)
+	callback.OnConnectionEvent(FfiConverterTypeAPSConnectionEventINSTANCE.Read(reader))
 
 	return uniffiCallbackResultSuccess
 }

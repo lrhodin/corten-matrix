@@ -2025,6 +2025,10 @@ uint16_t uniffi_rustpushgo_checksum_method_messagecallback_on_message(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_messagecallback_on_connection_event(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_rustlogsink_log(
 	RustCallStatus* out_status
 );

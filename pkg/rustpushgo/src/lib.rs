@@ -1,4 +1,5 @@
 pub mod util;
+mod aps_connection_events;
 #[cfg(target_os = "macos")]
 pub mod local_config;
 #[cfg(all(not(target_os = "macos"), feature = "anisette-remote-v3"))]
@@ -11,6 +12,8 @@ mod test_hwinfo;
 
 use std::{collections::HashMap, io::Cursor, path::PathBuf, str::FromStr, sync::Arc, time::Duration, sync::atomic::{AtomicU64, Ordering}};
 
+use aps_connection_events::{observed_aps_state, APSConnectionTransition};
+pub use aps_connection_events::APSConnectionEvent;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use icloud_auth::AppleAccount;
 use keystore::{init_keystore, keystore, software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
@@ -4145,6 +4148,7 @@ pub fn init_logger_with_sink(sink: Box<dyn RustLogSink>) {
 #[uniffi::export(callback_interface)]
 pub trait MessageCallback: Send + Sync {
     fn on_message(&self, msg: WrappedMessage);
+    fn on_connection_event(&self, event: APSConnectionEvent);
 }
 
 #[uniffi::export(callback_interface)]
@@ -6647,6 +6651,7 @@ pub async fn new_client(
         let status_cb_for_recv = status_callback_for_recv.clone();
         let ft_for_recv = prewarmed_facetime.clone();
         let client_weak_for_loop = client_weak_for_loop.clone();
+        let connection_event_callback = callback.clone();
         async move {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(rustpush::APSMessage, u64)>();
             let pending = Arc::new(AtomicU64::new(0));
@@ -6662,12 +6667,16 @@ pub async fn new_client(
                 let conn = conn.clone();
                 let reconnected_at = reconnected_at.clone();
                 let last_inbound_ms = last_inbound_ms.clone();
+                let connection_event_callback = connection_event_callback.clone();
                 async move {
                     let mut recv = conn.messages_cont.subscribe();
                     let mut state = conn.resource_state.subscribe();
-                    // Mark the initial resource_state value as seen so we
-                    // only trigger on future transitions.
-                    state.borrow_and_update();
+                    let initial_state = observed_aps_state(&*state.borrow_and_update());
+                    let mut connection_transition = APSConnectionTransition::new(initial_state);
+                    if let Some(event) = connection_transition.initial_event() {
+                        warn!("Initial APS resource event {:?}; notifying Go Internet-recovery coordinator", event);
+                        connection_event_callback.on_connection_event(event);
+                    }
                     // Set reconnected_at NOW — right when we start listening.
                     // Covers stored messages delivered on first connect.
                     let start_ms = std::time::SystemTime::now()
@@ -6747,6 +6756,10 @@ pub async fn new_client(
                                     break;
                                 }
                                 let current = state.borrow_and_update().clone();
+                                if let Some(event) = connection_transition.observe(observed_aps_state(&current)) {
+                                    warn!("APS resource event {:?}; notifying Go Internet-recovery coordinator", event);
+                                    connection_event_callback.on_connection_event(event);
+                                }
                                 if matches!(current, ResourceState::Generating) {
                                     let now = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)

@@ -233,13 +233,16 @@ type IMClient struct {
 	UserLogin *bridgev2.UserLogin
 
 	// Rustpush (primary — real-time send/receive)
-	client     *rustpushgo.Client
-	config     *rustpushgo.WrappedOsConfig
-	users      *rustpushgo.WrappedIdsUsers
-	identity   *rustpushgo.WrappedIdsngmIdentity
-	connection *rustpushgo.WrappedApsConnection
-	handle     string   // Primary iMessage handle used for sending (e.g., tel:+1234567890)
-	allHandles []string // All registered handles (for IsThisUser checks)
+	client                 *rustpushgo.Client
+	config                 *rustpushgo.WrappedOsConfig
+	users                  *rustpushgo.WrappedIdsUsers
+	identity               *rustpushgo.WrappedIdsngmIdentity
+	connection             *rustpushgo.WrappedApsConnection
+	connectionEventWake    chan struct{}
+	connectionEventMu      sync.Mutex
+	connectionEventPending uint8
+	handle                 string   // Primary iMessage handle used for sending (e.g., tel:+123****7890)
+	allHandles             []string // All registered handles (for IsThisUser checks)
 
 	// iCloud token provider (auth for CardDAV, CloudKit, etc.)
 	tokenProvider **rustpushgo.WrappedTokenProvider
@@ -448,9 +451,19 @@ type IMClient struct {
 	chatDB *chatDB
 
 	// Background goroutine lifecycle
-	stopChan chan struct{}
-	// Serializes Disconnect — see the comment there.
+	stopChan            chan struct{}
+	stopChanClosed      bool
+	recoveryDone        chan struct{}
+	recoveryDoneClosed  bool
+	recoveryBridgeState *bridgev2.BridgeStateQueue
+	// Serializes the complete Connect/Disconnect lifecycle so an asynchronous
+	// logout cannot finish teardown before Connect installs its Rust client.
+	lifecycleMu         sync.Mutex
+	lifecycleTerminated bool
+	// Serializes the teardown body — see the comment there.
 	disconnectMu sync.Mutex
+	// Serializes this login's event-driven Internet recovery episode.
+	internetRecoveryMu sync.Mutex
 
 	// Unsend re-delivery suppression
 	recentUnsends     map[string]time.Time
@@ -1113,10 +1126,41 @@ func safeFinish(
 	return session.Finish(config, conn, existingIdentity, existingUsers)
 }
 
+func (c *IMClient) beginConnect() bool {
+	c.lifecycleMu.Lock()
+	if c.lifecycleTerminated {
+		c.lifecycleMu.Unlock()
+		return false
+	}
+	return true
+}
+
+func (c *IMClient) endConnect() {
+	c.lifecycleMu.Unlock()
+}
+
 func (c *IMClient) Connect(ctx context.Context) {
+	if !c.beginConnect() {
+		return
+	}
+	defer c.endConnect()
+
 	c.startupTime = time.Now()
 	log := c.UserLogin.Log.With().Str("component", "imessage").Logger()
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
+
+	// Create this connect epoch's cancellation and APNs-event channels before
+	// NewClient installs the Rust callback. An initial APS failure can callback
+	// while NewClient is still returning; the buffered event must already exist.
+	c.stopChan = make(chan struct{})
+	c.stopChanClosed = false
+	c.recoveryDone = make(chan struct{})
+	c.recoveryDoneClosed = false
+	c.recoveryBridgeState = c.UserLogin.BridgeState
+	c.connectionEventWake = make(chan struct{}, 1)
+	c.connectionEventMu.Lock()
+	c.connectionEventPending = 0
+	c.connectionEventMu.Unlock()
 
 	rustpushgo.InitLogger()
 
@@ -1498,7 +1542,6 @@ func (c *IMClient) Connect(ctx context.Context) {
 	go c.loadSenderGuidsFromDB(log)
 
 	// Start periodic state saver (every 5 minutes)
-	c.stopChan = make(chan struct{})
 	c.msgBuffer = &messageBuffer{client: c}
 	go c.periodicStateSave(log)
 	go c.periodicPetRefresh(log)
@@ -1666,6 +1709,9 @@ func (c *IMClient) Connect(ctx context.Context) {
 		c.setCloudSyncDone()
 	}
 
+	// Start last. A connection event may synchronously tear this client down;
+	// there must be no remaining Connect initialization racing that teardown.
+	go c.runAPSConnectionEventLoop(c.stopChan, log.With().Str("component", "aps_connection_recovery").Logger())
 }
 
 // mgmtRoomEnsureMu serializes ensureManagementRoom across logins so two
@@ -1876,6 +1922,19 @@ func (c *IMClient) existingManagementRoom() id.RoomID {
 }
 
 func (c *IMClient) Disconnect() {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	c.lifecycleTerminated = true
+	c.disconnect(true)
+}
+
+func (c *IMClient) disconnectForInternetRecovery() {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	c.disconnect(false)
+}
+
+func (c *IMClient) disconnect(cancelRecovery bool) {
 	// bridgev2 serializes its own Disconnect calls (disconnectOnce), but
 	// LogoutRemote invokes this method directly, so two teardowns can run
 	// concurrently: double-close of stopChan, or one frame nil-ing c.client
@@ -1883,12 +1942,16 @@ func (c *IMClient) Disconnect() {
 	// second caller then no-ops on the already-nil'd fields.
 	c.disconnectMu.Lock()
 	defer c.disconnectMu.Unlock()
+	if cancelRecovery && c.recoveryDone != nil && !c.recoveryDoneClosed {
+		close(c.recoveryDone)
+		c.recoveryDoneClosed = true
+	}
 	if c.msgBuffer != nil {
 		c.msgBuffer.stop()
 	}
-	if c.stopChan != nil {
+	if c.stopChan != nil && !c.stopChanClosed {
 		close(c.stopChan)
-		c.stopChan = nil
+		c.stopChanClosed = true
 	}
 	// Close the APNs ResourceManager BEFORE stopping the Client: its death
 	// signal (a non-blocking try_send) aborts any in-flight reconnect so
@@ -3005,6 +3068,53 @@ func (c *IMClient) eagerResolveReshareSender(sender, normalizedUser string, log 
 		return
 	}
 	log.Debug().Msg("StatusKit: eager-resolve found no portal for reshare sender — will retry when presence arrives")
+}
+
+// OnConnectionEvent is called by rustpushgo when the established APS resource
+// leaves Generated or a regeneration attempt fails. Keep the FFI callback
+// nonblocking: the Go recovery loop performs all probes and lifecycle work.
+func (c *IMClient) OnConnectionEvent(event rustpushgo.ApsConnectionEvent) {
+	var priority uint32
+	switch event {
+	case rustpushgo.ApsConnectionEventInterrupted:
+		priority = 1
+	case rustpushgo.ApsConnectionEventRetryFailed:
+		priority = 2
+	default:
+		return
+	}
+
+	// Keep the highest-severity pending event. The one-slot wake channel may
+	// coalesce notifications, but RetryFailed can never be dropped behind a
+	// burst of ordinary Interrupted events.
+	c.connectionEventMu.Lock()
+	if uint8(priority) > c.connectionEventPending {
+		c.connectionEventPending = uint8(priority)
+	}
+	wake := c.connectionEventWake
+	c.connectionEventMu.Unlock()
+	if wake == nil {
+		return
+	}
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
+}
+
+func (c *IMClient) takeConnectionEvent() (rustpushgo.ApsConnectionEvent, bool) {
+	c.connectionEventMu.Lock()
+	pending := c.connectionEventPending
+	c.connectionEventPending = 0
+	c.connectionEventMu.Unlock()
+	switch pending {
+	case 1:
+		return rustpushgo.ApsConnectionEventInterrupted, true
+	case 2:
+		return rustpushgo.ApsConnectionEventRetryFailed, true
+	default:
+		return 0, false
+	}
 }
 
 // OnMessage is called by rustpush when a message is received via APNs.
