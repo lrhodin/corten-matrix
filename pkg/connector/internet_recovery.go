@@ -45,10 +45,11 @@ var (
 	// withdrawn: the requirement is to touch Apple only after public
 	// connectivity has returned and stayed stable, and a hand-back on a
 	// confirmed-down verdict contacts Apple while the probe still says down.
-	// Two things changed the calculus. The probe is no longer one ping — a
-	// false Unreachable now needs every authenticated leg of both providers
-	// over both address families to fail — and, more important, the
-	// requirement forbids touching Apple, not being down. So when the probe
+	// Two things changed the calculus. The probe is no longer one ping: a
+	// provider can vote Reachable only through certificate-validated TLS, and a
+	// down verdict requires at least one real network failure with neither
+	// provider authenticated as reachable. More importantly, the requirement
+	// forbids touching Apple, not being down. So when the probe
 	// says down for a long time the correct behavior is a LOUD dead bridge,
 	// not an automatic Apple reconnect: after this much continuous confirmed
 	// outage the loop raises a throttled Error and posts a management-room
