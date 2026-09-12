@@ -1830,6 +1830,26 @@ var mgmtRoomEnsureMu sync.Mutex
 // clients handle correctly (bot on the participant list, normal chat controls,
 // leave/archive/delete all available).
 //
+// postManagementNotice posts a plain notice to the user's management room, for
+// a condition an operator must see even without reading logs. Reuses the same
+// bot send path as the welcome message; a missing room or a send failure is
+// logged and otherwise ignored, because the caller has already logged the
+// condition itself.
+func (c *IMClient) postManagementNotice(ctx context.Context, log zerolog.Logger, text string) {
+	if c.Main == nil || c.Main.Bridge == nil || c.Main.Bridge.Bot == nil || c.UserLogin == nil || c.UserLogin.User == nil {
+		return
+	}
+	roomID := c.UserLogin.User.ManagementRoom
+	if roomID == "" {
+		log.Warn().Msg("No management room to post the notice to")
+		return
+	}
+	content := &event.MessageEventContent{MsgType: event.MsgNotice, Body: text}
+	if _, err := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{Parsed: content}, nil); err != nil {
+		log.Warn().Err(err).Str("management_room", string(roomID)).Msg("Failed to post a notice to the management room")
+	}
+}
+
 // bridgev2's own GetManagementRoom builds the room backwards: the BOT creates
 // it and pulls the user in via BeeperInitialMembers/auto-join. That room is the
 // bug as reported — the client treats it as bridge infrastructure the user is
@@ -2188,29 +2208,42 @@ func (c *IMClient) connectEpochActiveLocked() bool {
 
 // needsRetirement reports whether a load path must put this client through
 // Disconnect() before installing a replacement for the same login. It is the
-// union of every state that still owns something able to touch Apple or the
-// shared bridge-state queue, kept in one predicate so a load path cannot test
-// a subset of them:
+// union of every RESOURCE this client can own that touches Apple or the shared
+// bridge-state queue — not a reading of how far Connect has progressed, which
+// is how two earlier versions each missed one state — kept in one predicate so
+// a load path cannot test a subset:
 //
-//   - a Rust client is installed: it owns a live APS connection;
-//   - a connect epoch is live (connectEpochActive): Connect is still running.
-//     c.client is nil until NewClient returns — up to 300s — and without
-//     retirement that Connect finishes into a second APS connection on the
-//     same device token, pushes StateConnected on the shared queue, and starts
-//     a wedge watchdog and APS event loop nobody would ever stop;
-//   - Internet recovery tore the client down but left its loop armed
-//     (hasOrphanedRecovery): the loop can still push states that make bridgev2
-//     tear down the replacement.
+//   - the APS connection (c.connection). LoadUserLogin builds it in the struct
+//     literal, before Connect is even scheduled, and from that moment its
+//     ResourceManager retries Apple every <=30s with with_max_times(usize::MAX).
+//     It is the earliest live resource and the one every real client has, so in
+//     production this term alone is true for every client bridgev2 has ever
+//     held: a load path ALWAYS retires the previous client. (The round-10
+//     finding: a client replaced between LoadUserLogin and Connect kept its
+//     connection retrying on the same device token as the replacement's.)
+//   - the Rust client (c.client): IDS, StatusKit, the courier receive loop;
+//   - a live connect epoch (connectEpochActive): Connect is still running and
+//     would otherwise finish into a second live client — StateConnected on the
+//     shared queue, a wedge watchdog and APS event loop nobody would stop;
+//   - an orphaned recovery loop (hasOrphanedRecovery): Internet recovery tore
+//     the client down but left its loop armed, and that loop can push states
+//     that make bridgev2 tear down the replacement.
 //
-// The first two overlap for most of an epoch's life; the second is the one the
-// round-8 audit found missing. One snapshot under disconnectMu: this is read
-// from the load goroutine while Connect may be installing c.client (which it
-// therefore does under the same lock) and while disconnect() may be nil'ing
-// it, and the epoch fields are ordered by that lock alone.
+// Audit of the remaining pre-Connect fields, so this is the last "one state
+// earlier": config, users and identity are passive data; the DB-backed stores
+// (cloudStore, sharedProfileStore, pendingAttachments) start no goroutines and
+// contact nothing; tokenProvider is created inside Connect; every worker
+// goroutine is launched after markConnected on stopChan. Nothing else is live
+// before Connect.
+//
+// One snapshot under disconnectMu: this is read from the load goroutine while
+// Connect may be installing c.client (which it therefore does under the same
+// lock) and while disconnect() may be nil'ing it; c.connection is written once
+// at construction and never reassigned.
 func (c *IMClient) needsRetirement() bool {
 	c.disconnectMu.Lock()
 	defer c.disconnectMu.Unlock()
-	return c.client != nil || c.connectEpochActiveLocked() || c.hasOrphanedRecoveryLocked()
+	return c.connection != nil || c.client != nil || c.connectEpochActiveLocked() || c.hasOrphanedRecoveryLocked()
 }
 
 func (c *IMClient) disconnectForInternetRecovery() {

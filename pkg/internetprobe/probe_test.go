@@ -60,11 +60,15 @@ func TestEveryProviderIsProbedOverBothAddressFamilies(t *testing.T) {
 		}
 	}
 
-	// And over both methods: TLS on 443 first (the primary proof), DNS on 53
-	// as the fallback for hosts whose 443 is blocked or cannot validate.
+	// And over every leg: TLS on 443 first (the primary proof), TLS on 853 as
+	// the authenticated fallback, and plaintext DNS on 53 as a diagnostic that
+	// can never vote Reachable.
 	legs := probeLegs()
-	if len(legs) != 2 || legs[0].name != "tls" || legs[0].port != "443" || legs[1].name != "dns" || legs[1].port != "53" {
-		t.Fatalf("probe legs = %+v, want tls:443 then dns:53 (port 80 is deliberately not a leg)", legs)
+	if len(legs) != 3 ||
+		legs[0].name != "tls" || legs[0].port != "443" || !legs[0].voting ||
+		legs[1].name != "dot" || legs[1].port != "853" || !legs[1].voting ||
+		legs[2].name != "dns" || legs[2].port != "53" || legs[2].voting {
+		t.Fatalf("probe legs = %+v, want voting tls:443 and dot:853 then diagnostic dns:53 (port 80 is deliberately not a leg, and 53 must never vote)", legs)
 	}
 
 	// The race must actually dial every (address, method) pair of a provider.
@@ -118,6 +122,11 @@ func recordDials(t *testing.T, errno syscall.Errno) func() map[string]bool {
 // serving certificate and a root pool that trusts it.
 func fixtureCert(t *testing.T, ips ...net.IP) (tls.Certificate, *x509.CertPool) {
 	t.Helper()
+	return fixtureCertValid(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), ips...)
+}
+
+func fixtureCertValid(t *testing.T, notBefore, notAfter time.Time, ips ...net.IP) (tls.Certificate, *x509.CertPool) {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
@@ -125,8 +134,8 @@ func fixtureCert(t *testing.T, ips ...net.IP) (tls.Certificate, *x509.CertPool) 
 	template := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: "internetprobe fixture"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
@@ -181,99 +190,21 @@ func closedPort(t *testing.T) string {
 	return address
 }
 
-// useLegs points the two legs at fixture addresses (both on 127.0.0.1) and
+// useLegs points the three legs at fixture addresses (all on 127.0.0.1) and
 // installs roots as the TLS trust store; nil roots means the system roots and
 // an empty pool means a host with no CA bundle at all.
-func useLegs(t *testing.T, tlsAddr, dnsAddr string, roots *x509.CertPool) {
+func useLegs(t *testing.T, tlsAddr, dotAddr, dnsAddr string, roots *x509.CertPool) {
 	t.Helper()
-	savedTLS, savedDNS, savedRoots := tlsPort, dnsPort, tlsRootCAs
-	t.Cleanup(func() { tlsPort, dnsPort, tlsRootCAs = savedTLS, savedDNS, savedRoots })
+	savedTLS, savedDoT, savedDNS, savedRoots := tlsPort, dotPort, dnsPort, tlsRootCAs
+	t.Cleanup(func() { tlsPort, dotPort, dnsPort, tlsRootCAs = savedTLS, savedDoT, savedDNS, savedRoots })
 	_, tlsPort, _ = net.SplitHostPort(tlsAddr)
+	_, dotPort, _ = net.SplitHostPort(dotAddr)
 	_, dnsPort, _ = net.SplitHostPort(dnsAddr)
 	tlsRootCAs = roots
 }
 
-// The primary proof: only a certificate that chains to a trusted root AND names
-// the dialed IP counts. Every other handshake outcome abstains — it must not
-// become a verdict, because a MITM portal and a missing CA bundle look alike.
-func TestTLSLegAcceptsOnlyACertificateThatValidatesForTheDialedIP(t *testing.T) {
-	loopback := net.ParseIP("127.0.0.1")
-	cert, pool := fixtureCert(t, loopback)
-	server := startFixtureTLS(t, cert)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	t.Run("verified IP SAN is reachable", func(t *testing.T) {
-		useLegs(t, server, server, pool)
-		if outcome, err := tlsOnce(ctx, server); outcome != OutcomeReachable {
-			t.Fatalf("outcome = %s (err %v), want reachable for a certificate that validates for the dialed IP", outcome, err)
-		}
-	})
-	t.Run("self-signed with the system roots abstains", func(t *testing.T) {
-		useLegs(t, server, server, nil)
-		outcome, err := tlsOnce(ctx, server)
-		if outcome != OutcomeBlocked || !errors.Is(err, errTLSUnverified) {
-			t.Fatalf("outcome = %s, err = %v; a portal's self-signed certificate must abstain, never count as reachable", outcome, err)
-		}
-	})
-	t.Run("no CA bundle at all abstains", func(t *testing.T) {
-		useLegs(t, server, server, x509.NewCertPool())
-		outcome, err := tlsOnce(ctx, server)
-		if outcome != OutcomeBlocked || !errors.Is(err, errTLSUnverified) {
-			t.Fatalf("outcome = %s, err = %v; an empty trust store must abstain, not vote", outcome, err)
-		}
-	})
-	t.Run("a trusted certificate for a different IP abstains", func(t *testing.T) {
-		otherCert, otherPool := fixtureCert(t, net.ParseIP("203.0.113.1"))
-		otherServer := startFixtureTLS(t, otherCert)
-		useLegs(t, otherServer, otherServer, otherPool)
-		outcome, err := tlsOnce(ctx, otherServer)
-		if outcome != OutcomeBlocked || !errors.Is(err, errTLSUnverified) {
-			t.Fatalf("outcome = %s, err = %v; a certificate that does not name the dialed IP proves nothing", outcome, err)
-		}
-	})
-}
-
-// The provider verdict across both legs, in the cases that matter operationally.
-func TestProviderVerdictCombinesTheTLSAndDNSLegs(t *testing.T) {
-	loopback := net.ParseIP("127.0.0.1")
-	cert, pool := fixtureCert(t, loopback)
-	tlsServer := startFixtureTLS(t, cert)
-	resolver := startFakeResolver(t)
-	refused := closedPort(t)
-	hijacker := startHijacker(t)
-	host := []string{"127.0.0.1"}
-
-	for _, tc := range []struct {
-		name    string
-		tlsAddr string
-		dnsAddr string
-		roots   *x509.CertPool
-		want    Outcome
-		wantErr error
-	}{
-		{"verified TLS alone is reachable even with 53 refused", tlsServer, refused, pool, OutcomeReachable, nil},
-		{"443 refused but 53 answers is reachable", refused, resolver, nil, OutcomeReachable, nil},
-		{"no CA bundle still gets its verdict from 53", tlsServer, resolver, x509.NewCertPool(), OutcomeReachable, nil},
-		{"a self-signed portal on 443 with 53 refused is unreachable", tlsServer, refused, nil, OutcomeUnreachable, errTLSUnverified},
-		{"no CA bundle with 53 hijacked is unreachable", tlsServer, hijacker, x509.NewCertPool(), OutcomeUnreachable, errHijacked},
-		{"both refused is unreachable", refused, refused, nil, OutcomeUnreachable, syscall.ECONNREFUSED},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			useLegs(t, tc.tlsAddr, tc.dnsAddr, tc.roots)
-			outcome, err := queryProvider(context.Background(), host)
-			if outcome != tc.want {
-				t.Fatalf("outcome = %s (err %v), want %s", outcome, err, tc.want)
-			}
-			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
-				t.Fatalf("err = %v, want it to carry %v so the log explains the losing leg", err, tc.wantErr)
-			}
-		})
-	}
-}
-
 // startHijacker accepts on a port and answers with HTTP, like a captive portal
-// intercepting 53.
+// intercepting whatever port it is put on.
 func startHijacker(t *testing.T) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -296,7 +227,101 @@ func startHijacker(t *testing.T) string {
 	return listener.Addr().String()
 }
 
-// Only dial-level failures classify, identically for both legs: no route is an
+// The voting proof: only a certificate that chains to a trusted root AND names
+// the dialed IP counts. A peer that is provably not the provider votes
+// Unreachable; only a failure that may lie with this host abstains.
+func TestTLSLegAcceptsOnlyACertificateThatValidatesForTheDialedIP(t *testing.T) {
+	loopback := net.ParseIP("127.0.0.1")
+	cert, pool := fixtureCert(t, loopback)
+	server := startFixtureTLS(t, cert)
+	_, unrelated := fixtureCert(t, loopback) // a trust store that does not contain the server's certificate
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	leg := func(t *testing.T, roots *x509.CertPool, address string) (Outcome, error) {
+		t.Helper()
+		useLegs(t, address, address, address, roots)
+		return tlsOnce(ctx, address)
+	}
+	expect := func(t *testing.T, outcome Outcome, err error, want Outcome, wantErr error, why string) {
+		t.Helper()
+		if outcome != want || !errors.Is(err, wantErr) {
+			t.Fatalf("outcome = %s, err = %v; want %s carrying %v — %s", outcome, err, want, wantErr, why)
+		}
+	}
+
+	t.Run("verified IP SAN is reachable", func(t *testing.T) {
+		outcome, err := leg(t, pool, server)
+		if outcome != OutcomeReachable {
+			t.Fatalf("outcome = %s (err %v), want reachable for a certificate that validates for the dialed IP", outcome, err)
+		}
+	})
+	t.Run("an untrusted chain with a trust store present is a portal", func(t *testing.T) {
+		outcome, err := leg(t, unrelated, server)
+		expect(t, outcome, err, OutcomeUnreachable, errTLSRejected, "a self-signed certificate on a host that can validate is interception")
+	})
+	t.Run("no CA bundle at all abstains", func(t *testing.T) {
+		outcome, err := leg(t, x509.NewCertPool(), server)
+		expect(t, outcome, err, OutcomeBlocked, errTLSUnverified, "an empty trust store proves nothing about the peer")
+	})
+	t.Run("a trusted certificate for a different IP is a portal", func(t *testing.T) {
+		otherCert, otherPool := fixtureCert(t, net.ParseIP("203.0.113.1"))
+		otherServer := startFixtureTLS(t, otherCert)
+		outcome, err := leg(t, otherPool, otherServer)
+		expect(t, outcome, err, OutcomeUnreachable, errTLSRejected, "a portal with a real certificate for its own name is not the provider")
+	})
+	t.Run("a peer that does not speak TLS is a portal", func(t *testing.T) {
+		outcome, err := leg(t, pool, startHijacker(t))
+		expect(t, outcome, err, OutcomeUnreachable, errTLSRejected, "the providers always speak TLS on these ports")
+	})
+	t.Run("an expired certificate abstains", func(t *testing.T) {
+		expiredCert, expiredPool := fixtureCertValid(t, time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour), loopback)
+		expiredServer := startFixtureTLS(t, expiredCert)
+		outcome, err := leg(t, expiredPool, expiredServer)
+		expect(t, outcome, err, OutcomeBlocked, errTLSUnverified, "clock skew on this host is indistinguishable from an expired portal certificate")
+	})
+}
+
+// The provider verdict across all three legs, in the cases that matter
+// operationally. The diagnostic 53 leg can lower a verdict but never raise it.
+func TestProviderVerdictCombinesTheLegs(t *testing.T) {
+	loopback := net.ParseIP("127.0.0.1")
+	cert, pool := fixtureCert(t, loopback)
+	tlsServer := startFixtureTLS(t, cert)
+	_, unrelated := fixtureCert(t, loopback)
+	resolver := startFakeResolver(t)
+	refused := closedPort(t)
+	hijacker := startHijacker(t)
+	host := []string{"127.0.0.1"}
+
+	for _, tc := range []struct {
+		name                      string
+		tlsAddr, dotAddr, dnsAddr string
+		roots                     *x509.CertPool
+		want                      Outcome
+		wantErr                   error
+	}{
+		{"a verified 443 alone is reachable", tlsServer, refused, refused, pool, OutcomeReachable, nil},
+		{"443 refused but a verified 853 is reachable", refused, tlsServer, refused, pool, OutcomeReachable, nil},
+		{"both TLS legs refused and 53 answering is NOT reachable", refused, refused, resolver, pool, OutcomeUnreachable, errDiagnosticAnswered},
+		{"no CA bundle with 53 answering is blocked, not reachable", tlsServer, tlsServer, resolver, x509.NewCertPool(), OutcomeBlocked, errTLSUnverified},
+		{"a self-signed portal on 443 and 853 with 53 echoing our query is unreachable", tlsServer, tlsServer, resolver, unrelated, OutcomeUnreachable, errTLSRejected},
+		{"a portal speaking HTTP on every port is unreachable", hijacker, hijacker, hijacker, nil, OutcomeUnreachable, errHijacked},
+		{"everything refused is unreachable", refused, refused, refused, nil, OutcomeUnreachable, syscall.ECONNREFUSED},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useLegs(t, tc.tlsAddr, tc.dotAddr, tc.dnsAddr, tc.roots)
+			outcome, err := queryProvider(context.Background(), host)
+			if outcome != tc.want {
+				t.Fatalf("outcome = %s (err %v), want %s", outcome, err, tc.want)
+			}
+			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want it to carry %v so the log explains the legs", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// Only dial-level failures classify, identically for every leg: no route is an
 // outage, a socket the host denied is Blocked.
 func TestDialLevelErrorsDecideTheVerdict(t *testing.T) {
 	for _, tc := range []struct {
@@ -322,25 +347,25 @@ func TestDialLevelErrorsDecideTheVerdict(t *testing.T) {
 		t.Cleanup(func() { dialContext = saved })
 		dialContext = func(_ context.Context, _, address string) (net.Conn, error) {
 			_, port, _ := net.SplitHostPort(address)
-			if port == tlsPort {
-				return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.EACCES}
+			if port == dnsPort {
+				return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ENETUNREACH}
 			}
-			return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ENETUNREACH}
+			return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.EACCES}
 		}
 		if outcome, _ := queryProvider(context.Background(), cloudflareAddresses); outcome != OutcomeUnreachable {
-			t.Fatalf("outcome = %s, want unreachable: the 53 leg tested the network even though 443 was denied", outcome)
+			t.Fatalf("outcome = %s, want unreachable: the diagnostic leg tested the network even though the TLS legs were denied", outcome)
 		}
 	})
 }
 
-// A host that silently drops 53 must not make every probe take the whole
-// probeTimeout once 443 has already proved the provider.
+// A host that silently drops a port must not make every probe take the whole
+// probeTimeout once a voting leg has already proved the provider.
 func TestAWinningLegCancelsTheRestOfTheProviderRace(t *testing.T) {
 	loopback := net.ParseIP("127.0.0.1")
 	cert, pool := fixtureCert(t, loopback)
 	tlsServer := startFixtureTLS(t, cert)
-	// A distinct 53 address, so the seam below can blackhole that leg alone.
-	useLegs(t, tlsServer, closedPort(t), pool)
+	// Distinct 853 and 53 addresses, so the seam below can blackhole 53 alone.
+	useLegs(t, tlsServer, closedPort(t), closedPort(t), pool)
 
 	saved := dialContext
 	t.Cleanup(func() { dialContext = saved })

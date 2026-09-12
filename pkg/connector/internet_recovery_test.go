@@ -177,17 +177,15 @@ func TestInternetRecoveryFallbackCeilingsAreOrdered(t *testing.T) {
 	if internetRecoveryBlockedGrace <= internetRecoveryPollInterval {
 		t.Fatal("the unusable-probe grace must span several poll rounds")
 	}
-	if internetRecoveryBlockedGrace >= internetRecoveryOfflineCeiling {
-		t.Fatal("an unusable probe must give up sooner than a confirmed outage")
+	if internetRecoveryHoldAlarmAfter <= internetRecoveryStablePeriod {
+		t.Fatal("the hold alarm must outlast the stability window, or a healthy recovery could alarm")
 	}
-	if internetRecoveryOfflineCeiling <= internetRecoveryStablePeriod {
-		t.Fatal("the offline ceiling must outlast the stability window")
+	if internetRecoveryHoldAlarmInterval < internetRecoveryPollInterval {
+		t.Fatal("the hold alarm must be throttled to more than one poll round")
 	}
-	// The episode cap exists to end a flapping episode the per-outage clock
-	// cannot; if it were shorter than the per-outage ceiling it would fire first
-	// on a continuous outage and the per-outage clock would lose its meaning.
-	if internetRecoveryEpisodeCeiling < internetRecoveryOfflineCeiling {
-		t.Fatal("the episode cap must not be shorter than the per-outage ceiling")
+	// Pinned with literals: the alarm cadence is what an operator is promised.
+	if internetRecoveryHoldAlarmAfter != 30*time.Minute || internetRecoveryHoldAlarmInterval != 30*time.Minute {
+		t.Fatalf("hold alarm after %v every %v, want 30m/30m", internetRecoveryHoldAlarmAfter, internetRecoveryHoldAlarmInterval)
 	}
 }
 
@@ -303,60 +301,54 @@ func TestInternetRecoveryStateRetryDelayOutlastsBridgeJitter(t *testing.T) {
 	}
 }
 
-// A link that flaps faster than the stability window can reset the per-outage
-// clock indefinitely. Without the absolute episode cap the episode never ends,
-// the client stays torn down, and no rebuild is ever requested — a silently dead
-// login on an ordinary flapping DSL or LTE line.
-func TestFlappingLinkStillHandsBackWithinTheEpisodeCap(t *testing.T) {
+// Round-10 blocker B2: a confirmed outage NEVER hands back, however long it
+// lasts and however the link flaps. A flapping link is held quietly (the alarm
+// measures the current outage, which every up phase resets); a dead link is
+// held loudly — an alarm at holdAlarmAfter and every holdAlarmInterval after.
+func TestConfirmedOutageIsHeldAppleFreeAndAlarms(t *testing.T) {
+	timing := currentRecoveryTiming()
+	const retryDelay = 7 * time.Minute
 	start := time.Unix(10_000, 0)
-	episodeStartedAt := start
-	outageStartedAt := start
+	e := newRecoveryEpisode(start)
 	now := start
+	step := func(verdict recoveryVerdict) recoveryDecision {
+		now = now.Add(internetRecoveryPollInterval)
+		return e.step(recoveryRound{now: now, verdict: verdict, retryDelay: retryDelay, timing: timing})
+	}
 
-	const upPhase = 30 * time.Second   // shorter than internetRecoveryStablePeriod
-	const downPhase = 20 * time.Minute // shorter than internetRecoveryOfflineCeiling
-
+	// Flapping for hours: up phases shorter than the stability window, down
+	// phases shorter than the alarm threshold.
 	for range 200 {
-		// Down phase: never long enough to trip the per-outage ceiling alone.
-		for elapsed := time.Duration(0); elapsed < downPhase; elapsed += internetRecoveryPollInterval {
-			now = now.Add(internetRecoveryPollInterval)
-			if internetRecoveryShouldHandBack(now, outageStartedAt, episodeStartedAt) {
-				if now.Sub(episodeStartedAt) > internetRecoveryEpisodeCeiling+downPhase {
-					t.Fatalf("handed back after %s, far past the episode cap", now.Sub(episodeStartedAt))
-				}
-				return // handed back: the loop terminates
+		for elapsed := time.Duration(0); elapsed < 20*time.Minute; elapsed += internetRecoveryPollInterval {
+			if d := step(verdictUnreachable); d.action != actionNone || d.holdAlarm {
+				t.Fatalf("flapping link at +%s: decision %+v, want nothing (no Apple contact, no alarm)", now.Sub(start), d)
 			}
 		}
-		// Up phase: resets the per-outage clock, never the episode clock.
-		now = now.Add(upPhase)
-		outageStartedAt = now
-	}
-	t.Fatalf("flapping link never handed back to bridgev2 after %s — the episode livelocked", now.Sub(episodeStartedAt))
-}
-
-func TestHandBackUsesBothClocks(t *testing.T) {
-	start := time.Unix(20_000, 0)
-
-	// Per-outage ceiling alone: a continuous outage, episode clock identical.
-	if !internetRecoveryShouldHandBack(start.Add(internetRecoveryOfflineCeiling), start, start) {
-		t.Error("a continuous outage past the ceiling must hand back")
-	}
-	if internetRecoveryShouldHandBack(start.Add(internetRecoveryOfflineCeiling-time.Second), start, start) {
-		t.Error("handed back before the ceiling")
+		for elapsed := time.Duration(0); elapsed < 30*time.Second; elapsed += internetRecoveryPollInterval {
+			if d := step(verdictReachable); d.action != actionNone {
+				t.Fatalf("flapping link at +%s: action %s on a short up phase", now.Sub(start), d.action)
+			}
+		}
 	}
 
-	// Episode cap alone. Distinct values so a swap of the last two arguments is
-	// detectable: outage clock fresh, episode clock exactly at the cap.
-	now := start.Add(internetRecoveryEpisodeCeiling)
-	freshOutage := now.Add(-internetRecoveryPollInterval)
-	if !internetRecoveryShouldHandBack(now, freshOutage, start) {
-		t.Error("an episode past its absolute cap must hand back even with a fresh outage clock")
+	// Then dead for good: alarms at the threshold and at each interval, holds
+	// throughout, never hands back.
+	outageStart := now
+	var alarms []time.Duration
+	for now.Sub(outageStart) < 3*timing.holdAlarmAfter {
+		d := step(verdictUnreachable)
+		if d.action != actionNone {
+			t.Fatalf("continuous outage at +%s: action %s, want the bridge held Apple-free", now.Sub(outageStart), d.action)
+		}
+		if d.holdAlarm {
+			alarms = append(alarms, now.Sub(outageStart))
+		}
 	}
-	// With the arguments swapped the episode clause sees a fresh clock and the
-	// outage clause sees an old one, so only the correct order is satisfied by a
-	// case where the outage clock alone is not yet due.
-	if internetRecoveryShouldHandBack(now.Add(-internetRecoveryEpisodeCeiling/2), freshOutage, start) {
-		t.Error("handed back before either clock was due")
+	if len(alarms) != 3 {
+		t.Fatalf("alarms at %v, want exactly three (at the threshold, then once per interval)", alarms)
+	}
+	if alarms[0] != timing.holdAlarmAfter || alarms[1]-alarms[0] != timing.holdAlarmInterval {
+		t.Fatalf("alarms at %v, want the first at %v and then every %v", alarms, timing.holdAlarmAfter, timing.holdAlarmInterval)
 	}
 }
 
@@ -407,20 +399,21 @@ func TestDeclineAlarmIgnoresAnUnstampedStreak(t *testing.T) {
 func scaleRecoveryTimingForTest(t *testing.T) {
 	t.Helper()
 	poll, stable := internetRecoveryPollInterval, internetRecoveryStablePeriod
-	grace, offline := internetRecoveryBlockedGrace, internetRecoveryOfflineCeiling
-	episode := internetRecoveryEpisodeCeiling
-	probe, send, delay := internetProbeFunc, sendRecoveryState, retryDelayFunc
+	grace, alarmAfter := internetRecoveryBlockedGrace, internetRecoveryHoldAlarmAfter
+	alarmInterval := internetRecoveryHoldAlarmInterval
+	probe, send, delay, notice := internetProbeFunc, sendRecoveryState, retryDelayFunc, sendRecoveryHoldNotice
 	t.Cleanup(func() {
 		internetRecoveryPollInterval, internetRecoveryStablePeriod = poll, stable
-		internetRecoveryBlockedGrace, internetRecoveryOfflineCeiling = grace, offline
-		internetRecoveryEpisodeCeiling = episode
-		internetProbeFunc, sendRecoveryState, retryDelayFunc = probe, send, delay
+		internetRecoveryBlockedGrace, internetRecoveryHoldAlarmAfter = grace, alarmAfter
+		internetRecoveryHoldAlarmInterval = alarmInterval
+		internetProbeFunc, sendRecoveryState, retryDelayFunc, sendRecoveryHoldNotice = probe, send, delay, notice
 	})
 	internetRecoveryPollInterval = time.Millisecond
 	internetRecoveryStablePeriod = 20 * time.Millisecond
 	internetRecoveryBlockedGrace = 40 * time.Millisecond
-	internetRecoveryOfflineCeiling = 200 * time.Millisecond
-	internetRecoveryEpisodeCeiling = 400 * time.Millisecond
+	internetRecoveryHoldAlarmAfter = 100 * time.Millisecond
+	internetRecoveryHoldAlarmInterval = 100 * time.Millisecond
+	sendRecoveryHoldNotice = func(*IMClient, context.Context, zerolog.Logger, string) {}
 }
 
 func reachableResult() internetprobe.Result {
@@ -433,21 +426,28 @@ func blockedResult() internetprobe.Result {
 	return internetprobe.Result{} // zero value is Blocked on both providers
 }
 
-// TestRecoveryLoopTerminatesOnEveryProbeScript drives the REAL loop. Four audit
-// rounds produced only pure-function tests of its predicates, and both of this
-// feature's worst bugs were in where those predicates were read — an exit
-// condition evaluated on one branch but not the branch the loop could persist on.
-// Only a test that runs the loop can see that class.
-func TestRecoveryLoopTerminatesOnEveryProbeScript(t *testing.T) {
+// TestRecoveryLoopEndsOnlyOnAVerdictOrCancellation drives the REAL loop. Four
+// audit rounds produced only pure-function tests of its predicates, and both of
+// this feature's worst bugs were in where those predicates were read — an exit
+// condition evaluated on one branch but not the branch the loop could persist
+// on. Only a test that runs the loop can see that class.
+//
+// Since round 10 the loop has exactly two ways to ask bridgev2 for Apple: a
+// stable, verified link (im-internet-recovered) and a probe that produced no
+// verdict at all (im-internet-probe-unusable). Every confirmed-down script —
+// continuous, flapping, or passing the main round but failing the preflight —
+// holds Apple-free for as long as it runs, alarms, and ends only when canceled.
+func TestRecoveryLoopEndsOnlyOnAVerdictOrCancellation(t *testing.T) {
 	tests := []struct {
 		name    string
 		verdict func(round int, phase string) internetprobe.Result
-		wantErr status.BridgeStateErrorCode
+		wantErr status.BridgeStateErrorCode // "" means: must never ask
+		alarms  bool
 	}{
 		{
-			name:    "continuous outage hands back at the offline ceiling",
+			name:    "continuous outage holds Apple-free and alarms",
 			verdict: func(int, string) internetprobe.Result { return unreachableResult() },
-			wantErr: "im-internet-offline-ceiling",
+			alarms:  true,
 		},
 		{
 			name:    "unusable probe hands back at the blocked grace",
@@ -455,30 +455,26 @@ func TestRecoveryLoopTerminatesOnEveryProbeScript(t *testing.T) {
 			wantErr: "im-internet-probe-unusable",
 		},
 		{
-			// The round-4 bug: main probe passes, final preflight fails, forever.
-			// The per-outage clock resets every round, so only the episode cap can
-			// end it. Before the fix this looped until the process exited.
-			name: "main probe passes but preflight always fails",
+			// The round-4 shape: main probe passes, final preflight fails,
+			// forever. It used to end at the episode ceiling; now it holds.
+			name: "main probe passes but preflight always fails: held",
 			verdict: func(_ int, phase string) internetprobe.Result {
 				if phase == "final_reconnect_preflight" {
 					return unreachableResult()
 				}
 				return reachableResult()
 			},
-			wantErr: "im-internet-offline-ceiling",
 		},
 		{
-			// The round-3 bug, now exercised through the loop rather than the
-			// predicate: up-phases shorter than the stability window, down-phases
-			// shorter than the offline ceiling, so neither normal exit fires.
-			name: "flapping link satisfies neither normal exit",
+			// The round-3 shape: up phases shorter than the stability window.
+			// It used to end at the episode ceiling; now it holds, quietly.
+			name: "flapping link is held without an alarm",
 			verdict: func(round int, _ string) internetprobe.Result {
 				if (round/3)%2 == 0 {
 					return reachableResult()
 				}
 				return unreachableResult()
 			},
-			wantErr: "im-internet-offline-ceiling",
 		},
 		{
 			name:    "healthy link recovers and requests a rebuild",
@@ -510,20 +506,49 @@ func TestRecoveryLoopTerminatesOnEveryProbeScript(t *testing.T) {
 				}
 				return true
 			}
+			var noticeMu sync.Mutex
+			var notices []string
+			sendRecoveryHoldNotice = func(_ *IMClient, _ context.Context, _ zerolog.Logger, text string) {
+				noticeMu.Lock()
+				notices = append(notices, text)
+				noticeMu.Unlock()
+			}
 
 			client := newRecoveryTestClient()
 			stop := runRecoveryLoopForTest(t, client)
 
-			select {
-			case got := <-sent:
-				if got != tc.wantErr {
-					t.Fatalf("hand-back error = %q, want %q", got, tc.wantErr)
+			if tc.wantErr != "" {
+				select {
+				case got := <-sent:
+					if got != tc.wantErr {
+						t.Fatalf("request = %q, want %q", got, tc.wantErr)
+					}
+				case <-time.After(10 * time.Second):
+					t.Fatal("loop never requested a rebuild on a script that must produce one")
 				}
-			case <-time.After(10 * time.Second):
-				t.Fatal("loop never requested a rebuild — it cannot terminate on this script")
+				stop()
+				return
 			}
 
-			stop()
+			// Many alarm thresholds' worth of scaled time: any request at all
+			// is Apple contact on a confirmed-down verdict.
+			select {
+			case got := <-sent:
+				t.Fatalf("loop asked bridgev2 for Apple with %q while the probe said down", got)
+			case <-time.After(500 * time.Millisecond):
+			}
+			stop() // the episode must end cleanly on cancellation (checked by the helper)
+			noticeMu.Lock()
+			defer noticeMu.Unlock()
+			if tc.alarms && len(notices) == 0 {
+				t.Fatal("a long confirmed outage produced no management-room notice: the hold is silent, not loud")
+			}
+			if !tc.alarms && len(notices) != 0 {
+				t.Fatalf("a flapping or preflight-failing link raised %d hold notices; the alarm must measure the current outage", len(notices))
+			}
+			if tc.alarms && !strings.Contains(notices[0], "will not be contacted") {
+				t.Fatalf("notice %q does not tell the operator Apple is being held off", notices[0])
+			}
 		})
 	}
 }
@@ -538,8 +563,6 @@ func TestBlockedRoundDoesNotWithdrawAPendingRebuild(t *testing.T) {
 	// handled by the Blocked arm. Without this the probeUnusable hatch absorbs
 	// them and the test stops proving anything about that arm.
 	internetRecoveryBlockedGrace = time.Hour
-	internetRecoveryOfflineCeiling = time.Hour
-	internetRecoveryEpisodeCeiling = time.Hour
 
 	var mu sync.Mutex
 	round := 0
@@ -587,33 +610,25 @@ func TestBlockedRoundDoesNotWithdrawAPendingRebuild(t *testing.T) {
 	}
 }
 
-// After a ceiling hand-back the loop must keep working. Without re-arming both
-// clocks, the episode clause latches and the hand-back arm absorbs EVERY later
-// round: the stability window and final preflight never run again, the decline
-// alarm goes dark, and a fully reachable round reports "Cannot confirm Internet
-// connectivity". So a link that recovers after a hand-back must still be able to
+// After an unusable-probe hand-back the loop must keep working. Without
+// re-arming its clocks, the hand-back arm absorbs EVERY later round: the
+// stability window and final preflight never run again, the decline alarm goes
+// dark, and a fully reachable round reports "no connectivity signal". So a link
+// whose probe starts working again after a hand-back must still be able to
 // produce a normal im-internet-recovered request.
-func TestLoopStillRecoversNormallyAfterACeilingHandBack(t *testing.T) {
+func TestLoopStillRecoversNormallyAfterAnUnusableProbeHandBack(t *testing.T) {
 	scaleRecoveryTimingForTest(t)
 	retryDelayFunc = func(time.Duration) time.Duration { return 10 * time.Millisecond }
 
-	// Phase 1 FLAPS rather than staying down, so the per-outage clock keeps
-	// resetting and the hand-back can only come from the EPISODE cap — which is
-	// the clock whose failure to re-arm latches the hand-back arm forever.
 	var mu sync.Mutex
 	healthy := false
-	round := 0
 	internetProbeFunc = func(_ context.Context, _ string) internetprobe.Result {
 		mu.Lock()
 		defer mu.Unlock()
 		if healthy {
 			return reachableResult()
 		}
-		round++
-		if (round/3)%2 == 0 {
-			return reachableResult()
-		}
-		return unreachableResult()
+		return blockedResult()
 	}
 
 	handedBack := make(chan struct{})
@@ -621,7 +636,7 @@ func TestLoopStillRecoversNormallyAfterACeilingHandBack(t *testing.T) {
 	var once, onceR sync.Once
 	sendRecoveryState = func(_ *bridgev2.Bridge, _ *bridgev2.BridgeStateQueue, st status.BridgeState) bool {
 		switch st.Error {
-		case "im-internet-offline-ceiling":
+		case "im-internet-probe-unusable":
 			once.Do(func() { close(handedBack) })
 		case "im-internet-recovered":
 			onceR.Do(func() { close(recovered) })
@@ -635,9 +650,10 @@ func TestLoopStillRecoversNormallyAfterACeilingHandBack(t *testing.T) {
 	select {
 	case <-handedBack:
 	case <-time.After(10 * time.Second):
-		t.Fatal("never reached the ceiling hand-back")
+		t.Fatal("never reached the unusable-probe hand-back")
 	}
-	// bridgev2 declined (the loop is still alive), and now the link comes back.
+	// bridgev2 declined (the loop is still alive), and now the probe works and
+	// the link is up.
 	mu.Lock()
 	healthy = true
 	mu.Unlock()
@@ -650,43 +666,41 @@ func TestLoopStillRecoversNormallyAfterACeilingHandBack(t *testing.T) {
 	stop()
 }
 
-// Round-6 audit finding #1, now pinned.
+// Round-6 audit finding #1, now pinned for the one hand-back that remains.
 //
-// A ceiling hand-back must survive long enough for bridgev2 to act on it.
+// A hand-back must survive long enough for bridgev2 to act on it.
 // unknownErrorReconnect waits UnknownErrorAutoReconnect (4-6 min jittered with
 // this connector's forced 5m) and THEN re-checks: it declines if any newer
 // bridge state was sent (bridgestate.go `triggeredBy.Timestamp != prev.Timestamp`,
 // and `prevUnsent.StateEvent != status.StateUnknownError` — the latter is set
 // unconditionally by Send() before any dedup, so a differing state always
 // cancels). So any StateTransientDisconnect emitted after the hand-back cancels
-// the rebuild.
-//
-// Re-arming BOTH clocks in the hand-back arm makes internetRecoveryShouldHandBack
-// go false immediately, so the very next round (one poll interval later) falls
-// into `case !result.Reachable():`, sees reconnectRequested, and withdraws —
-// 10 seconds after asking, inside bridgev2's own wait. The ceiling therefore
-// never produces a rebuild in the one scenario it was written for: a probe with
-// a permanent false negative (egress that allows APNs but drops 1.1.1.1/8.8.8.8).
-// The transition function keys withdrawal on the pending request's KIND, so a
-// hand-back cannot be withdrawn whatever the clocks do; this test drives the
-// real loop to prove the wiring agrees with the table.
-func TestCeilingHandBackIsNotWithdrawnWhileStillUnreachable(t *testing.T) {
+// the rebuild. The transition function keys withdrawal on the pending request's
+// KIND, so a hand-back cannot be withdrawn whatever the verdicts do; this test
+// drives the real loop through an unusable probe that then turns into a
+// confirmed outage, to prove the wiring agrees with the table.
+func TestUnusableProbeHandBackIsNotWithdrawnByALaterOutageVerdict(t *testing.T) {
 	scaleRecoveryTimingForTest(t)
 
+	var mu sync.Mutex
+	sawHandBack := false
 	internetProbeFunc = func(context.Context, string) internetprobe.Result {
-		return unreachableResult()
+		mu.Lock()
+		defer mu.Unlock()
+		if sawHandBack {
+			return unreachableResult()
+		}
+		return blockedResult()
 	}
 
 	handedBack := make(chan struct{})
 	withdrawn := make(chan status.BridgeStateErrorCode, 1)
 	var once sync.Once
-	var mu sync.Mutex
-	sawHandBack := false
 	sendRecoveryState = func(_ *bridgev2.Bridge, _ *bridgev2.BridgeStateQueue, st status.BridgeState) bool {
 		mu.Lock()
 		defer mu.Unlock()
 		switch {
-		case st.Error == "im-internet-offline-ceiling":
+		case st.Error == "im-internet-probe-unusable":
 			sawHandBack = true
 			once.Do(func() { close(handedBack) })
 		case sawHandBack && st.StateEvent == status.StateTransientDisconnect:
@@ -704,13 +718,13 @@ func TestCeilingHandBackIsNotWithdrawnWhileStillUnreachable(t *testing.T) {
 	select {
 	case <-handedBack:
 	case <-time.After(10 * time.Second):
-		t.Fatal("never reached the ceiling hand-back")
+		t.Fatal("never reached the unusable-probe hand-back")
 	}
-	// Many poll rounds' worth of scaled time: long enough for the withdrawal to
+	// Many poll rounds' worth of scaled time: long enough for a withdrawal to
 	// happen, far shorter than bridgev2's real reconnect wait.
 	select {
 	case code := <-withdrawn:
-		t.Fatalf("the ceiling hand-back was withdrawn with %q while the probe still reported unreachable — bridgev2's pending unknownErrorReconnect will decline and the client is never rebuilt", code)
+		t.Fatalf("the hand-back was withdrawn with %q on a later unreachable verdict — bridgev2's pending unknownErrorReconnect will decline and the client is never rebuilt", code)
 	case <-time.After(500 * time.Millisecond):
 	}
 }
@@ -862,7 +876,7 @@ func TestLoopHoldsRepeatHandBacksBehindTheBackoff(t *testing.T) {
 	retryDelayFunc = func(time.Duration) time.Duration { return time.Millisecond }
 
 	internetProbeFunc = func(context.Context, string) internetprobe.Result {
-		return unreachableResult()
+		return blockedResult()
 	}
 
 	var mu sync.Mutex
@@ -870,7 +884,7 @@ func TestLoopHoldsRepeatHandBacksBehindTheBackoff(t *testing.T) {
 	first := make(chan struct{})
 	var once sync.Once
 	sendRecoveryState = func(_ *bridgev2.Bridge, _ *bridgev2.BridgeStateQueue, st status.BridgeState) bool {
-		if st.Error == "im-internet-offline-ceiling" {
+		if st.Error == "im-internet-probe-unusable" {
 			mu.Lock()
 			handBacks++
 			mu.Unlock()
@@ -905,10 +919,10 @@ func TestLoopHoldsRepeatHandBacksBehindTheBackoff(t *testing.T) {
 func TestRecoveryStepDecisionTable(t *testing.T) {
 	now := time.Unix(100_000, 0)
 	timing := recoveryTiming{
-		stablePeriod:   60 * time.Second,
-		blockedGrace:   2 * time.Minute,
-		offlineCeiling: 30 * time.Minute,
-		episodeCeiling: 60 * time.Minute,
+		stablePeriod:      60 * time.Second,
+		blockedGrace:      2 * time.Minute,
+		holdAlarmAfter:    30 * time.Minute,
+		holdAlarmInterval: 30 * time.Minute,
 	}
 	const retryDelay = 7 * time.Minute
 	ago := func(d time.Duration) time.Time { return now.Add(-d) }
@@ -962,13 +976,13 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			want:    recoveryDecision{stabilityReset: true},
 		},
 		{
-			// Round-8 survivor: without the reset, the offline ceiling fires
-			// 30m after the EPISODE began regardless of recovery, doubling
-			// Apple contact on a flapping link.
-			name: "clause 1: a reachable round ends the current outage, so a stale outage clock cannot fire the ceiling",
+			// Round-8 survivor: without the reset, the hold alarm measures
+			// from the EPISODE start regardless of recovery and cries wolf on
+			// a flapping link.
+			name: "clause 1: a reachable round ends the current outage, so a stale outage clock cannot raise the hold alarm",
 			episode: func() *recoveryEpisode {
 				e := stabilizingFor(fresh(), 30*time.Second)
-				e.outageStartedAt = ago(timing.offlineCeiling)
+				e.outageStartedAt = ago(timing.holdAlarmAfter)
 				return e
 			},
 			verdict: verdictReachable,
@@ -1009,10 +1023,10 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			},
 		},
 		{
-			name: "clause 3: withdrawal outranks a due ceiling on the same round",
+			name: "clause 3: withdrawal outranks a due hold alarm on the same round",
 			episode: func() *recoveryEpisode {
 				e := pendingSince(fresh(), pendingRecovered, 10*time.Minute)
-				e.outageStartedAt = ago(timing.offlineCeiling)
+				e.outageStartedAt = ago(timing.holdAlarmAfter)
 				return e
 			},
 			verdict: verdictUnreachable,
@@ -1028,7 +1042,7 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			pending: pendingRecovered,
 		},
 		{
-			// The round-5 finding: a ceiling hand-back withdrawn one poll later
+			// The round-5 finding: a hand-back withdrawn one poll later
 			// meant zero honored hand-backs. Structurally impossible now — the
 			// kind, not the clocks, decides.
 			name:    "clause 3: unreachable never withdraws a pending hand-back",
@@ -1061,14 +1075,14 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			pending: pendingRecovered,
 		},
 		{
-			// THE round-7 finding. The episode cap is due, the re-ask gate is
-			// shut, and the link is healthy. The old arms routed this into the
-			// hand-back arm forever; the gate now comes first, so the window keeps
-			// accumulating and nothing is requested until the gate opens.
-			name: "clause 5: a recent request blocks the ceiling from preempting a healthy link",
+			// THE round-7 finding. The re-ask gate is shut and the link is
+			// healthy. The old arms routed this into the hand-back arm forever;
+			// the gate now comes first, so the window keeps accumulating and
+			// nothing is requested until the gate opens.
+			name: "clause 5: a recent request keeps the gate shut on a healthy link",
 			episode: func() *recoveryEpisode {
 				e := pendingSince(stabilizingFor(fresh(), timing.stablePeriod), pendingHandBack, time.Minute)
-				e.startedAt = ago(timing.episodeCeiling + time.Minute)
+				e.startedAt = ago(3 * time.Hour)
 				return e
 			},
 			verdict: verdictReachable,
@@ -1081,10 +1095,10 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			},
 		},
 		{
-			name: "clause 5: a recent request also blocks a due ceiling on an unreachable link",
+			name: "clause 5: a recent request also defers the hold alarm on an unreachable link",
 			episode: func() *recoveryEpisode {
 				e := pendingSince(fresh(), pendingHandBack, time.Minute)
-				e.outageStartedAt = ago(timing.offlineCeiling + time.Minute)
+				e.outageStartedAt = ago(timing.holdAlarmAfter + time.Minute)
 				return e
 			},
 			verdict: verdictUnreachable,
@@ -1092,13 +1106,13 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			pending: pendingHandBack,
 		},
 		{
-			// Mutation-1 territory: the connector backoff is longer than every
-			// ceiling and holding. The normal path must still win on a stable
-			// link, or the backoff starves recovery.
-			name: "clause 6: the normal exit beats a due ceiling even while the backoff holds",
+			// Mutation-1 territory: the connector backoff is holding. The
+			// normal path must still win on a stable link, or the backoff
+			// starves recovery.
+			name: "clause 6: the normal exit wins even while the backoff holds",
 			episode: func() *recoveryEpisode {
 				e := pendingSince(stabilizingFor(fresh(), timing.stablePeriod), pendingHandBack, retryDelay)
-				e.startedAt = ago(timing.episodeCeiling + time.Minute)
+				e.startedAt = ago(3 * time.Hour)
 				return e
 			},
 			verdict: verdictReachable,
@@ -1107,23 +1121,17 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			pending: pendingHandBack,
 		},
 		{
-			// The round-4 finding: main probe passes, preflight always fails, the
-			// window never completes. Only the episode cap can end it, so a
-			// reachable round that is NOT ready must still be able to hand back.
-			name: "clause 7: the episode cap hands back on a reachable round that never stabilizes",
+			// Round-10 B2: the round-4 shape (main probe passes, preflight
+			// always fails) used to end at the episode ceiling. A reachable
+			// round that is not yet stable now holds, however old the episode.
+			name: "clause 7: a reachable round that never stabilizes is held, not handed back",
 			episode: func() *recoveryEpisode {
 				e := stabilizingFor(fresh(), 10*time.Second)
-				e.startedAt = ago(timing.episodeCeiling)
+				e.startedAt = ago(3 * time.Hour)
 				return e
 			},
 			verdict: verdictReachable,
-			want:    recoveryDecision{action: actionHandBack, handBackCode: handBackCodeCeiling},
-			pending: pendingHandBack,
-			after: func(t *testing.T, e *recoveryEpisode) {
-				if !e.startedAt.Equal(now) {
-					t.Error("a hand-back send must re-arm the episode clock")
-				}
-			},
+			want:    recoveryDecision{},
 		},
 		{
 			name: "clause 7: an unusable probe hands back after the blocked grace",
@@ -1147,50 +1155,89 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			want:    recoveryDecision{},
 		},
 		{
-			name: "clause 7: a continuous outage hands back at the offline ceiling",
+			// Round-10 B2, the load-bearing case: a confirmed outage NEVER
+			// hands back. At the alarm threshold it alarms and keeps holding.
+			name: "clause 7: a continuous outage is held Apple-free and alarms at the threshold",
 			episode: func() *recoveryEpisode {
 				e := fresh()
-				e.outageStartedAt = ago(timing.offlineCeiling)
+				e.outageStartedAt = ago(timing.holdAlarmAfter)
 				return e
 			},
 			verdict: verdictUnreachable,
-			want:    recoveryDecision{action: actionHandBack, handBackCode: handBackCodeCeiling},
-			pending: pendingHandBack,
+			want:    recoveryDecision{holdAlarm: true},
+			after: func(t *testing.T, e *recoveryEpisode) {
+				if !e.lastHoldAlarmAt.Equal(now) {
+					t.Error("the alarm must stamp its throttle clock")
+				}
+			},
 		},
 		{
-			name: "clause 7: nothing is due before either ceiling",
+			name: "clause 7: a continuous outage below the threshold is held silently",
 			episode: func() *recoveryEpisode {
 				e := fresh()
-				e.outageStartedAt = ago(timing.offlineCeiling - time.Second)
-				e.startedAt = ago(timing.episodeCeiling - time.Second)
+				e.outageStartedAt = ago(timing.holdAlarmAfter - time.Second)
+				e.startedAt = ago(3 * time.Hour)
 				return e
 			},
 			verdict: verdictUnreachable,
 			want:    recoveryDecision{},
 		},
 		{
-			// The round-3 finding: a flapping link resets the outage clock
-			// forever; the episode clock must still end the episode.
-			name: "clause 7: the episode cap hands back with a fresh outage clock",
+			name: "clause 7: the hold alarm is throttled to its interval",
+			episode: func() *recoveryEpisode {
+				e := fresh()
+				e.outageStartedAt = ago(2 * timing.holdAlarmAfter)
+				e.lastHoldAlarmAt = ago(timing.holdAlarmInterval - time.Second)
+				return e
+			},
+			verdict: verdictUnreachable,
+			want:    recoveryDecision{},
+		},
+		{
+			name: "clause 7: the hold alarm fires again once its interval elapses",
+			episode: func() *recoveryEpisode {
+				e := fresh()
+				e.outageStartedAt = ago(2 * timing.holdAlarmAfter)
+				e.lastHoldAlarmAt = ago(timing.holdAlarmInterval)
+				return e
+			},
+			verdict: verdictUnreachable,
+			want:    recoveryDecision{holdAlarm: true},
+		},
+		{
+			// The round-3 shape: a flapping link resets the outage clock forever.
+			// It used to be ended by the episode clock; now it is simply held,
+			// and quietly — the alarm measures the current outage.
+			name: "clause 7: a flapping link with an old episode is held without an alarm",
 			episode: func() *recoveryEpisode {
 				e := fresh()
 				e.outageStartedAt = ago(time.Minute)
-				e.startedAt = ago(timing.episodeCeiling)
+				e.startedAt = ago(3 * time.Hour)
 				return e
 			},
 			verdict: verdictUnreachable,
-			want:    recoveryDecision{action: actionHandBack, handBackCode: handBackCodeCeiling},
-			pending: pendingHandBack,
+			want:    recoveryDecision{},
 		},
 		{
-			name: "clause 7: a re-ask after the gate opens is a hand-back again while still unreachable",
+			name: "clause 7: a blocked round inside the grace neither alarms nor hands back",
 			episode: func() *recoveryEpisode {
-				e := pendingSince(fresh(), pendingHandBack, retryDelay)
-				e.outageStartedAt = ago(timing.offlineCeiling + retryDelay)
+				e := fresh()
+				e.outageStartedAt = ago(2 * timing.holdAlarmAfter)
+				e.lastNetworkVerdict = ago(time.Second)
 				return e
 			},
-			verdict: verdictUnreachable,
-			want:    recoveryDecision{action: actionHandBack, handBackCode: handBackCodeCeiling},
+			verdict: verdictBlocked,
+			want:    recoveryDecision{},
+		},
+		{
+			name: "clause 7: a re-ask after the gate opens is a hand-back again while the probe is still unusable",
+			episode: func() *recoveryEpisode {
+				e := pendingSince(fresh(), pendingHandBack, retryDelay)
+				e.lastNetworkVerdict = ago(timing.blockedGrace + retryDelay)
+				return e
+			},
+			verdict: verdictBlocked,
+			want:    recoveryDecision{action: actionHandBack, handBackCode: handBackCodeProbeUnusable},
 			pending: pendingHandBack,
 			after: func(t *testing.T, e *recoveryEpisode) {
 				if e.attempt != 2 {
@@ -1206,12 +1253,12 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			name: "clause 7: a hand-back re-arms the hold log so the next hold logs again",
 			episode: func() *recoveryEpisode {
 				e := fresh()
-				e.outageStartedAt = ago(timing.offlineCeiling)
+				e.lastNetworkVerdict = ago(timing.blockedGrace)
 				e.lastHoldLogAt = ago(time.Minute)
 				return e
 			},
-			verdict: verdictUnreachable,
-			want:    recoveryDecision{action: actionHandBack, handBackCode: handBackCodeCeiling},
+			verdict: verdictBlocked,
+			want:    recoveryDecision{action: actionHandBack, handBackCode: handBackCodeProbeUnusable},
 			pending: pendingHandBack,
 			after: func(t *testing.T, e *recoveryEpisode) {
 				// Logging-only survivor: without the clear, the first hold of
@@ -1225,10 +1272,10 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			name: "clause 7: the backoff hold is logged on its first round",
 			episode: func() *recoveryEpisode {
 				e := pendingSince(fresh(), pendingHandBack, retryDelay)
-				e.outageStartedAt = ago(timing.offlineCeiling + retryDelay)
+				e.lastNetworkVerdict = ago(timing.blockedGrace + retryDelay)
 				return e
 			},
-			verdict: verdictUnreachable,
+			verdict: verdictBlocked,
 			hold:    5 * time.Minute,
 			want:    recoveryDecision{holdLog: true},
 			pending: pendingHandBack,
@@ -1245,11 +1292,11 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			name: "clause 7: the backoff hold is silent inside the throttle interval",
 			episode: func() *recoveryEpisode {
 				e := pendingSince(fresh(), pendingHandBack, retryDelay)
-				e.outageStartedAt = ago(timing.offlineCeiling + retryDelay)
+				e.lastNetworkVerdict = ago(timing.blockedGrace + retryDelay)
 				e.lastHoldLogAt = ago(retryDelay - time.Second)
 				return e
 			},
-			verdict: verdictUnreachable,
+			verdict: verdictBlocked,
 			hold:    5 * time.Minute,
 			want:    recoveryDecision{},
 			pending: pendingHandBack,
@@ -1258,11 +1305,11 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			name: "clause 7: the backoff hold logs again once the throttle interval elapses",
 			episode: func() *recoveryEpisode {
 				e := pendingSince(fresh(), pendingHandBack, retryDelay)
-				e.outageStartedAt = ago(timing.offlineCeiling + retryDelay)
+				e.lastNetworkVerdict = ago(timing.blockedGrace + retryDelay)
 				e.lastHoldLogAt = ago(retryDelay)
 				return e
 			},
-			verdict: verdictUnreachable,
+			verdict: verdictBlocked,
 			hold:    5 * time.Minute,
 			want:    recoveryDecision{holdLog: true},
 			pending: pendingHandBack,
@@ -1371,34 +1418,35 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 }
 
 // TestRecoveryIsIndependentOfTimingOrder drives the pure transition function
-// through a simulated outage-then-recovery on every ordering of the three
-// timing knobs an operator can move against each other: the re-ask gate
-// (unknown_error_auto_reconnect, floor only), the connector backoff, and the
-// episode ceiling. The round-7 latch needed one specific ordering (gate or
-// backoff longer than the ceiling); this test asserts that NO ordering can keep
-// a healthy link from producing im-internet-recovered within one gate of the
-// link coming back. It runs in simulated time, so the real production values
-// are used unscaled.
+// through a simulated outage-then-recovery on every ordering of the timing
+// knobs an operator can move against each other: the re-ask gate
+// (unknown_error_auto_reconnect, floor only) and the connector backoff. The
+// round-7 latch needed one specific ordering; this test asserts that NO
+// ordering can keep a healthy link from producing im-internet-recovered within
+// one gate of the link coming back — and, since round 10, that no ordering
+// makes a confirmed outage contact Apple, however long it runs. It runs in
+// simulated time, so the real production values are used unscaled.
 func TestRecoveryIsIndependentOfTimingOrder(t *testing.T) {
 	timing := recoveryTiming{
-		stablePeriod:   60 * time.Second,
-		blockedGrace:   2 * time.Minute,
-		offlineCeiling: 30 * time.Minute,
-		episodeCeiling: 60 * time.Minute,
+		stablePeriod:      60 * time.Second,
+		blockedGrace:      2 * time.Minute,
+		holdAlarmAfter:    30 * time.Minute,
+		holdAlarmInterval: 30 * time.Minute,
 	}
 	const poll = 10 * time.Second
 	for _, retryDelay := range []time.Duration{
 		internetRecoveryStateRetryDelay(5 * time.Minute),  // the forced floor
 		internetRecoveryStateRetryDelay(60 * time.Minute), // unknown_error_auto_reconnect: 60m
 	} {
-		for _, hold := range []time.Duration{0, recoveryHandBackMaxDelay, 2 * timing.episodeCeiling} {
+		for _, hold := range []time.Duration{0, recoveryHandBackMaxDelay, 4 * time.Hour} {
 			name := "retry=" + retryDelay.String() + "/hold=" + hold.String()
 			t.Run(name, func(t *testing.T) {
 				start := time.Unix(200_000, 0)
 				e := newRecoveryEpisode(start)
 				now := start
-				outageEnd := start.Add(2 * timing.episodeCeiling)
-				var recoveredAt, handBackAt time.Time
+				outageEnd := start.Add(3 * time.Hour)
+				var recoveredAt time.Time
+				alarms := 0
 				deadline := outageEnd.Add(timing.stablePeriod + retryDelay + 2*poll)
 				for now.Before(deadline) {
 					now = now.Add(poll)
@@ -1409,12 +1457,7 @@ func TestRecoveryIsIndependentOfTimingOrder(t *testing.T) {
 					d := e.step(recoveryRound{now: now, verdict: verdict, retryDelay: retryDelay, handBackHold: hold, timing: timing})
 					switch d.action {
 					case actionHandBack:
-						if verdict == verdictReachable {
-							t.Fatalf("hand-back requested on a reachable round at +%s", now.Sub(start))
-						}
-						if handBackAt.IsZero() {
-							handBackAt = now
-						}
+						t.Fatalf("hand-back requested at +%s on a %s verdict: a confirmed outage must never contact Apple", now.Sub(start), verdict)
 					case actionWithdraw:
 						t.Fatalf("withdrawal at +%s with nothing to withdraw", now.Sub(start))
 					case actionPreflight:
@@ -1422,15 +1465,15 @@ func TestRecoveryIsIndependentOfTimingOrder(t *testing.T) {
 							recoveredAt = now
 						}
 					}
+					if d.holdAlarm {
+						alarms++
+					}
 					if !recoveredAt.IsZero() {
 						break
 					}
 				}
-				if hold == 0 && handBackAt.IsZero() {
-					t.Fatal("an unheld outage past both ceilings must hand back")
-				}
-				if hold > 0 && !handBackAt.IsZero() {
-					t.Fatal("a held hand-back was sent anyway")
+				if alarms != 5 {
+					t.Fatalf("hold alarms = %d over a 3h outage, want 5 (at 30m, then every 30m until the link returns at 3h)", alarms)
 				}
 				if recoveredAt.IsZero() {
 					t.Fatalf("the link came back at +%s and no im-internet-recovered followed within stability+retryDelay — the episode latched", outageEnd.Sub(start))
@@ -1440,31 +1483,25 @@ func TestRecoveryIsIndependentOfTimingOrder(t *testing.T) {
 	}
 }
 
-// Round-7 audit finding #1, now pinned.
+// Round-7 audit finding #1, now pinned for the one hand-back that remains.
 //
-// The old hand-back arm re-armed episodeStartedAt ONLY after a successful send;
-// both of its gated exits (the episode-local retryDelay gate and the
-// connector-level backoff hold) left it stale. Once the episode clause came due
-// nothing could clear it, so armHandBack absorbed EVERY later round and the
-// stability window, the final preflight, the decline alarm and the
-// im-internet-recovered request were dead for the rest of the episode — on a
-// link the probe reported as fully healthy.
+// The old hand-back arm re-armed its clock ONLY after a successful send; both
+// of its gated exits (the episode-local retryDelay gate and the connector-level
+// backoff hold) left it stale, and once the hand-back clause came due nothing
+// could clear it, so the arm absorbed EVERY later round and the stability
+// window, the final preflight, the decline alarm and the im-internet-recovered
+// request were dead for the rest of the episode — on a link the probe reported
+// as fully healthy.
 //
-// The latch needed the episode clause to come due while a gate was closed, i.e.
-// max(retryDelay, handBackDelay(n)) >= internetRecoveryEpisodeCeiling. retryDelay
-// derives from UnknownErrorAutoReconnect, on which connector.go only raises a
-// FLOOR ("an explicit larger value is kept"), so unknown_error_auto_reconnect:
-// 60m gave retryDelay = 73m against a 60m ceiling and the latch was permanent.
-//
-// This fixture mirrors that ratio (retryDelay 800ms vs a 400ms scaled episode
-// ceiling) and then makes the link perfectly healthy. The transition function
-// evaluates the re-ask gate BEFORE the ceiling, so the ordering of those knobs
-// is no longer load-bearing (TestRecoveryIsIndependentOfTimingOrder covers every
-// ordering in simulated time); this test drives the real loop for one of them.
-func TestLoopStillReachesTheRecoveredPathAfterTheRetryGateAbsorbsAnEpisodeClause(t *testing.T) {
+// This fixture makes the re-ask gate (800ms) far longer than the scaled
+// unusable-probe grace (40ms), sends one unusable-probe hand-back, keeps the
+// probe unusable while the gate is shut, and then makes the link perfectly
+// healthy. The transition function evaluates the re-ask gate BEFORE the
+// hand-back clause, so the ordering of those knobs is not load-bearing
+// (TestRecoveryIsIndependentOfTimingOrder covers every ordering in simulated
+// time); this test drives the real loop for one of them.
+func TestLoopStillReachesTheRecoveredPathAfterTheRetryGateAbsorbsAHandBack(t *testing.T) {
 	scaleRecoveryTimingForTest(t)
-	// Mirrors unknown_error_auto_reconnect >= 50m: the re-ask gate is longer than
-	// the absolute episode cap, so the cap comes due while the gate is shut.
 	retryDelayFunc = func(time.Duration) time.Duration { return 800 * time.Millisecond }
 
 	var mu sync.Mutex
@@ -1475,7 +1512,7 @@ func TestLoopStillReachesTheRecoveredPathAfterTheRetryGateAbsorbsAnEpisodeClause
 		if healthy {
 			return reachableResult()
 		}
-		return unreachableResult()
+		return blockedResult()
 	}
 
 	handedBack := make(chan struct{})
@@ -1483,7 +1520,7 @@ func TestLoopStillReachesTheRecoveredPathAfterTheRetryGateAbsorbsAnEpisodeClause
 	var onceH, onceR sync.Once
 	sendRecoveryState = func(_ *bridgev2.Bridge, _ *bridgev2.BridgeStateQueue, st status.BridgeState) bool {
 		switch st.Error {
-		case "im-internet-offline-ceiling":
+		case "im-internet-probe-unusable":
 			onceH.Do(func() { close(handedBack) })
 		case "im-internet-recovered":
 			onceR.Do(func() { close(recovered) })
@@ -1497,7 +1534,7 @@ func TestLoopStillReachesTheRecoveredPathAfterTheRetryGateAbsorbsAnEpisodeClause
 	select {
 	case <-handedBack:
 	case <-time.After(10 * time.Second):
-		t.Fatal("never reached the ceiling hand-back")
+		t.Fatal("never reached the unusable-probe hand-back")
 	}
 	// bridgev2 declined the hand-back (the loop is still alive), and the link is
 	// now healthy. The loop must be able to run the stability window and final
@@ -1509,17 +1546,17 @@ func TestLoopStillReachesTheRecoveredPathAfterTheRetryGateAbsorbsAnEpisodeClause
 	select {
 	case <-recovered:
 	case <-time.After(10 * time.Second):
-		t.Fatal("a fully reachable link never produced im-internet-recovered: the episode clause latched on a retryDelay break that does not re-arm episodeStartedAt, so armHandBack absorbs every round and the stability/preflight path is dead for the rest of the episode")
+		t.Fatal("a fully reachable link never produced im-internet-recovered: the hand-back clause latched on a retryDelay break, so it absorbs every round and the stability/preflight path is dead for the rest of the episode")
 	}
 }
 
 // The other gated exit of the old hand-back arm: the connector-level backoff.
 // Here the backoff is already widened (two hand-backs on record, so the next is
-// held for 14 minutes — far longer than every scaled ceiling), the outage runs
-// past both ceilings with the hand-back HELD the whole time, and then the link
-// comes back. A latched loop sits behind the hold forever; the transition
-// function must run the stability window and preflight and produce
-// im-internet-recovered, and must never have sent a ceiling hand-back.
+// held for 14 minutes — far longer than this test runs), the outage runs for a
+// long time with the hold in force, and then the link comes back. A latched
+// loop sits behind the hold forever; the transition function must run the
+// stability window and preflight and produce im-internet-recovered, and must
+// never have sent a hand-back of any kind.
 func TestLoopStillReachesTheRecoveredPathWhileTheConnectorBackoffHolds(t *testing.T) {
 	scaleRecoveryTimingForTest(t)
 	retryDelayFunc = func(time.Duration) time.Duration { return 10 * time.Millisecond }
@@ -1541,7 +1578,7 @@ func TestLoopStillReachesTheRecoveredPathWhileTheConnectorBackoffHolds(t *testin
 	var handBacks int
 	sendRecoveryState = func(_ *bridgev2.Bridge, _ *bridgev2.BridgeStateQueue, st status.BridgeState) bool {
 		switch st.Error {
-		case "im-internet-offline-ceiling", "im-internet-probe-unusable":
+		case "im-internet-probe-unusable":
 			stateMu.Lock()
 			handBacks++
 			stateMu.Unlock()
@@ -1557,7 +1594,7 @@ func TestLoopStillReachesTheRecoveredPathWhileTheConnectorBackoffHolds(t *testin
 	client.Main.noteHandBack(client.UserLogin.ID, start)
 	runRecoveryLoopForTest(t, client)
 
-	// Well past both scaled ceilings (200ms / 400ms), with the hold in force.
+	// Many scaled alarm thresholds, with the hold in force.
 	time.Sleep(600 * time.Millisecond)
 	mu.Lock()
 	healthy = true
@@ -1566,7 +1603,7 @@ func TestLoopStillReachesTheRecoveredPathWhileTheConnectorBackoffHolds(t *testin
 	select {
 	case <-recovered:
 	case <-time.After(10 * time.Second):
-		t.Fatal("a healthy link never produced im-internet-recovered while the connector backoff held the ceiling hand-back — the hold starved the stability path")
+		t.Fatal("a healthy link never produced im-internet-recovered while the connector backoff held — the hold starved the stability path")
 	}
 	stateMu.Lock()
 	defer stateMu.Unlock()

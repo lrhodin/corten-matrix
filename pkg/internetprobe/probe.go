@@ -2,26 +2,33 @@
 // reachability check and recovery-stability tracker.
 //
 // The probe contacts two public providers (Cloudflare and Google) at literal
-// addresses and demands proof that it reached the real host. Two proofs are
-// accepted, raced per provider and per address family:
+// addresses and demands proof that it reached the real host. The selection
+// criterion for a leg that may vote Reachable is AUTHENTICATION, not port
+// availability: a verdict of "up" authorizes contacting Apple, so every leg
+// that can produce it must be something an intermediary cannot forge. Two such
+// legs are raced per provider and per address family, both a TLS handshake
+// validated against the dialed IP literal:
 //
-//   - TLS on 443 with certificate validation — the primary check. A completed
-//     handshake whose certificate chains to a trusted root and carries the
-//     dialed IP in its SANs (cloudflare-dns.com lists 1.1.1.1/1.0.0.1 and their
-//     IPv6 twins; dns.google lists 8.8.8.8/8.8.4.4 and theirs) is cryptographic
-//     proof that we spoke to the provider. A captive portal or a transparently
-//     proxying ISP can accept the connection and can even echo a DNS
-//     transaction id, but it cannot forge a certificate for 1.1.1.1. And 443
-//     is essentially never blocked outbound.
-//   - DNS-over-TCP on 53 with reply validation — the fallback. VPS providers
-//     commonly block outbound 53 to prevent DNS-amplification abuse, so it is
-//     not the primary check any more, but it is what still works on a host
-//     whose 443 is blocked or whose TLS stack cannot validate anything. A
-//     matching transaction id with QR set proves a real resolver answered.
+//   - TLS on 443 — the primary check. A completed handshake whose certificate
+//     chains to a trusted root and carries the dialed IP in its SANs
+//     (cloudflare-dns.com lists 1.1.1.1/1.0.0.1 and their IPv6 twins;
+//     dns.google lists 8.8.8.8/8.8.4.4 and theirs) is cryptographic proof that
+//     we spoke to the provider. 443 is essentially never blocked outbound.
+//   - TLS on 853 (the DNS-over-TLS port) — the fallback for a network that
+//     does block or intercept 443. Both providers present the same validated
+//     certificates there, so it is exactly as unforgeable.
 //
-// Port 80 was considered and rejected: a captive portal answers 80 with a
-// redirect, and so does 1.1.1.1 itself, so there is nothing to validate and it
-// would reopen the exact hole reply validation exists to close. Do not add it.
+// Plaintext DNS on 53 is NOT a voting leg. Its reply validation (transaction
+// id, QR bit, QDCOUNT) checks only values an interceptor reads off our own
+// query and echoes back, and transparent DNS interception is ordinary on ISP,
+// hotel and corporate networks — so it could authorize an Apple reconnect
+// behind a portal, the exact hole this package exists to close. It still runs,
+// as a DIAGNOSTIC leg: it can never make a provider Reachable, and its result
+// appears in the joined error so an operator can tell "no network" (53 fails
+// too) from "443/853 filtered" (53 answers). Port 80 was considered and
+// rejected for the same reason: a captive portal answers 80 with a redirect,
+// and so does 1.1.1.1 itself, so there is nothing to authenticate. Do not add
+// either as a voting leg.
 //
 // Three properties are load-bearing, and each replaced something that was
 // quietly wrong:
@@ -42,16 +49,21 @@
 //     reported Reachable and let the client keep retrying Apple for the whole
 //     portal period, which is the exact hazard this package exists to prevent.
 //
-// How the legs combine is what keeps the verdict honest. Only DIAL-level
-// failures classify: a refused or unroutable connection is Unreachable, and a
-// socket the host would not give us is Blocked (see locallyBlocked). A TLS
-// handshake that completes the TCP connection but fails to validate is
-// ambiguous — a MITM portal and a minimal container with no CA bundle produce
-// the same x509 error — so that leg ABSTAINS rather than voting, and the 53 leg
-// or a dial-level errno decides. A host with no CA bundle therefore still gets
-// its verdict from 53. The residual case is a host with no CA bundle whose
-// 53 is also blocked: it reads as Unreachable, the recovery loop's ceilings
-// bound the cost, and the joined leg errors in the log name the cert failure.
+// How the legs combine is what keeps the verdict honest. Dial-level failures
+// classify as they always have: a refused or unroutable connection is
+// Unreachable, and a socket the host would not give us is Blocked (see
+// locallyBlocked). A handshake that reaches a peer which is provably NOT the
+// provider — a certificate that validates but names another host, a peer that
+// does not speak TLS at all, a connection reset mid-handshake — is Unreachable.
+// Only two handshake failures ABSTAIN (Blocked, "no evidence") instead of
+// voting: a certificate this host cannot chain to any root when the host has NO
+// trust store at all (a minimal container without ca-certificates — with a
+// trust store present, an untrusted chain is a portal and votes Unreachable),
+// and a certificate the host considers invalid on time grounds (clock skew on
+// the host is indistinguishable from an expired portal cert). A host that
+// cannot validate anything therefore reads as Blocked — the probe cannot run
+// here — and the recovery loop's unusable-probe hatch, not a forged verdict,
+// decides what happens next, with the cert failure named in the log.
 //
 // Each provider is tried over IPv4 and IPv6 concurrently. That is not garnish:
 // on an IPv6-only or NAT64/DNS64 host there is no IPv4 route at all, so dialing
@@ -89,29 +101,41 @@ const (
 	probeTimeout = 3 * time.Second
 )
 
-// Ports of the two probe methods. Vars only so a test can point a leg at a
-// fixture listener; never reassigned in production. See the package doc for
-// why 80 is not, and must not become, a third.
+// Ports of the probe legs. Vars only so a test can point a leg at a fixture
+// listener; never reassigned in production. See the package doc for why 53 is
+// diagnostic-only and 80 is not, and must not become, a leg.
 var (
 	tlsPort = "443"
+	dotPort = "853"
 	dnsPort = "53"
 )
 
-// probeMethod is one way of proving a provider host is real.
+// probeMethod is one leg of a provider's race. Only a voting leg can make the
+// provider Reachable; a diagnostic leg's success is recorded in the joined
+// error and contributes nothing to the verdict, while its dial-level and
+// hijack failures still count (they can only keep the verdict down).
 type probeMethod struct {
-	name string
-	port string
-	run  func(ctx context.Context, address string) (Outcome, error)
+	name   string
+	port   string
+	voting bool
+	run    func(ctx context.Context, address string) (Outcome, error)
 }
 
-// probeLegs lists the methods raced against every address of a provider, the
+// probeLegs lists the legs raced against every address of a provider, the
 // primary first. Built per call so the port seams are read at probe time.
 func probeLegs() []probeMethod {
 	return []probeMethod{
-		{name: "tls", port: tlsPort, run: tlsOnce},
-		{name: "dns", port: dnsPort, run: queryOnce},
+		{name: "tls", port: tlsPort, voting: true, run: tlsOnce},
+		{name: "dot", port: dotPort, voting: true, run: tlsOnce},
+		{name: "dns", port: dnsPort, voting: false, run: queryOnce},
 	}
 }
+
+// errDiagnosticAnswered notes, in a provider's joined error, that the
+// diagnostic 53 leg got a valid reply even though the voting legs did not
+// prove the host: the signature of a network that filters 443/853 or of a
+// DNS interceptor, either way not a reason to contact Apple.
+var errDiagnosticAnswered = errors.New("answered (diagnostic leg, cannot vote Reachable)")
 
 // Seams for tests. dialContext lets a test inject dial-level errnos
 // (ENETUNREACH, EACCES, EMFILE) deterministically and observe which legs are
@@ -259,6 +283,10 @@ func queryProvider(ctx context.Context, addresses []string) (Outcome, error) {
 			index := mi*len(addresses) + ai
 			go func() {
 				outcome, err := method.run(probeCtx, net.JoinHostPort(address, method.port))
+				if !method.voting && outcome == OutcomeReachable {
+					// A diagnostic leg's success is a note, never a vote.
+					outcome, err = OutcomeBlocked, errDiagnosticAnswered
+				}
 				if err != nil {
 					err = fmt.Errorf("%s:%s %s: %w", method.name, method.port, address, err)
 				}
@@ -303,16 +331,56 @@ func classifyDialError(err error) (Outcome, error) {
 	return OutcomeUnreachable, err
 }
 
-// errTLSUnverified marks a 443 leg whose TCP connection succeeded but whose
-// handshake did not produce a certificate that validates for the dialed IP.
-// The leg abstains — OutcomeBlocked, "no evidence" — rather than voting
-// Unreachable, because a captive portal terminating TLS and a host with no
-// usable CA bundle raise the same error and only the 53 leg or a dial-level
-// errno can tell them apart.
-var errTLSUnverified = errors.New("TLS handshake did not verify the host's certificate for the dialed IP (captive portal, interception, or no usable CA bundle)")
+// errTLSUnverified marks a TLS leg that ABSTAINS: the TCP connection succeeded
+// but this host could not validate the certificate for a reason that may lie
+// with the host rather than the peer (no trust store at all, or a certificate
+// it considers invalid on time grounds). OutcomeBlocked, "no evidence".
+var errTLSUnverified = errors.New("TLS handshake could not be validated on this host (no usable CA bundle, or a certificate this host considers invalid)")
 
-// tlsOnce is the primary leg: a TLS handshake on 443 validated against the
-// dialed IP literal. With ServerName set to the literal, Go checks the
+// errTLSRejected marks a TLS leg that reached a peer which is provably not the
+// provider: a certificate that validates but names another host (a portal with
+// a real certificate for its own domain), a chain no root in a present trust
+// store signs (a self-signed portal), a peer that does not speak TLS, or a
+// connection cut mid-handshake. OutcomeUnreachable.
+var errTLSRejected = errors.New("TLS peer is not the provider (captive portal or interception)")
+
+// hasTrustStore reports whether this host has any root certificates at all
+// under the pool the probe validates against. With none, an untrusted chain
+// says nothing about the peer; with some, it says the peer is not who it
+// claims. Computed once for the system roots.
+var (
+	systemTrustStoreOnce  sync.Once
+	systemTrustStoreKnown bool
+)
+
+func hasTrustStore(pool *x509.CertPool) bool {
+	if pool != nil {
+		return !pool.Equal(x509.NewCertPool())
+	}
+	systemTrustStoreOnce.Do(func() {
+		system, err := x509.SystemCertPool()
+		systemTrustStoreKnown = err == nil && system != nil && !system.Equal(x509.NewCertPool())
+	})
+	return systemTrustStoreKnown
+}
+
+// classifyHandshakeError sorts a failed handshake into abstain (Blocked) or a
+// verdict (Unreachable) per the package doc.
+func classifyHandshakeError(err error, roots *x509.CertPool) (Outcome, error) {
+	var unknownAuthority x509.UnknownAuthorityError
+	var invalid x509.CertificateInvalidError
+	switch {
+	case errors.As(err, &unknownAuthority) && !hasTrustStore(roots):
+		return OutcomeBlocked, fmt.Errorf("%w: %v", errTLSUnverified, err)
+	case errors.As(err, &invalid) && invalid.Reason == x509.Expired:
+		return OutcomeBlocked, fmt.Errorf("%w: %v", errTLSUnverified, err)
+	default:
+		return OutcomeUnreachable, fmt.Errorf("%w: %v", errTLSRejected, err)
+	}
+}
+
+// tlsOnce is a voting leg: a TLS handshake (on 443 or 853) validated against
+// the dialed IP literal. With ServerName set to the literal, Go checks the
 // certificate's IP SANs, so no name resolution is involved.
 func tlsOnce(ctx context.Context, address string) (Outcome, error) {
 	conn, err := dialContext(ctx, "tcp", address)
@@ -328,13 +396,14 @@ func tlsOnce(ctx context.Context, address string) (Outcome, error) {
 	if err != nil {
 		return OutcomeBlocked, err
 	}
+	roots := tlsRootCAs
 	tlsConn := tls.Client(conn, &tls.Config{
 		ServerName: host,
-		RootCAs:    tlsRootCAs,
+		RootCAs:    roots,
 		MinVersion: tls.VersionTLS12,
 	})
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		return OutcomeBlocked, fmt.Errorf("%w: %v", errTLSUnverified, err)
+		return classifyHandshakeError(err, roots)
 	}
 	return OutcomeReachable, nil
 }
@@ -343,8 +412,10 @@ func tlsOnce(ctx context.Context, address string) (Outcome, error) {
 // reply — the captive-portal signature.
 var errHijacked = errors.New("connected but no valid DNS reply (captive portal or interception)")
 
-// queryOnce is the fallback leg: a DNS-over-TCP query on 53 whose reply must
-// carry our transaction id.
+// queryOnce is the diagnostic leg: a DNS-over-TCP query on 53 whose reply must
+// carry our transaction id. That check defeats a portal that speaks HTTP on 53
+// but not one that echoes our query, which is why queryProvider never lets its
+// success vote (see probeMethod.voting).
 func queryOnce(ctx context.Context, address string) (Outcome, error) {
 	conn, err := dialContext(ctx, "tcp", address)
 	if err != nil {

@@ -9,6 +9,7 @@ package connector
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"time"
 
@@ -37,54 +38,26 @@ var (
 	// control back to bridgev2 and let a real Apple attempt decide.
 	internetRecoveryBlockedGrace = 2 * time.Minute
 
-	// Even a definitive "no route" verdict gets a ceiling, and this IS a
-	// deliberate exception to the "stay Apple-free until the public Internet
-	// returns" requirement. The justification is bounded blast radius, not that
-	// bridgev2 owns reconnect policy (it does not — its auto-reconnect is off by
-	// default and this connector has to switch it on): the probe is a heuristic
-	// with a false-negative mode, such as egress that permits APNs while dropping
-	// these resolvers, and a heuristic that can be permanently wrong must not be
-	// able to hold the bridge down forever.
-	//
-	// Cost, and why it is bounded: a hand-back is a full bridgev2 rebuild, and
-	// that rebuild closes recoveryDone, killing the loop that owns this episode's
-	// re-ask gate. So episode-local state cannot widen the cadence — each
-	// hand-back would otherwise start a fresh episode with a fresh clock and
-	// repeat forever while Apple stayed unreachable. That is what
-	// IMConnector.handBackDue/noteHandBack exist for: the spacing lives on the
-	// connector, which outlives client rebuilds, doubles per consecutive
-	// hand-back (7m, 14m, 28m, capped at 45m; pinned by
-	// TestHandBackDelayScheduleIsPinned), and is cleared only by evidence that a
-	// rebuild produced a working courier — the receive-wedge watchdog seeing an
-	// inbound frame — or by a logout, never by a Connect merely completing.
-	// The wedge watchdog's own rebuild shares the same run. Worst case
-	// therefore settles at about one courier attempt per 45 minutes, against
-	// the ~120/hour rustpush's own 30-second-capped retry loop would make.
-	//
-	// The 20+-handle StatusKit IDS invite sweep is gated separately, by
-	// fullConnectIDSCooldown (30m, measured from the last Connect that ran the
-	// sweep), not by this spacing: a rebuild inside the cooldown skips it
-	// whatever the spacing, and one past the cooldown may run it — but the
-	// sweep runs from subscribeAfterInit only after InitStatuskit succeeds,
-	// which requires the courier to have connected. So the sweep can fire at
-	// most once per SUCCESSFUL connect per cooldown, which is the same burst a
-	// process restart at that cadence would make. The spacing is deliberately
-	// left at 45m: raising it to hide the sweep would
-	// trade a bounded post-connect burst for a longer dead bridge on a probe
-	// with a permanent false negative, which is the worse outcome.
-	internetRecoveryOfflineCeiling = 30 * time.Minute
-
-	// Absolute cap on one recovery episode, independent of flapping. The
-	// per-outage ceiling above resets whenever a probe succeeds, which is right
-	// for measuring "this outage", but on its own it is a livelock: a link whose
-	// up-phases are shorter than internetRecoveryStablePeriod and whose
-	// down-phases are shorter than the ceiling satisfies NEITHER exit, so the
-	// client stays torn down and no rebuild is ever requested. A flapping DSL or
-	// LTE link does exactly that. A reachable round never touches this clock;
-	// the only thing that re-arms it is a hand-back actually being sent (see
-	// recoveryEpisode.startedAt), so an episode always produces a request
-	// within this cap plus whatever the connector-level backoff is holding.
-	internetRecoveryEpisodeCeiling = 2 * internetRecoveryOfflineCeiling
+	// There is deliberately NO ceiling on a confirmed outage. Earlier rounds
+	// handed control back to bridgev2 after 30 minutes of Unreachable verdicts
+	// (and after 60 minutes of any episode) on the argument that a permanently
+	// wrong probe must not hold the bridge down forever. That defense is
+	// withdrawn: the requirement is to touch Apple only after public
+	// connectivity has returned and stayed stable, and a hand-back on a
+	// confirmed-down verdict contacts Apple while the probe still says down.
+	// Two things changed the calculus. The probe is no longer one ping — a
+	// false Unreachable now needs every authenticated leg of both providers
+	// over both address families to fail — and, more important, the
+	// requirement forbids touching Apple, not being down. So when the probe
+	// says down for a long time the correct behavior is a LOUD dead bridge,
+	// not an automatic Apple reconnect: after this much continuous confirmed
+	// outage the loop raises a throttled Error and posts a management-room
+	// notice, and keeps holding Apple-free. The episode still ends cleanly on
+	// cancellation or shutdown; it never ends by contacting Apple. The one
+	// hand-back that remains is the unusable-probe hatch above, which fires on
+	// NO verdict rather than on a down one.
+	internetRecoveryHoldAlarmAfter    = 30 * time.Minute
+	internetRecoveryHoldAlarmInterval = 30 * time.Minute
 
 	// Rounds logged at Info before steady-state repetition drops to Debug. At the
 	// 10-second cadence this covers the first minute; a change of verdict is
@@ -443,7 +416,7 @@ func (c *IMClient) runPublicOnlyInternetRecovery(log zerolog.Logger, appleSpecif
 		Bool("apple_specific_failure", appleSpecificFailure).
 		Dur("required_stability", internetRecoveryStablePeriod).
 		Dur("unusable_probe_grace", internetRecoveryBlockedGrace).
-		Dur("offline_ceiling", internetRecoveryOfflineCeiling).
+		Dur("hold_alarm_after", internetRecoveryHoldAlarmAfter).
 		Msg("APNs recovery entered public-only mode: iMessage client teardown completed; the recovery watcher will use only public probes until Internet stability is established")
 
 	var probeLog internetProbeLogger
@@ -473,6 +446,9 @@ func (c *IMClient) runPublicOnlyInternetRecovery(log zerolog.Logger, appleSpecif
 
 		decision := episode.step(round)
 		c.logRecoveryDecision(log, recoveryPhaseMain, result, round, decision, episode)
+		if decision.holdAlarm {
+			sendRecoveryHoldNotice(c, ctx, log, recoveryHoldNoticeText(now.Sub(episode.outageStartedAt)))
+		}
 		switch decision.action {
 		case actionWithdraw:
 			if !c.sendRecoveryWithdrawal(main, bridgeState) {
@@ -595,18 +571,32 @@ func (c *IMClient) logRecoveryDecision(log zerolog.Logger, phase string, result 
 			Dur("hold_log_interval", round.retryDelay).
 			Msg("Holding in Apple-free recovery: the previous hand-back was recent and consecutive hand-backs back off, so retrying Apple now would only repeat it")
 	}
+	if d.holdAlarm {
+		log.Error().
+			Dur("offline_for", round.now.Sub(e.outageStartedAt)).
+			Dur("episode_age", round.now.Sub(e.startedAt)).
+			Dur("alarm_interval", round.timing.holdAlarmInterval).
+			Msg("Public Internet has been confirmed unreachable for a long time; the iMessage client stays torn down and Apple will NOT be contacted until connectivity returns and remains stable — if this network is expected to be up, the bridge needs attention")
+	}
 	if d.action == actionHandBack {
-		reason := "Public Internet has not been confirmed within the recovery ceiling; handing control back to bridgev2 so a real Apple attempt can decide"
-		if d.handBackCode == handBackCodeProbeUnusable {
-			reason = "Public Internet probe cannot run on this host, so recovery has no connectivity signal; handing control back to bridgev2 rather than staying in Apple-free mode"
-		}
 		logBlockedProbe(log.With().
 			Int("request_attempt", e.attempt).
-			Dur("offline_for", round.now.Sub(e.outageStartedAt)).
+			Dur("no_verdict_for", round.now.Sub(e.lastNetworkVerdict)).
 			Dur("bridgev2_reconnect_delay", c.Main.Bridge.Config.UnknownErrorAutoReconnect).
-			Logger(), result).Msg(reason)
+			Logger(), result).Msg("Public Internet probe cannot run on this host, so recovery has no connectivity signal at all; handing control back to bridgev2 rather than staying in Apple-free mode on no evidence")
 	}
 }
+
+// recoveryHoldNoticeText is the management-room notice for a long confirmed
+// outage; the operator-facing twin of the holdAlarm log line.
+func recoveryHoldNoticeText(offlineFor time.Duration) string {
+	return fmt.Sprintf("iMessage bridge: the public Internet has been unreachable for %s. The iMessage client is held offline and Apple will not be contacted until connectivity returns and stays stable for %s. If this network is expected to be up, the bridge needs attention.",
+		offlineFor.Round(time.Minute), internetRecoveryStablePeriod)
+}
+
+// sendRecoveryHoldNotice is the seam through which the loop posts that notice.
+// Never reassigned in production.
+var sendRecoveryHoldNotice = (*IMClient).postManagementNotice
 
 // bridgeRecoveryContext returns the bridge-owned context that outlives one
 // client epoch, so recovery keeps a cancellation source after teardown.
@@ -627,28 +617,32 @@ func (c *IMClient) bridgeRecoveryContext() context.Context {
 // work the old arms did by convention:
 //
 //  1. A pending request has a KIND. An unreachable round withdraws a "recovered"
-//     request (bridgev2 must not rebuild into an outage) and never a ceiling
-//     hand-back (whose whole point is to let Apple decide when the probe may be
-//     permanently wrong). The round-5 self-canceling ceiling — a hand-back
-//     withdrawn one poll later — cannot be expressed here, whatever the clocks do.
+//     request (bridgev2 must not rebuild into an outage) and never an
+//     unusable-probe hand-back (whose whole point is to let Apple decide when
+//     the probe cannot produce a verdict at all). The round-5 self-canceling
+//     hand-back — withdrawn one poll later — cannot be expressed here,
+//     whatever the clocks do.
 //
-//  2. The re-ask gate is evaluated BEFORE the ceiling. While bridgev2 has a
-//     request it has not had time to act on, no clock can preempt the normal
-//     path: a reachable link keeps accumulating stability and re-asks with
-//     im-internet-recovered the moment the gate opens. The round-7 latch — a
-//     stale episode clock routing every later round into the hand-back arm —
-//     cannot be expressed here either, and the relation between retryDelay, the
-//     connector backoff and the episode ceiling is no longer load-bearing, which
-//     is what makes the loop safe under operator-supplied
-//     unknown_error_auto_reconnect values.
+//  2. The re-ask gate is evaluated BEFORE the hand-back clause. While bridgev2
+//     has a request it has not had time to act on, no clock can preempt the
+//     normal path: a reachable link keeps accumulating stability and re-asks
+//     with im-internet-recovered the moment the gate opens. The round-7 latch
+//     — a stale clock routing every later round into the hand-back arm —
+//     cannot be expressed here either, and the relation between retryDelay
+//     and the connector backoff is not load-bearing, which is what makes the
+//     loop safe under operator-supplied unknown_error_auto_reconnect values.
 //
-// Worst case for an operator: clause 3 is NOT gated by clause 5, so a link that
-// flaps up for ~70s and down for ~10s has every recovered request withdrawn
-// before bridgev2 can act on it, and the per-outage clock never reaches the
-// offline ceiling. Only the episode ceiling ends that — about 60 minutes to
-// the first hand-back. Deliberate: a rebuild scheduled during an up phase
-// lands in the next down phase and reconnects into the outage, which is what
-// the withdrawal exists to prevent, and the episode ceiling bounds it.
+//  3. A confirmed-Unreachable verdict NEVER produces a request. There is no
+//     outage ceiling and no episode ceiling (both were removed in round 10:
+//     each contacted Apple while the probe still said down, which the
+//     requirement forbids). The only hand-back is the unusable-probe hatch,
+//     which fires on the ABSENCE of a verdict. A link that never stabilizes —
+//     down for good, or flapping faster than the stability window forever —
+//     therefore holds Apple-free indefinitely, and the loop makes that loud
+//     rather than automatic: after holdAlarmAfter of continuous confirmed
+//     outage it raises a throttled Error and a management-room notice
+//     (clause 7). The episode ends on cancellation or shutdown, never by
+//     contacting Apple.
 
 // recoveryVerdict reduces a probe result to the three cases the decision table
 // distinguishes. Blocked is checked before "not reachable" because Blocked
@@ -694,9 +688,9 @@ const (
 	// im-internet-recovered: the probe said the link is stable. Withdrawn by an
 	// unreachable round.
 	pendingRecovered
-	// im-internet-offline-ceiling / im-internet-probe-unusable: the probe could
-	// not confirm the link for too long. Never withdrawn — bridgev2 acting on it
-	// despite the probe is the intended outcome.
+	// im-internet-probe-unusable: the probe produced no verdict at all for the
+	// whole grace period. Never withdrawn — bridgev2 acting on it despite the
+	// probe is the intended outcome.
 	pendingHandBack
 )
 
@@ -741,27 +735,26 @@ func (a recoveryAction) String() string {
 	}
 }
 
-const (
-	handBackCodeCeiling       status.BridgeStateErrorCode = "im-internet-offline-ceiling"
-	handBackCodeProbeUnusable status.BridgeStateErrorCode = "im-internet-probe-unusable"
-)
+// The one hand-back code left. "im-internet-offline-ceiling" no longer exists:
+// a confirmed outage never hands back (see the section comment).
+const handBackCodeProbeUnusable status.BridgeStateErrorCode = "im-internet-probe-unusable"
 
 // recoveryTiming carries the package-level timing knobs into a step as plain
 // values, so a table test can pin a decision to explicit durations instead of
 // to whatever the package vars hold.
 type recoveryTiming struct {
-	stablePeriod   time.Duration
-	blockedGrace   time.Duration
-	offlineCeiling time.Duration
-	episodeCeiling time.Duration
+	stablePeriod      time.Duration
+	blockedGrace      time.Duration
+	holdAlarmAfter    time.Duration
+	holdAlarmInterval time.Duration
 }
 
 func currentRecoveryTiming() recoveryTiming {
 	return recoveryTiming{
-		stablePeriod:   internetRecoveryStablePeriod,
-		blockedGrace:   internetRecoveryBlockedGrace,
-		offlineCeiling: internetRecoveryOfflineCeiling,
-		episodeCeiling: internetRecoveryEpisodeCeiling,
+		stablePeriod:      internetRecoveryStablePeriod,
+		blockedGrace:      internetRecoveryBlockedGrace,
+		holdAlarmAfter:    internetRecoveryHoldAlarmAfter,
+		holdAlarmInterval: internetRecoveryHoldAlarmInterval,
 	}
 }
 
@@ -786,18 +779,19 @@ type recoveryDecision struct {
 	stabilityReset   bool // a window was in progress and this round ended it
 	holdLog          bool // the backoff hold is logged this round (throttled)
 	declineAlarm     bool // a request is old and unanswered on a reachable link
+	holdAlarm        bool // a long confirmed outage is being held Apple-free (throttled)
 }
 
 // recoveryEpisode is the complete mutable state of one recovery episode. Every
 // field is written only by step, finishPreflight and their helpers.
 type recoveryEpisode struct {
-	// startedAt is the episode clock. It is re-armed by exactly one event — a
-	// hand-back send — so the absolute cap measures "time since this episode
-	// last handed back", which is the only reading under which it can neither
-	// livelock (never re-armed: round 3) nor latch (re-armed only on some paths:
-	// round 7).
+	// startedAt is the episode clock, re-armed by a hand-back send. It drives
+	// no decision any more (the episode ceiling is gone); it is logged so an
+	// operator can see how long the loop has held.
 	startedAt time.Time
 	// outageStartedAt is the per-outage clock: reset by every reachable round.
+	// It is what the hold alarm measures from, so a flapping link that keeps
+	// resetting it is a different, quieter kind of hold than a dead link.
 	outageStartedAt time.Time
 	// lastNetworkVerdict is the last round that actually tested the network, as
 	// opposed to being refused a socket by this host.
@@ -815,6 +809,7 @@ type recoveryEpisode struct {
 
 	lastDeclineAlarmAt time.Time
 	lastHoldLogAt      time.Time
+	lastHoldAlarmAt    time.Time
 }
 
 func newRecoveryEpisode(now time.Time) *recoveryEpisode {
@@ -882,10 +877,21 @@ func (e *recoveryEpisode) step(in recoveryRound) recoveryDecision {
 		return d
 	}
 
-	// 7. Ceiling. Both escape hatches exist so a permanently failing or
-	// unusable probe cannot become a permanently dead bridge.
+	// 7. Holds. A confirmed outage is held Apple-free for as long as it lasts,
+	// and made loud rather than automatic: after holdAlarmAfter of continuous
+	// Unreachable verdicts the loop alarms (throttled to holdAlarmInterval) and
+	// keeps holding. The one hand-back left is the unusable-probe hatch: a
+	// probe that has produced NO verdict for blockedGrace cannot hold the
+	// bridge on no evidence, so bridgev2 is asked to let a real Apple attempt
+	// decide. Nothing in this clause fires on an Unreachable verdict except
+	// the alarm.
 	probeUnusable := in.verdict != verdictReachable && now.Sub(e.lastNetworkVerdict) >= in.timing.blockedGrace
-	if !probeUnusable && !in.timing.shouldHandBack(now, e.outageStartedAt, e.startedAt) {
+	if !probeUnusable {
+		if in.verdict == verdictUnreachable && now.Sub(e.outageStartedAt) >= in.timing.holdAlarmAfter &&
+			internetRecoveryHoldLogDue(now, e.lastHoldAlarmAt, in.timing.holdAlarmInterval) {
+			e.lastHoldAlarmAt = now
+			d.holdAlarm = true
+		}
 		return d
 	}
 	if in.handBackHold > 0 {
@@ -901,10 +907,7 @@ func (e *recoveryEpisode) step(in recoveryRound) recoveryDecision {
 	e.noteRequest(now, pendingHandBack)
 	e.startedAt = now
 	d.action = actionHandBack
-	d.handBackCode = handBackCodeCeiling
-	if probeUnusable {
-		d.handBackCode = handBackCodeProbeUnusable
-	}
+	d.handBackCode = handBackCodeProbeUnusable
 	return d
 }
 
@@ -966,21 +969,6 @@ func (e *recoveryEpisode) clearPending() {
 	e.pending = pendingNone
 	e.requestedAt = time.Time{}
 	e.firstRequestedAt = time.Time{}
-}
-
-// shouldHandBack reports whether an episode must stop waiting and let bridgev2
-// rebuild. Two clocks, and both are required: the per-outage clock gives the
-// ceiling its intended meaning ("this outage has run long"), while the episode
-// clock guarantees termination, because a link that flaps faster than the
-// stability window can reset the per-outage clock forever.
-func (t recoveryTiming) shouldHandBack(now, outageStartedAt, episodeStartedAt time.Time) bool {
-	return now.Sub(outageStartedAt) >= t.offlineCeiling ||
-		now.Sub(episodeStartedAt) >= t.episodeCeiling
-}
-
-// internetRecoveryShouldHandBack is shouldHandBack over the package-level knobs.
-func internetRecoveryShouldHandBack(now, outageStartedAt, episodeStartedAt time.Time) bool {
-	return currentRecoveryTiming().shouldHandBack(now, outageStartedAt, episodeStartedAt)
 }
 
 // internetRecoveryDeclineAlarmDue reports whether to warn that a requested rebuild

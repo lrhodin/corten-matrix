@@ -500,11 +500,41 @@ func TestBothLoadPathsAbortWhenThePreviousClientWillNotRetire(t *testing.T) {
 	})
 
 	t.Run("nothing to retire", func(t *testing.T) {
-		previous := newLifecycleTestClient() // never connected: no client, no epoch
+		previous := newLifecycleTestClient()
+		previous.connection = nil // no APS connection, no client, no epoch
+		if previous.needsRetirement() {
+			t.Fatal("a client that owns nothing live must not need retirement")
+		}
 		if err := retirePreviousClient(previous, zerolog.Nop()); err != nil {
 			t.Fatalf("a client with nothing to retire must not fail the load: %v", err)
 		}
 	})
+}
+
+// Round-10 blocker B1: a client exactly as LoadUserLogin leaves it — APS
+// connection built, no epoch, no Rust client — already has a ResourceManager
+// retrying Apple on this device token, and MUST be retired before a replacement
+// is installed. Every earlier predicate read Connect's progress and missed it.
+func TestRetirePreviousClientRetiresAPreConnectClient(t *testing.T) {
+	closed, _, mu := installLifecycleSeams(t)
+	previous := newLifecycleTestClient()
+	if previous.connection == nil || previous.stopChan != nil || previous.client != nil {
+		t.Fatal("precondition: the fixture must look exactly like a client LoadUserLogin just built")
+	}
+	if !previous.needsRetirement() {
+		t.Fatal("a client with a live APS connection and no epoch was not considered live")
+	}
+	if err := retirePreviousClient(previous, zerolog.Nop()); err != nil {
+		t.Fatalf("retirement failed: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if *closed != 1 {
+		t.Fatalf("APS connection closed %d times, want 1: the replacement would otherwise share the device token with a connection still retrying Apple", *closed)
+	}
+	if !previous.terminationRequested() {
+		t.Fatal("a retired pre-Connect client must refuse a later Connect")
+	}
 }
 
 // Finding 6: every way an interactive login can end without an IMClient taking

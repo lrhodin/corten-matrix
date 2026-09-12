@@ -89,7 +89,7 @@ func (c *IMConnector) Start(ctx context.Context) error {
 	// asking for the rebuild, the login is left dead rather than merely
 	// degraded, with Restart=always no help because the process never exits.
 	// The cap bought no Apple safety anyway. Each rebuild source has its own
-	// bound, and only the first two widen: the recovery loop's ceiling
+	// bound, and only the first two widen: the recovery loop's unusable-probe
 	// hand-backs and the wedge watchdog's rebuild are behind the widening
 	// hand-back backoff (7m to 45m); the recovery loop's normal exit,
 	// im-internet-recovered, is bounded only by its stability window (60s of

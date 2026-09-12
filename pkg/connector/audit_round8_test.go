@@ -87,10 +87,9 @@ func TestRetirePreviousClientRetiresAnInProgressConnectEpoch(t *testing.T) {
 // could not ask" rather than "the network is down".
 func TestBlockedFinalPreflightDoesNotWithdrawAPendingRebuild(t *testing.T) {
 	scaleRecoveryTimingForTest(t)
-	// Push both escape hatches out of reach so only the preflight path can act.
+	// Push the unusable-probe hatch out of reach so only the preflight path can
+	// act. (The outage ceilings this line used to push away no longer exist.)
 	internetRecoveryBlockedGrace = time.Hour
-	internetRecoveryOfflineCeiling = time.Hour
-	internetRecoveryEpisodeCeiling = time.Hour
 	retryDelayFunc = func(time.Duration) time.Duration { return 10 * time.Millisecond }
 
 	var mu sync.Mutex
