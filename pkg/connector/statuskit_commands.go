@@ -8,6 +8,7 @@
 package connector
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -123,16 +124,43 @@ func statusKitClientFromEvent(ce *commands.Event) (*rustpushgo.WrappedStatusKitC
 		return nil, false
 	}
 	client, ok := login.Client.(*IMClient)
-	if !ok || client == nil || client.client == nil {
+	if !ok || client == nil {
 		ce.Reply("Bridge client not available.")
 		return nil, false
 	}
-	sk, err := client.client.GetStatuskitClient()
+	sk, err := client.statusKitClientForCommand()
+	if errors.Is(err, errStatusKitClientUnavailable) {
+		ce.Reply("Bridge client not available.")
+		return nil, false
+	}
 	if err != nil {
 		ce.Reply("Failed to initialize StatusKit client: %v", err)
 		return nil, false
 	}
 	return sk, true
+}
+
+// errStatusKitClientUnavailable: there is no Rust client to ask (the login is
+// not connected).
+var errStatusKitClientUnavailable = errors.New("bridge client not available")
+
+// getStatusKitClient is the FFI seam the explicit-command path reaches the
+// StatusKit client through. Never reassigned in production.
+var getStatusKitClient = func(client *rustpushgo.Client) (*rustpushgo.WrappedStatusKitClient, error) {
+	return client.GetStatuskitClient()
+}
+
+// statusKitClientForCommand is the explicit-command path to the StatusKit
+// client. It is deliberately NOT gated by the flap run's StatusKit deferral
+// (launchOrDeferStatusKit): the Rust getter lazily builds the StatusKit client
+// on demand, so a user who asks for presence while startup is deferred gets it
+// — the deferral holds only the automatic startup block. Keep it that way; a
+// test pins the absence of a gate here.
+func (c *IMClient) statusKitClientForCommand() (*rustpushgo.WrappedStatusKitClient, error) {
+	if c.client == nil {
+		return nil, errStatusKitClientUnavailable
+	}
+	return getStatusKitClient(c.client)
 }
 
 // primeGsaTokensForStatuskit runs a PET refresh on the current login's token

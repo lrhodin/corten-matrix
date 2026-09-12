@@ -207,10 +207,15 @@ func (c *IMClient) runAPSConnectionEventLoop(stop <-chan struct{}, log zerolog.L
 			if !ok {
 				continue
 			}
+			// Any APS event — the courier left Generated, or a regeneration
+			// failed — ends the flap run's health lease for this login. The
+			// run itself is untouched; this is what re-asserts it.
+			c.Main.noteCourierUnhealthy(c.UserLogin.ID)
 			log.Info().
 				Str("platform", runtime.GOOS).
 				Strs("public_probe_targets", []string{internetprobe.CloudflareTarget, internetprobe.GoogleTarget}).
 				Uint("aps_event", uint(event)).
+				Bool("statuskit_deferred", c.statusKitDeferred.Load()).
 				Msg("APS connection event received; checking public Internet before deciding how to reconnect")
 			switch event {
 			case rustpushgo.ApsConnectionEventInterrupted:
@@ -384,6 +389,15 @@ func recordInterruption(history []time.Time, now time.Time) []time.Time {
 // last verdict — the one that started the episode — was a confirmed outage.
 func (c *IMClient) runPublicOnlyInternetRecovery(log zerolog.Logger, entry recoveryVerdict) {
 	appleSpecificFailure := entry == verdictReachable
+	// courierFailure: the courier failed on a link the probe did NOT call down
+	// — a flap storm or a sustained regeneration failure, entered on a
+	// Reachable or Blocked verdict. These are the episodes whose recovered
+	// rebuilds the flap run counts and holds (flap_recovery.go). A confirmed
+	// outage (entry Unreachable, from the confirmation window or the wedge
+	// watchdog) is NOT one: its rebuild after the stability window gets normal
+	// timing and neither reads nor writes the run. This is the only place the
+	// distinction is drawn, so the two cannot drift.
+	courierFailure := entry != verdictUnreachable
 	main := c.Main
 	if main == nil || main.Bridge == nil {
 		return
@@ -431,6 +445,8 @@ func (c *IMClient) runPublicOnlyInternetRecovery(log zerolog.Logger, entry recov
 		Str("platform", runtime.GOOS).
 		Strs("public_probe_targets", []string{internetprobe.CloudflareTarget, internetprobe.GoogleTarget}).
 		Bool("apple_specific_failure", appleSpecificFailure).
+		Bool("courier_failure", courierFailure).
+		Int("flap_rebuilds_so_far", main.flapRebuildCount(c.UserLogin.ID)).
 		Dur("required_stability", internetRecoveryStablePeriod).
 		Dur("unusable_probe_grace", internetRecoveryBlockedGrace).
 		Dur("hold_alarm_after", internetRecoveryHoldAlarmAfter).
@@ -459,6 +475,14 @@ func (c *IMClient) runPublicOnlyInternetRecovery(log zerolog.Logger, entry recov
 		// Spacing that survives the rebuild which kills this loop.
 		if wait, ok := main.handBackDue(c.UserLogin.ID, now); !ok {
 			round.handBackHold = wait
+		}
+		// The flap run's spacing, read ONLY for a courier-failure episode: a
+		// confirmed-outage episode leaves flapHold zero and so reaches the
+		// preflight on the stability window alone.
+		if courierFailure {
+			if wait, ok := main.flapRebuildDue(c.UserLogin.ID, now); !ok {
+				round.flapHold = wait
+			}
 		}
 
 		decision := episode.step(round)
@@ -527,6 +551,17 @@ func (c *IMClient) runPublicOnlyInternetRecovery(log zerolog.Logger, entry recov
 				}) {
 					return
 				}
+				// Recorded after the send and unconditionally, as noteHandBack
+				// is, and only for a courier-failure episode: this is the one
+				// writer that lengthens the flap run, and a confirmed-outage
+				// rebuild must not count toward it.
+				if courierFailure {
+					main.noteFlapRebuild(c.UserLogin.ID, now)
+					log.Info().Int("flap_rebuilds", main.flapRebuildCount(c.UserLogin.ID)).
+						Dur("next_flap_rebuild_held_for", handBackDelay(main.flapRebuildCount(c.UserLogin.ID))).
+						Dur("healthy_lease", flapRecoveryHealthyLease).
+						Msg("This rebuild follows a courier failure on a live link; recorded in the flap run — another courier-failure rebuild before the replacement stays healthy for the full lease is held behind the widening schedule, and a repeated one defers StatusKit startup")
+				}
 			}
 		}
 
@@ -587,6 +622,13 @@ func (c *IMClient) logRecoveryDecision(log zerolog.Logger, phase string, result 
 			Dur("next_hand_back_in", round.handBackHold).
 			Dur("hold_log_interval", round.retryDelay).
 			Msg("Holding in Apple-free recovery: the previous hand-back was recent and consecutive hand-backs back off, so retrying Apple now would only repeat it")
+	}
+	if d.flapHoldLog {
+		log.Info().
+			Dur("next_flap_rebuild_in", round.flapHold).
+			Dur("hold_log_interval", round.retryDelay).
+			Int("flap_rebuilds", c.Main.flapRebuildCount(c.UserLogin.ID)).
+			Msg("Public Internet is stable, but the previous courier-failure rebuild was recent and consecutive ones back off (7m, 14m, 28m, then 45m); holding the rebuild request rather than rebuilding into another flap")
 	}
 	if d.holdAlarm {
 		log.Error().
@@ -789,7 +831,12 @@ type recoveryRound struct {
 	// Non-zero while the connector-level hand-back backoff is holding; the
 	// value is how much longer it holds.
 	handBackHold time.Duration
-	timing       recoveryTiming
+	// Non-zero while the flap run is holding a courier-failure rebuild; the
+	// value is how much longer it holds. The loop sets it only for a
+	// courier-failure episode, so for a confirmed outage it is always zero and
+	// clause 6 is unchanged.
+	flapHold time.Duration
+	timing   recoveryTiming
 }
 
 // recoveryDecision is a step's output: exactly one action, plus independent
@@ -801,6 +848,7 @@ type recoveryDecision struct {
 	stabilityStarted bool // first reachable round of a stability window
 	stabilityReset   bool // a window was in progress and this round ended it
 	holdLog          bool // the backoff hold is logged this round (throttled)
+	flapHoldLog      bool // the flap-run hold on a ready rebuild is logged this round (throttled)
 	declineAlarm     bool // a request is old and unanswered on a reachable link
 	holdAlarm        bool // a long confirmed outage is being held Apple-free (throttled)
 }
@@ -903,8 +951,20 @@ func (e *recoveryEpisode) step(in recoveryRound) recoveryDecision {
 	}
 
 	// 6. Normal exit: a reachable link that has stayed up for the whole window
-	// earns a final preflight and, if that passes, a rebuild request.
+	// earns a final preflight and, if that passes, a rebuild request — unless
+	// the flap run is holding it. The hold is a courier-failure episode's
+	// widening schedule (the loop leaves flapHold zero for a confirmed
+	// outage); the window keeps accumulating underneath it, so the round
+	// after the hold expires reaches the preflight at once. Logged on the
+	// re-ask cadence, like the hand-back hold, not every poll.
 	if in.verdict == verdictReachable && ready {
+		if in.flapHold > 0 {
+			if internetRecoveryHoldLogDue(now, e.lastHoldLogAt, in.retryDelay) {
+				e.lastHoldLogAt = now
+				d.flapHoldLog = true
+			}
+			return d
+		}
 		d.action = actionPreflight
 		return d
 	}

@@ -362,6 +362,18 @@ type IMClient struct {
 	// the persisted backoff resumes and steady-state behavior takes over.
 	statusKitCloudPassFirstCallDone atomic.Bool
 
+	// StatusKit startup state for this client epoch (see startStatusKit).
+	// statusKitStartOnce makes the block launch at most once per client, from
+	// Connect or from the flap run's health lease; statusKitStarts counts the
+	// launches (0 or 1) so tests can observe it; statusKitDeferred is set by a
+	// Connect that held the block for a repeated courier-failure rebuild and
+	// cleared when the block launches; statusKitSkipHeavyIDSSweep is Connect's
+	// invite-sweep decision, captured so a deferred launch honors it.
+	statusKitStartOnce         sync.Once
+	statusKitStarts            atomic.Int32
+	statusKitDeferred          atomic.Bool
+	statusKitSkipHeavyIDSSweep bool
+
 	// statusKitPassInFlight is a single-flight guard so only one
 	// syncCloudStatusKitPeers pass runs at a time. The periodic pull loop, the
 	// post-backfill trigger, and the cloud-sync phases can all call it; two
@@ -1443,196 +1455,9 @@ func (c *IMClient) Connect(ctx context.Context) {
 		return
 	}
 
-	// Initialize StatusKit presence system (non-fatal — runs in background).
-	// Once initialized, the Rust receive loop intercepts StatusKit APNs
-	// messages and invokes OnStatusUpdate for subscribed handles.
-	go func() {
-		if c.client == nil || c.terminationRequested() {
-			return
-		}
-		// Wrapped in a 30s timeout to prevent silent goroutine hangs if the
-		// Rust future (StatusKitClient::new → request_topics) never completes.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		done := make(chan error, 1)
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Warn().Interface("panic", r).Msg("StatusKit init panicked — treating as init failure")
-					done <- fmt.Errorf("statuskit init panicked: %v", r)
-				}
-			}()
-			done <- c.client.InitStatuskit(c)
-		}()
-		subscribeAfterInit := func(err error) {
-			// Guard against Disconnect having nil'd c.client during the
-			// init window (e.g. bridge shutdown or reconnect cycle while
-			// InitStatuskit was still running past its 30s timeout).
-			if c.client == nil {
-				return
-			}
-			// Registration state is independent of StatusKit init — log it
-			// unconditionally so we can see MULTIPLEX presence even when
-			// init fails. If MULTIPLEX is absent, key exchange cannot work
-			// regardless of how many invites we send.
-			services := c.client.GetRegisteredServices()
-			multiplexPresent := false
-			for _, s := range services {
-				if s == "com.apple.private.alloy.multiplex1" {
-					multiplexPresent = true
-					break
-				}
-			}
-			log.Info().
-				Bool("multiplex_registered", multiplexPresent).
-				Strs("registered_services", services).
-				Bool("init_ok", err == nil).
-				Msg("StatusKit startup")
-
-			if err != nil {
-				log.Warn().Err(err).Msg("StatusKit initialization failed — presence updates unavailable")
-				return
-			}
-			log.Info().Msg("StatusKit presence system initialized")
-			// subscribeToContactPresence may have raced ahead of InitStatuskit
-			// and failed with "StatusKit not initialized". Re-run it now that
-			// the StatusKit client is guaranteed to be ready.
-			c.subscribeToContactPresence(log)
-			// Delayed re-subscribe (~5s): catches peers whose reshare landed
-			// in the brief window between StatusKitClient::new spawning the
-			// APNs recv loop and the Rust-side status_callback being installed.
-			// Reshares in that window have their on_keys_received() call
-			// silently dropped by the `if let Some(cb)` guard in the recv loop;
-			// the bridge has the keys but never re-subscribes for that peer's
-			// presence channel. The 5s delay is comfortably larger than the
-			// callback-install gap (sub-millisecond on typical hardware) and
-			// the first round of inbound reshares (peer-network RTT bounded).
-			go func() {
-				time.Sleep(5 * time.Second)
-				if c.client == nil {
-					return
-				}
-				log.Info().Msg("StatusKit: delayed re-subscribe (catches install-callback race)")
-				c.subscribeToContactPresence(log)
-			}()
-			// Fan-out StatusKit invites matching OB-Android's shape: one
-			// handle per IDS message, paced with a small inter-send delay.
-			// OB invites per-chat-activation (and on app resume); bridge
-			// approximates with a startup sweep. Empirically the batched
-			// 23-handles-in-one-invite call we used previously appeared to
-			// either trigger peer-side filtering or not propagate to each
-			// peer's distribution set the way one-at-a-time invites do —
-			// 12h on passive-only yielded zero real-iOS reshares, whereas
-			// OB (which invites one at a time) gets reshares fine.
-			// Gated by the full-connect cooldown (see lastFullConnectKVKey): a
-			// reconnect/rebuild must not re-fire this 20+-handle IDS invite burst
-			// at Apple. skipHeavyIDSSweep is captured from Connect's scope.
-			if !skipHeavyIDSSweep {
-				go c.inviteContactsToStatusSharing(log)
-			}
-			// Share status "available" once at startup. Empirically, peer iOS
-			// reciprocates a share with its own reshare, which is what gives
-			// us the key material to decrypt their subsequent presence
-			// updates. OB-Android only calls share_status from its zen-mode
-			// hooks (StatusQuery.kt on OS DND change) — but bridge has no OS
-			// DND to hook, and gating share behind a bot command puts a
-			// per-user setup step in the way that most users won't discover.
-			// So: share "available" unconditionally on startup. Bridge has no
-			// Focus mode of its own; "available" is the only truthful state.
-			// Gated on statuskit_share_on_startup (default true, user-overridable).
-			if c.Main.Config.StatusKitShareOnStartup {
-				go func() {
-					defer func() {
-						if r := recover(); r != nil {
-							log.Warn().Interface("panic", r).Msg("StatusKit startup share panicked")
-						}
-					}()
-					sk, err := c.client.GetStatuskitClient()
-					if err != nil || sk == nil {
-						log.Debug().Err(err).Msg("StatusKit startup share skipped — client not ready")
-						return
-					}
-					if err := c.safeRefreshPetTokenThrottled(); err != nil {
-						log.Debug().Err(err).Msg("StatusKit startup share: PET refresh skipped")
-					}
-					shareErr := sk.ShareStatus(true, nil)
-					if shareErr != nil && strings.Contains(shareErr.Error(), "Auth Missing") &&
-						c.tokenProvider != nil && *c.tokenProvider != nil {
-						// Warm-restore (restore_token_provider) injects ONLY the PET;
-						// the full GSA token map — including com.apple.gs.sharedchannels.auth
-						// that share_status needs — is repopulated only by a full
-						// login_email_pass. The GSA-announce prime that used to do that
-						// is disabled, and upstream get_token won't lazily fetch an
-						// *absent* token (it only re-logs-in for an expired-but-present
-						// one), so the map can lack sharedchannels.auth → "Auth Missing".
-						// The proactive refresh above is throttle-skipped on a quick
-						// restart, so force a full refresh here to rebuild the map,
-						// then retry once. One prime fixes the whole process.
-						//
-						// This deliberately bypasses the proactive 5-minute throttle
-						// (the warm-restore map is genuinely incomplete EVERY restart,
-						// so the throttle would wrongly leave us silent). To still
-						// protect against a crash-restart loop hammering Apple's GSA
-						// login, honor a short floor: skip the prime if any token
-						// refresh ran in the last 60s. Matches the CloudKit recovery's
-						// 60s min-interval; a normal restart (minutes apart) clears it,
-						// a tight crash loop (seconds) is bounded to ~1 login/60s.
-						const statusKitPrimeFloor = 60 * time.Second
-						recentRefresh := false
-						if raw := c.Main.Bridge.DB.KV.Get(context.Background(), petRefreshKVKey); raw != "" {
-							if ts, perr := strconv.ParseInt(raw, 10, 64); perr == nil && time.Since(time.Unix(ts, 0)) < statusKitPrimeFloor {
-								recentRefresh = true
-							}
-						}
-						if recentRefresh {
-							log.Warn().Msg("StatusKit startup share hit Auth Missing, but a token refresh ran <60s ago — skipping prime to avoid hammering Apple GSA (crash-loop guard)")
-						} else {
-							log.Info().Msg("StatusKit startup share hit Auth Missing — priming GSA tokens (warm-restore map is PET-only) and retrying")
-							if rErr := safeRefreshPetToken(*c.tokenProvider); rErr != nil {
-								log.Warn().Err(rErr).Msg("StatusKit startup share: GSA token prime failed")
-							} else {
-								c.Main.Bridge.DB.KV.Set(context.Background(), petRefreshKVKey, strconv.FormatInt(time.Now().Unix(), 10))
-								shareErr = sk.ShareStatus(true, nil)
-							}
-						}
-					}
-					if shareErr != nil {
-						log.Warn().Err(shareErr).Msg("StatusKit startup share_status failed")
-						return
-					}
-					// Stamp the post-invite cooldown key so the sweep's
-					// publishStatusKitAvailableAfterInvite (which fires
-					// seconds later when the bootstrap sweep finishes
-					// invites) coalesces with this publish instead of
-					// firing a redundant ShareStatus. Restart-within-5min
-					// is the only case that "loses" a publish; the next
-					// state change or sweep republishes.
-					c.Main.Bridge.DB.KV.Set(context.Background(), database.Key(statusKitLastPostInviteShareKey), time.Now().Format(time.RFC3339))
-					log.Info().Msg("StatusKit startup share_status(available) published")
-				}()
-			} else {
-				log.Info().Msg("StatusKit startup share disabled via config (statuskit_share_on_startup: false)")
-			}
-
-			// Complement the `StatusKit startup` line above with the peer-key
-			// count, which is only available once the StatusKit client is ready.
-			if sk, skErr := c.client.GetStatuskitClient(); skErr == nil && sk != nil {
-				log.Info().Int("known_peer_keys", len(sk.GetKnownHandles())).Msg("StatusKit peer keys loaded")
-			}
-		}
-		select {
-		case err := <-done:
-			subscribeAfterInit(err)
-		case <-ctx.Done():
-			// The Rust FFI call (StatusKitClient::new → request_topics) is
-			// taking longer than 30s. Don't block the connect flow, but keep
-			// a goroutine alive to subscribe as soon as it eventually finishes.
-			// The Rust side WILL set shared_statuskit/status_callback once
-			// StatusKitClient::new completes; we just need to subscribe then.
-			log.Warn().Msg("StatusKit initialization taking >30s — will subscribe when ready")
-			go func() { subscribeAfterInit(<-done) }()
-		}
-	}()
+	// StatusKit startup, or its deferral on a repeated courier-failure
+	// rebuild — see launchOrDeferStatusKit.
+	c.launchOrDeferStatusKit(log, skipHeavyIDSSweep)
 
 	// Pre-populate sender_guid cache from existing portal metadata
 	go c.loadSenderGuidsFromDB(log)
@@ -1813,6 +1638,270 @@ func (c *IMClient) Connect(ctx context.Context) {
 	// Start last. A connection event may synchronously tear this client down;
 	// there must be no remaining Connect initialization racing that teardown.
 	go c.runAPSConnectionEventLoop(c.stopChan, log.With().Str("component", "aps_connection_recovery").Logger())
+}
+
+// launchOrDeferStatusKit is Connect's StatusKit decision: the one call that
+// launches the presence block (startStatusKit), or, on a REPEATED
+// courier-failure rebuild, the deferral that holds it until the flap run's
+// health lease clears. First recovery preserves today's behavior exactly; a
+// process restart has no run and never defers. Explicit StatusKit commands are
+// not gated by this — they reach the StatusKit client through its lazy getter
+// regardless (statusKitClientForCommand). A method rather than inline so the
+// decision can be driven without the FFI calls that precede it in Connect.
+func (c *IMClient) launchOrDeferStatusKit(log zerolog.Logger, skipHeavyIDSSweep bool) {
+	c.statusKitSkipHeavyIDSSweep = skipHeavyIDSSweep
+	if c.Main.flapRecoveryDefersStatusKit(c.UserLogin.ID) {
+		c.statusKitDeferred.Store(true)
+		// The StatusKit-CloudKit pass's first-call bypass exists so a process
+		// restart is a natural retry of the peer-key pull; it is per client, so
+		// every rebuild would otherwise get one. A repeated flap epoch is not a
+		// restart: consume the bypass so the pass honors its inter-pass backoff
+		// like any later call. Message backfill does not read this flag.
+		c.statusKitCloudPassFirstCallDone.Store(true)
+		log.Warn().
+			Int("flap_rebuilds", c.Main.flapRebuildCount(c.UserLogin.ID)).
+			Dur("healthy_lease", flapRecoveryHealthyLease).
+			Uint64("healthy_max_idle_secs", courierHealthyMaxIdleSecs).
+			Msg("StatusKit startup DEFERRED: this client is a repeated rebuild after the APNs courier kept flapping, so presence (StatusKit init, subscriptions, invite sweep, startup share) is held until the courier stays healthy for the full lease; core iMessage send/receive is up normally, and explicit StatusKit commands still work")
+	} else {
+		c.startStatusKit(log, "connect")
+	}
+}
+
+// startStatusKit is the ONE entry to the optional StatusKit startup block —
+// IDS topic registration (InitStatuskit), presence subscriptions and the
+// delayed re-subscribe, the contact invite sweep and the startup ShareStatus
+// with its possible PET/GSA refresh. Idempotent per client: Connect calls it
+// for a normal epoch, the receive-wedge watchdog calls it when the flap run's
+// health lease clears an epoch whose startup was deferred, and whichever comes
+// first wins; the other is a no-op. reason names the caller for the log.
+//
+// It runs the block in the background on THIS client and checks c.client and
+// terminationRequested first, so a call that lands during teardown does
+// nothing; the activation path is driven by the epoch's own watchdog (which
+// exits on the epoch's stop channel), so there is no timer that can outlive
+// the epoch and fire against a replacement.
+func (c *IMClient) startStatusKit(log zerolog.Logger, reason string) {
+	c.statusKitStartOnce.Do(func() {
+		c.statusKitStarts.Add(1)
+		c.statusKitDeferred.Store(false)
+		if reason != "connect" {
+			log.Info().Str("reason", reason).Msg("StatusKit startup activated")
+		}
+		go c.runStatusKitStartup(log, c.statusKitSkipHeavyIDSSweep)
+	})
+}
+
+// activateDeferredStatusKit is the receive-wedge watchdog's half of the
+// deferral: called on the tick whose healthy lease ended the flap run. Only
+// an epoch that deferred at Connect has anything to activate; the stop
+// channel is checked here as well as inside the block, so a lease that
+// clears on the same tick a teardown lands starts nothing.
+func (c *IMClient) activateDeferredStatusKit(stop <-chan struct{}, log zerolog.Logger) {
+	if !c.statusKitDeferred.Load() || channelClosed(stop) {
+		return
+	}
+	c.startStatusKit(log, "courier stayed healthy for the full lease; flap run cleared")
+}
+
+// statusKitStartupLaunched reports whether the StatusKit block has been
+// launched on this client, for tests and diagnostics.
+func (c *IMClient) statusKitStartupLaunched() bool {
+	return c.statusKitStarts.Load() > 0
+}
+
+// runStatusKitStartup is the StatusKit block itself, moved verbatim out of
+// Connect so it can be launched from more than one place through
+// startStatusKit. Initialize StatusKit presence system (non-fatal — runs in
+// background). Once initialized, the Rust receive loop intercepts StatusKit
+// APNs messages and invokes OnStatusUpdate for subscribed handles.
+func (c *IMClient) runStatusKitStartup(log zerolog.Logger, skipHeavyIDSSweep bool) {
+
+	if c.client == nil || c.terminationRequested() {
+		return
+	}
+	// Wrapped in a 30s timeout to prevent silent goroutine hangs if the
+	// Rust future (StatusKitClient::new → request_topics) never completes.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Warn().Interface("panic", r).Msg("StatusKit init panicked — treating as init failure")
+				done <- fmt.Errorf("statuskit init panicked: %v", r)
+			}
+		}()
+		done <- c.client.InitStatuskit(c)
+	}()
+	subscribeAfterInit := func(err error) {
+		// Guard against Disconnect having nil'd c.client during the
+		// init window (e.g. bridge shutdown or reconnect cycle while
+		// InitStatuskit was still running past its 30s timeout).
+		if c.client == nil {
+			return
+		}
+		// Registration state is independent of StatusKit init — log it
+		// unconditionally so we can see MULTIPLEX presence even when
+		// init fails. If MULTIPLEX is absent, key exchange cannot work
+		// regardless of how many invites we send.
+		services := c.client.GetRegisteredServices()
+		multiplexPresent := false
+		for _, s := range services {
+			if s == "com.apple.private.alloy.multiplex1" {
+				multiplexPresent = true
+				break
+			}
+		}
+		log.Info().
+			Bool("multiplex_registered", multiplexPresent).
+			Strs("registered_services", services).
+			Bool("init_ok", err == nil).
+			Msg("StatusKit startup")
+
+		if err != nil {
+			log.Warn().Err(err).Msg("StatusKit initialization failed — presence updates unavailable")
+			return
+		}
+		log.Info().Msg("StatusKit presence system initialized")
+		// subscribeToContactPresence may have raced ahead of InitStatuskit
+		// and failed with "StatusKit not initialized". Re-run it now that
+		// the StatusKit client is guaranteed to be ready.
+		c.subscribeToContactPresence(log)
+		// Delayed re-subscribe (~5s): catches peers whose reshare landed
+		// in the brief window between StatusKitClient::new spawning the
+		// APNs recv loop and the Rust-side status_callback being installed.
+		// Reshares in that window have their on_keys_received() call
+		// silently dropped by the `if let Some(cb)` guard in the recv loop;
+		// the bridge has the keys but never re-subscribes for that peer's
+		// presence channel. The 5s delay is comfortably larger than the
+		// callback-install gap (sub-millisecond on typical hardware) and
+		// the first round of inbound reshares (peer-network RTT bounded).
+		go func() {
+			time.Sleep(5 * time.Second)
+			if c.client == nil {
+				return
+			}
+			log.Info().Msg("StatusKit: delayed re-subscribe (catches install-callback race)")
+			c.subscribeToContactPresence(log)
+		}()
+		// Fan-out StatusKit invites matching OB-Android's shape: one
+		// handle per IDS message, paced with a small inter-send delay.
+		// OB invites per-chat-activation (and on app resume); bridge
+		// approximates with a startup sweep. Empirically the batched
+		// 23-handles-in-one-invite call we used previously appeared to
+		// either trigger peer-side filtering or not propagate to each
+		// peer's distribution set the way one-at-a-time invites do —
+		// 12h on passive-only yielded zero real-iOS reshares, whereas
+		// OB (which invites one at a time) gets reshares fine.
+		// Gated by the full-connect cooldown (see lastFullConnectKVKey): a
+		// reconnect/rebuild must not re-fire this 20+-handle IDS invite burst
+		// at Apple. skipHeavyIDSSweep is captured from Connect's scope.
+		if !skipHeavyIDSSweep {
+			go c.inviteContactsToStatusSharing(log)
+		}
+		// Share status "available" once at startup. Empirically, peer iOS
+		// reciprocates a share with its own reshare, which is what gives
+		// us the key material to decrypt their subsequent presence
+		// updates. OB-Android only calls share_status from its zen-mode
+		// hooks (StatusQuery.kt on OS DND change) — but bridge has no OS
+		// DND to hook, and gating share behind a bot command puts a
+		// per-user setup step in the way that most users won't discover.
+		// So: share "available" unconditionally on startup. Bridge has no
+		// Focus mode of its own; "available" is the only truthful state.
+		// Gated on statuskit_share_on_startup (default true, user-overridable).
+		if c.Main.Config.StatusKitShareOnStartup {
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Warn().Interface("panic", r).Msg("StatusKit startup share panicked")
+					}
+				}()
+				sk, err := c.client.GetStatuskitClient()
+				if err != nil || sk == nil {
+					log.Debug().Err(err).Msg("StatusKit startup share skipped — client not ready")
+					return
+				}
+				if err := c.safeRefreshPetTokenThrottled(); err != nil {
+					log.Debug().Err(err).Msg("StatusKit startup share: PET refresh skipped")
+				}
+				shareErr := sk.ShareStatus(true, nil)
+				if shareErr != nil && strings.Contains(shareErr.Error(), "Auth Missing") &&
+					c.tokenProvider != nil && *c.tokenProvider != nil {
+					// Warm-restore (restore_token_provider) injects ONLY the PET;
+					// the full GSA token map — including com.apple.gs.sharedchannels.auth
+					// that share_status needs — is repopulated only by a full
+					// login_email_pass. The GSA-announce prime that used to do that
+					// is disabled, and upstream get_token won't lazily fetch an
+					// *absent* token (it only re-logs-in for an expired-but-present
+					// one), so the map can lack sharedchannels.auth → "Auth Missing".
+					// The proactive refresh above is throttle-skipped on a quick
+					// restart, so force a full refresh here to rebuild the map,
+					// then retry once. One prime fixes the whole process.
+					//
+					// This deliberately bypasses the proactive 5-minute throttle
+					// (the warm-restore map is genuinely incomplete EVERY restart,
+					// so the throttle would wrongly leave us silent). To still
+					// protect against a crash-restart loop hammering Apple's GSA
+					// login, honor a short floor: skip the prime if any token
+					// refresh ran in the last 60s. Matches the CloudKit recovery's
+					// 60s min-interval; a normal restart (minutes apart) clears it,
+					// a tight crash loop (seconds) is bounded to ~1 login/60s.
+					const statusKitPrimeFloor = 60 * time.Second
+					recentRefresh := false
+					if raw := c.Main.Bridge.DB.KV.Get(context.Background(), petRefreshKVKey); raw != "" {
+						if ts, perr := strconv.ParseInt(raw, 10, 64); perr == nil && time.Since(time.Unix(ts, 0)) < statusKitPrimeFloor {
+							recentRefresh = true
+						}
+					}
+					if recentRefresh {
+						log.Warn().Msg("StatusKit startup share hit Auth Missing, but a token refresh ran <60s ago — skipping prime to avoid hammering Apple GSA (crash-loop guard)")
+					} else {
+						log.Info().Msg("StatusKit startup share hit Auth Missing — priming GSA tokens (warm-restore map is PET-only) and retrying")
+						if rErr := safeRefreshPetToken(*c.tokenProvider); rErr != nil {
+							log.Warn().Err(rErr).Msg("StatusKit startup share: GSA token prime failed")
+						} else {
+							c.Main.Bridge.DB.KV.Set(context.Background(), petRefreshKVKey, strconv.FormatInt(time.Now().Unix(), 10))
+							shareErr = sk.ShareStatus(true, nil)
+						}
+					}
+				}
+				if shareErr != nil {
+					log.Warn().Err(shareErr).Msg("StatusKit startup share_status failed")
+					return
+				}
+				// Stamp the post-invite cooldown key so the sweep's
+				// publishStatusKitAvailableAfterInvite (which fires
+				// seconds later when the bootstrap sweep finishes
+				// invites) coalesces with this publish instead of
+				// firing a redundant ShareStatus. Restart-within-5min
+				// is the only case that "loses" a publish; the next
+				// state change or sweep republishes.
+				c.Main.Bridge.DB.KV.Set(context.Background(), database.Key(statusKitLastPostInviteShareKey), time.Now().Format(time.RFC3339))
+				log.Info().Msg("StatusKit startup share_status(available) published")
+			}()
+		} else {
+			log.Info().Msg("StatusKit startup share disabled via config (statuskit_share_on_startup: false)")
+		}
+
+		// Complement the `StatusKit startup` line above with the peer-key
+		// count, which is only available once the StatusKit client is ready.
+		if sk, skErr := c.client.GetStatuskitClient(); skErr == nil && sk != nil {
+			log.Info().Int("known_peer_keys", len(sk.GetKnownHandles())).Msg("StatusKit peer keys loaded")
+		}
+	}
+	select {
+	case err := <-done:
+		subscribeAfterInit(err)
+	case <-ctx.Done():
+		// The Rust FFI call (StatusKitClient::new → request_topics) is
+		// taking longer than 30s. Don't block the connect flow, but keep
+		// a goroutine alive to subscribe as soon as it eventually finishes.
+		// The Rust side WILL set shared_statuskit/status_callback once
+		// StatusKitClient::new completes; we just need to subscribe then.
+		log.Warn().Msg("StatusKit initialization taking >30s — will subscribe when ready")
+		go func() { subscribeAfterInit(<-done) }()
+	}
 }
 
 // mgmtRoomEnsureMu serializes ensureManagementRoom across logins so two
@@ -2378,6 +2467,29 @@ func (c *IMClient) runReceiveWedgeWatchdog(stop chan struct{}, log zerolog.Logge
 				receiveConfirmed = true
 				c.Main.clearHandBacks(c.UserLogin.ID)
 			}
+			// The flap run's health lease (flap_recovery.go). Fed only once a
+			// real frame has been seen this epoch — the seeded stamp is not
+			// health — and only while the age is under rustpush's own stall
+			// bound; an age past it ends the lease, as an APS event does in
+			// the event loop. The tick that serves the full lease ends the run
+			// and, for an epoch that deferred at Connect, launches StatusKit.
+			if receiveConfirmed && idle < courierHealthyMaxIdleSecs {
+				now := time.Now()
+				leaseWasRunning := !c.Main.flapRunHealthySince(c.UserLogin.ID).IsZero()
+				if c.Main.noteCourierHealthy(c.UserLogin.ID, now) {
+					log.Info().
+						Dur("healthy_lease", flapRecoveryHealthyLease).
+						Bool("statuskit_was_deferred", c.statusKitDeferred.Load()).
+						Msg("APNs courier has stayed continuously healthy for the full lease; the flap run is cleared and the next courier-failure rebuild gets normal timing")
+					c.activateDeferredStatusKit(stop, log)
+				} else if !leaseWasRunning && c.statusKitDeferred.Load() {
+					log.Info().
+						Dur("healthy_lease", flapRecoveryHealthyLease).
+						Msg("APNs courier confirmed receiving; the health lease has started — StatusKit startup (deferred for repeated flapping) activates when the lease is served without an interruption")
+				}
+			} else if receiveConfirmed {
+				c.Main.noteCourierUnhealthy(c.UserLogin.ID)
+			}
 			if idle < receiveWedgeRecoverySecs {
 				continue
 			}
@@ -2430,10 +2542,11 @@ func (c *IMClient) runReceiveWedgeWatchdog(stop chan struct{}, log zerolog.Logge
 
 func (c *IMClient) LogoutRemote(ctx context.Context) {
 	c.Disconnect()
-	// The hand-back run is keyed by login ID and lives on the connector, which
-	// outlives this client; a logout ends the run so a later re-login with the
-	// same ID starts with no backoff carried over.
+	// The hand-back and flap runs are keyed by login ID and live on the
+	// connector, which outlives this client; a logout ends both so a later
+	// re-login with the same ID starts with no backoff carried over.
 	c.Main.clearHandBacks(c.UserLogin.ID)
+	c.Main.clearFlapRun(c.UserLogin.ID)
 }
 
 func (c *IMClient) IsThisUser(_ context.Context, userID networkid.UserID) bool {

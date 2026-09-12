@@ -37,6 +37,12 @@ type IMConnector struct {
 	// IMClient because a hand-back exists to make bridgev2 replace the IMClient.
 	handBackMu sync.Mutex
 	handBacks  map[networkid.UserLoginID]*handBackRun
+
+	// Flap-recovery run, per login: the widening schedule for rebuilds after
+	// courier failures on a live link, and the health lease that ends it. A
+	// separate run from handBacks on purpose — see flap_recovery.go.
+	flapRunMu sync.Mutex
+	flapRuns  map[networkid.UserLoginID]*flapRecoveryRun
 }
 
 var _ bridgev2.NetworkConnector = (*IMConnector)(nil)
