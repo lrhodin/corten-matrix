@@ -28,12 +28,13 @@ import (
 //   - flapRecoveryRun counts rebuilds after the courier FAILED ON A LINK THE
 //     PROBE DID NOT CALL DOWN: a Generated -> Generating storm, or a sustained
 //     regeneration failure (RetryFailed), either way recovered through the
-//     public-only loop's 60-second stability window. A flapping courier
-//     delivers frames between flaps, so one frame refutes nothing here; only
-//     sustained health does. Folding this into handBackRun would force one of
-//     the two clear rules on both — the first-frame clear would make this run
-//     never widen, and the 15-minute lease would hold the daily-wedge rebuild
-//     that today rebuilds immediately.
+//     public-only loop — by its 60-second stability window, or by the
+//     unusable-probe hand-back on a host whose probe cannot run. A flapping
+//     courier delivers frames between flaps, so one frame refutes nothing
+//     here; only a lease of healthy time does. Folding this into handBackRun
+//     would force one of the two clear rules on both — the first-frame clear
+//     would make this run never widen, and the lease would hold the
+//     daily-wedge rebuild that today rebuilds immediately.
 //
 // Separation is also what keeps confirmed-outage recovery on normal timing:
 // an episode entered on a confirmed outage never consults or writes this run
@@ -43,33 +44,62 @@ import (
 //
 // INVARIANT — what a live run asserts: "every client built for this login
 // since the run began was built to replace a courier that failed with no
-// outage evidence, and no client since then has stayed healthy for a full
-// lease". It is a statement about the whole sequence, not about the most
-// recent sample: one frame, one quiet tick, or one clean Connect does not
-// refute it, and a single interruption after ten healthy minutes re-asserts
-// it (the lease restarts). It is refuted by exactly two things — a client
-// that stays continuously healthy for flapRecoveryHealthyLease
-// (noteCourierHealthy), or a logout (clearFlapRun) — and by a process restart,
-// because the run is memory-only: a deliberate restart is the operator's own
-// reconnect and starts clean.
+// outage evidence, and no client since then has accrued a full lease of
+// healthy time within its own epoch". It is a statement about the whole
+// sequence, not about the most recent sample: one frame, one quiet tick, or
+// one clean Connect does not refute it, and an interruption after ten healthy
+// minutes does not re-assert it either — it only pauses the accrual. It is
+// refuted by exactly two things — a client whose healthy time within its
+// epoch reaches flapRecoveryHealthyLease (noteCourierHealthy), or a logout
+// (clearFlapRun) — and by a process restart, because the run is memory-only:
+// a deliberate restart is the operator's own reconnect and starts clean.
 //
-// "Continuously healthy" (see noteCourierHealthy/noteCourierUnhealthy) means
-// that within the current client epoch, for the whole lease: no APS connection
-// event (Interrupted or RetryFailed) was observed, and every receive-watchdog
-// tick found the inbound-frame age under courierHealthyMaxIdleSecs. A healthy
-// link can sustain that indefinitely: rustpush sends a keepalive Ping every
-// 60s (aps.rs), the Pong is broadcast on messages_cont like every other frame
-// and stamps last_inbound_ms (lib.rs drain task), so the age the watchdog reads
-// on an idle link is at most about 60s at every tick. The bound is rustpush's
-// own stall definition — five missed keepalive cycles — so a quiet minute
-// cannot reset the lease and a dead-but-not-yet-wedged link cannot pass as
-// healthy for more than five of them.
+// "Healthy time" (see noteCourierHealthy/noteCourierUnhealthy) accrues in
+// stretches within the current client epoch. A stretch begins at the first
+// receive-watchdog tick that finds the inbound-frame age under
+// courierHealthyMaxIdleSecs — after a real frame has been seen this epoch,
+// the seeded stamp is not health — and ends at the next APS connection event
+// (Interrupted or RetryFailed) or the next tick that finds the age past the
+// bound. A stretch that ends is BANKED, not discarded: what an interruption
+// costs the run is the unhealthy time that follows it, never the healthy time
+// before it. A rebuild (noteFlapRebuild) zeroes the bank, so the lease is
+// always one epoch's own healthy time.
+//
+// Why cumulative rather than contiguous: rustpush's own receive watchdog
+// (lib.rs, APNS_STALL_TIMEOUT = 300s) forces a transport-only reconnect on a
+// link that stopped receiving, and the APS observer reports that reconnect as
+// Interrupted (aps_connection_events.rs: Generated -> Generating). A link that
+// stalls and self-heals every few minutes therefore interrupts on every cycle
+// while never storming (the burst and sustained thresholds) and never wedging
+// (receiveWedgeRecoverySecs), so no recovery episode fires and nothing rebuilds
+// it. A contiguous lease was unreachable on that link, and the run pinned —
+// with presence deferred — until a process restart. With accrual the lease is
+// served in bounded time on ANY epoch that receives: an epoch that survives
+// sees a frame at least every receiveWedgeRecoverySecs (600s, or the wedge
+// watchdog rebuilds it), each frame is followed by healthy ticks until the
+// age passes 300s, so at least about 240s of every 600s accrues and the lease
+// is served within roughly 2.5x flapRecoveryHealthyLease — under 40 minutes —
+// of the first confirmed frame. A non-receiving epoch is rebuilt at the wedge
+// threshold, held at most handBackDelay's cap. No epoch stays deferred for
+// more than about an hour. A courier that flaps at storm rate (5 in 60s, or
+// 12 in 10 minutes) enters recovery — and is torn down, bank and all — before
+// it can accrue the 15-minute lease, and a RetryFailed enters at once; a
+// courier that flaps below storm rate is, for this run's purpose, not
+// flapping: no rebuild is being requested, and the run measures rebuilds.
+//
+// A healthy link sustains a stretch indefinitely: rustpush sends a keepalive
+// Ping every 60s (aps.rs), the Pong is broadcast on messages_cont like every
+// other frame and stamps last_inbound_ms (lib.rs drain task), so the age the
+// watchdog reads on an idle link is at most about 60s at every tick. The
+// bound is rustpush's own stall definition — five missed keepalive cycles —
+// so a quiet minute cannot end a stretch and a dead-but-not-yet-wedged link
+// cannot pass as healthy for more than five of them.
 //
 // Writers of the fields, in full:
-//   - noteFlapRebuild:     ConsecutiveRebuilds++, LastRebuild = now, HealthySince = zero
-//   - noteCourierHealthy:  HealthySince = now (first healthy tick of a lease); deletes the run once the lease is served
-//   - noteCourierUnhealthy: HealthySince = zero
-//   - clearFlapRun:        deletes the run (LogoutRemote)
+//   - noteFlapRebuild:      ConsecutiveRebuilds++, LastRebuild = now, HealthySince = zero, HealthyAccrued = 0
+//   - noteCourierHealthy:   HealthySince = now (first tick of a stretch); deletes the run once accrued + current stretch >= lease
+//   - noteCourierUnhealthy: HealthyAccrued += now - HealthySince (banks the stretch), HealthySince = zero
+//   - clearFlapRun:         deletes the run (LogoutRemote)
 type flapRecoveryRun struct {
 	// ConsecutiveRebuilds is how many courier-failure rebuilds this run has
 	// requested. The Nth request is held handBackDelay(N-1) after the (N-1)th:
@@ -79,21 +109,25 @@ type flapRecoveryRun struct {
 	// send, unconditionally, exactly as noteHandBack does — an unobservable
 	// queue drop must err toward fewer Apple attempts).
 	LastRebuild time.Time
-	// HealthySince is the start of the current health lease, or zero while
+	// HealthySince is the start of the current healthy stretch, or zero while
 	// the courier is not known to be healthy.
 	HealthySince time.Time
+	// HealthyAccrued is the banked healthy time of the stretches that have
+	// already ended in this epoch. The lease is served when it plus the
+	// current stretch reaches flapRecoveryHealthyLease.
+	HealthyAccrued time.Duration
 }
 
-// flapRecoveryHealthyLease is how long a courier must stay continuously
-// healthy to end a flap run — and, for an epoch whose StatusKit startup was
-// deferred, to start it. A var only so tests can shrink it; never reassigned in
-// production.
+// flapRecoveryHealthyLease is how much healthy time a courier must accrue
+// within one epoch to end a flap run — and, for an epoch whose StatusKit
+// startup was deferred, to start it. A var only so tests can shrink it; never
+// reassigned in production.
 var flapRecoveryHealthyLease = 15 * time.Minute
 
-// courierHealthyMaxIdleSecs is the inbound-frame age above which a tick does
-// not count as healthy. It is rustpush's APNS_STALL_TIMEOUT (lib.rs): five
-// missed keepalive cycles, the point at which the Rust side itself forces a
-// transport reconnect. Kept as a literal rather than derived from
+// courierHealthyMaxIdleSecs is the inbound-frame age at and above which a tick
+// does not count as healthy. It is rustpush's APNS_STALL_TIMEOUT (lib.rs):
+// five missed keepalive cycles, the point at which the Rust side itself forces
+// a transport reconnect. Kept as a literal rather than derived from
 // receiveWedgeRecoverySecs so the two thresholds stay independently pinned.
 const courierHealthyMaxIdleSecs uint64 = 300
 
@@ -132,8 +166,9 @@ func (c *IMConnector) flapRebuildDue(login networkid.UserLoginID, now time.Time)
 }
 
 // noteFlapRebuild records a courier-failure rebuild request, widening the next
-// interval. The health lease is reset: the client being replaced is not the one
-// whose health will refute the run.
+// interval. The healthy time is zeroed — the current stretch and the bank —
+// because the client being replaced is not the one whose health will refute
+// the run: the lease is always one epoch's own.
 func (c *IMConnector) noteFlapRebuild(login networkid.UserLoginID, now time.Time) {
 	c.flapRunMu.Lock()
 	defer c.flapRunMu.Unlock()
@@ -141,6 +176,7 @@ func (c *IMConnector) noteFlapRebuild(login networkid.UserLoginID, now time.Time
 	run.ConsecutiveRebuilds++
 	run.LastRebuild = now
 	run.HealthySince = time.Time{}
+	run.HealthyAccrued = 0
 }
 
 // flapRebuildCount is the run's length, for logging and for Connect's
@@ -164,10 +200,10 @@ func (c *IMConnector) flapRecoveryDefersStatusKit(login networkid.UserLoginID) b
 }
 
 // noteCourierHealthy records one healthy receive-watchdog tick. The first
-// healthy tick after a rebuild or an interruption starts the lease; a tick
-// that finds the lease fully served ends the run and reports cleared=true,
-// exactly once per run. With no run in progress there is nothing to lease and
-// nothing is recorded.
+// healthy tick after a rebuild or an interruption starts a stretch; a tick
+// that finds the banked time plus the current stretch at or past the lease
+// ends the run and reports cleared=true, exactly once per run. With no run in
+// progress there is nothing to lease and nothing is recorded.
 func (c *IMConnector) noteCourierHealthy(login networkid.UserLoginID, now time.Time) (cleared bool) {
 	c.flapRunMu.Lock()
 	defer c.flapRunMu.Unlock()
@@ -177,29 +213,37 @@ func (c *IMConnector) noteCourierHealthy(login networkid.UserLoginID, now time.T
 	}
 	if run.HealthySince.IsZero() {
 		run.HealthySince = now
-		return false
 	}
-	if now.Sub(run.HealthySince) < flapRecoveryHealthyLease {
+	if run.HealthyAccrued+now.Sub(run.HealthySince) < flapRecoveryHealthyLease {
 		return false
 	}
 	delete(c.flapRuns, login)
 	return true
 }
 
-// noteCourierUnhealthy ends the current health lease: an APS connection event
-// (the courier left Generated, or a regeneration failed) or an inbound-frame
-// age past the healthy bound. The run itself is untouched — this is the
-// evidence that RE-ASSERTS it.
-func (c *IMConnector) noteCourierUnhealthy(login networkid.UserLoginID) {
+// noteCourierUnhealthy ends the current healthy stretch and banks it: an APS
+// connection event (the courier left Generated, or a regeneration failed) or
+// an inbound-frame age past the healthy bound. The run itself is untouched,
+// and so is the healthy time already accrued — the interruption costs the run
+// only the unhealthy time that follows it (see the header comment for why).
+// now is the caller's clock; the two callers run on different goroutines, so
+// a stretch whose end reads before its start is banked as nothing rather than
+// as negative time.
+func (c *IMConnector) noteCourierUnhealthy(login networkid.UserLoginID, now time.Time) {
 	c.flapRunMu.Lock()
 	defer c.flapRunMu.Unlock()
-	if run := c.flapRuns[login]; run != nil {
-		run.HealthySince = time.Time{}
+	run := c.flapRuns[login]
+	if run == nil || run.HealthySince.IsZero() {
+		return
 	}
+	if stretch := now.Sub(run.HealthySince); stretch > 0 {
+		run.HealthyAccrued += stretch
+	}
+	run.HealthySince = time.Time{}
 }
 
-// flapRunHealthySince exposes the lease start for logging; zero when no lease
-// is running.
+// flapRunHealthySince exposes the current stretch's start for logging and
+// tests; zero when no stretch is running.
 func (c *IMConnector) flapRunHealthySince(login networkid.UserLoginID) time.Time {
 	c.flapRunMu.Lock()
 	defer c.flapRunMu.Unlock()
@@ -207,6 +251,17 @@ func (c *IMConnector) flapRunHealthySince(login networkid.UserLoginID) time.Time
 		return run.HealthySince
 	}
 	return time.Time{}
+}
+
+// flapRunHealthyAccrued exposes the banked healthy time of the ended stretches
+// for logging and tests; zero when there is no run.
+func (c *IMConnector) flapRunHealthyAccrued(login networkid.UserLoginID) time.Duration {
+	c.flapRunMu.Lock()
+	defer c.flapRunMu.Unlock()
+	if run := c.flapRuns[login]; run != nil {
+		return run.HealthyAccrued
+	}
+	return 0
 }
 
 // clearFlapRun ends the run outright. Called by LogoutRemote, so a later

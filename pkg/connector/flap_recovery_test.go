@@ -8,8 +8,11 @@
 package connector
 
 import (
+	"bytes"
 	"context"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -131,10 +134,11 @@ func TestOneInboundFrameDoesNotClearTheFlapRun(t *testing.T) {
 	}
 }
 
-// Item 4: the run ends after fifteen continuously healthy minutes — the lease
-// is literally 15 minutes, a lease one second short does not clear, and an
-// interruption inside it restarts the clock. Then the same through the real
-// watchdog with the lease scaled down.
+// Item 4: the run ends once the epoch has accrued fifteen minutes of healthy
+// time — the lease is literally 15 minutes, a lease one second short does not
+// clear, an interruption pauses the accrual (the stretch before it is banked,
+// the unhealthy time after it does not count) and does not restart it. Then
+// the same through the real watchdog with the lease scaled down.
 func TestFifteenHealthyMinutesClearTheFlapRun(t *testing.T) {
 	if flapRecoveryHealthyLease != 15*time.Minute {
 		t.Fatalf("flapRecoveryHealthyLease = %v, want the specified 15 minutes", flapRecoveryHealthyLease)
@@ -150,24 +154,44 @@ func TestFifteenHealthyMinutesClearTheFlapRun(t *testing.T) {
 	if main.noteCourierHealthy(login, t0.Add(time.Minute+15*time.Minute-time.Second)) {
 		t.Fatal("cleared one second before the lease was served")
 	}
-	// An interruption restarts the clock: fifteen minutes measured from the
-	// original start no longer count.
-	main.noteCourierUnhealthy(login)
-	if main.noteCourierHealthy(login, t0.Add(16*time.Minute)) {
-		t.Fatal("cleared on the first healthy tick after an interruption")
-	}
-	if main.noteCourierHealthy(login, t0.Add(16*time.Minute+15*time.Minute-time.Second)) {
-		t.Fatal("cleared before the restarted lease was served")
-	}
-	if !main.noteCourierHealthy(login, t0.Add(31*time.Minute)) {
-		t.Fatal("fifteen continuously healthy minutes did not clear the run")
+	if !main.noteCourierHealthy(login, t0.Add(16*time.Minute)) {
+		t.Fatal("fifteen healthy minutes did not clear the run")
 	}
 	if got := main.flapRebuildCount(login); got != 0 {
 		t.Fatalf("run length after clearing = %d, want 0", got)
 	}
-	if _, ok := main.flapRebuildDue(login, t0.Add(31*time.Minute)); !ok {
+	if _, ok := main.flapRebuildDue(login, t0.Add(16*time.Minute)); !ok {
 		t.Fatal("a cleared run must give the next rebuild normal timing")
 	}
+
+	t.Run("an interruption pauses the accrual", func(t *testing.T) {
+		main := &IMConnector{}
+		main.noteFlapRebuild(login, t0)
+		// Ten healthy minutes, banked by the interruption.
+		main.noteCourierHealthy(login, t0.Add(time.Minute))
+		main.noteCourierUnhealthy(login, t0.Add(11*time.Minute))
+		if got := main.flapRunHealthyAccrued(login); got != 10*time.Minute {
+			t.Fatalf("banked healthy time after the interruption = %v, want 10m", got)
+		}
+		if !main.flapRunHealthySince(login).IsZero() {
+			t.Fatal("the interruption did not end the stretch")
+		}
+		// Nine unhealthy minutes count for nothing: at t0+20m the courier is
+		// healthy again with 10m banked, so the lease is served at t0+25m —
+		// not at t0+16m (wall clock) and not at t0+35m (a restarted lease).
+		if main.noteCourierHealthy(login, t0.Add(20*time.Minute)) {
+			t.Fatal("cleared on the first healthy tick after an interruption")
+		}
+		if main.noteCourierHealthy(login, t0.Add(24*time.Minute)) {
+			t.Fatal("cleared at 14 accrued minutes: the unhealthy time was counted")
+		}
+		if main.noteCourierHealthy(login, t0.Add(25*time.Minute-time.Second)) {
+			t.Fatal("cleared one second before the accrued lease was served")
+		}
+		if !main.noteCourierHealthy(login, t0.Add(25*time.Minute)) {
+			t.Fatal("fifteen accrued healthy minutes did not clear the run: the interruption restarted the lease")
+		}
+	})
 
 	t.Run("through the real watchdog", func(t *testing.T) {
 		scaleEventLoopTimingForTest(t)
@@ -184,6 +208,118 @@ func TestFifteenHealthyMinutesClearTheFlapRun(t *testing.T) {
 			t.Fatalf("a served lease left the flap run at %d", got)
 		}
 	})
+}
+
+// Finding 1 (flap-run review): the link class this feature targets. rustpush's
+// receive watchdog forces a transport reconnect at 300s of silence, which the
+// APS observer reports as Interrupted, and the Go watchdog's own tick at that
+// age is unhealthy too — so a courier that stalls and self-heals every five
+// minutes ends a stretch on every cycle while never storming or wedging.
+// Literal timeline, one cycle: frames resume at B; ticks at B+60..B+240 are
+// healthy (a stretch from B+60); at B+300 the stall interrupts and the tick
+// reads 300. Each cycle banks 240s, so three cycles bank 720s and the fourth
+// cycle's stretch serves the lease 180s in, at B3+240 = t0+19m. A contiguous
+// lease is never served on this link.
+func TestSelfHealingStallLinkServesTheLease(t *testing.T) {
+	main := &IMConnector{}
+	login := newRecoveryTestClient().UserLogin.ID
+	t0 := time.Unix(80_000, 0)
+	main.noteFlapRebuild(login, t0)
+	main.noteFlapRebuild(login, t0)
+	if !main.flapRecoveryDefersStatusKit(login) {
+		t.Fatal("precondition: a repeated run defers")
+	}
+
+	var clearedAt time.Time
+	for cycle := 0; cycle < 6 && clearedAt.IsZero(); cycle++ {
+		base := t0.Add(time.Duration(cycle) * 5 * time.Minute)
+		for tick := 1; tick <= 4; tick++ {
+			at := base.Add(time.Duration(tick) * time.Minute)
+			if main.noteCourierHealthy(login, at) {
+				clearedAt = at
+				break
+			}
+		}
+		if clearedAt.IsZero() {
+			// The stall: the APS event loop and the watchdog tick both end
+			// the stretch; the second is a no-op.
+			main.noteCourierUnhealthy(login, base.Add(5*time.Minute))
+			main.noteCourierUnhealthy(login, base.Add(5*time.Minute))
+		}
+	}
+	if clearedAt.IsZero() {
+		t.Fatal("six stall cycles never served the lease: the run is pinned on a self-healing link")
+	}
+	if want := t0.Add(19 * time.Minute); !clearedAt.Equal(want) {
+		t.Fatalf("lease served at +%v, want +19m (three cycles of 240s banked plus 180s of the fourth stretch)", clearedAt.Sub(t0))
+	}
+	if main.flapRecoveryDefersStatusKit(login) || main.flapRebuildCount(login) != 0 {
+		t.Fatal("the served lease did not end the run")
+	}
+}
+
+// The same link through the real watchdog: the inbound age cycles four
+// healthy ticks then two past the bound, so no contiguous stretch can reach
+// the lease, and the deferred StatusKit block still activates.
+func TestSelfHealingStallLinkActivatesDeferredStatusKit(t *testing.T) {
+	scaleEventLoopTimingForTest(t)
+	scaleHealthyLeaseForTest(t, 20*time.Millisecond)
+	_ = recordStates(t)
+	internetProbeFunc = func(context.Context, string) internetprobe.Result { return reachableResult() }
+	client := newRecoveryTestClient()
+	client.startupTime = time.Now().Add(-2 * time.Hour)
+	var ticks atomic.Int64
+	apsSecondsSinceLastInbound = func(*rustpushgo.WrappedApsConnection) uint64 {
+		if n := ticks.Add(1) - 1; n%6 < 4 {
+			return 30
+		}
+		return 400
+	}
+	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
+	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
+	client.launchOrDeferStatusKit(zerolog.Nop(), false)
+
+	runWedgeWatchdogForTest(t, client, 300*time.Millisecond)
+
+	if got := client.Main.flapRebuildCount(client.UserLogin.ID); got != 0 {
+		t.Fatalf("a self-healing stall link left the flap run at %d after %d ticks", got, ticks.Load())
+	}
+	if !client.statusKitStartupLaunched() {
+		t.Fatal("the deferred StatusKit block never activated on a self-healing stall link")
+	}
+}
+
+// A rebuild zeroes the epoch's healthy time — the stretch and the bank — so
+// the lease is always the replacement's own. Fourteen minutes banked by the
+// client being replaced must not let the replacement clear after one.
+func TestFlapRebuildZeroesHealthyTime(t *testing.T) {
+	main := &IMConnector{}
+	login := newRecoveryTestClient().UserLogin.ID
+	t0 := time.Unix(90_000, 0)
+	main.noteFlapRebuild(login, t0)
+	main.noteCourierHealthy(login, t0.Add(time.Minute))
+	main.noteCourierUnhealthy(login, t0.Add(15*time.Minute))
+	main.noteCourierHealthy(login, t0.Add(16*time.Minute))
+	if got := main.flapRunHealthyAccrued(login); got != 14*time.Minute {
+		t.Fatalf("precondition: banked = %v, want 14m", got)
+	}
+
+	main.noteFlapRebuild(login, t0.Add(17*time.Minute))
+	if got := main.flapRunHealthyAccrued(login); got != 0 {
+		t.Fatalf("banked healthy time survived the rebuild: %v", got)
+	}
+	if !main.flapRunHealthySince(login).IsZero() {
+		t.Fatal("the running stretch survived the rebuild")
+	}
+	if main.noteCourierHealthy(login, t0.Add(18*time.Minute)) {
+		t.Fatal("the replacement inherited the replaced client's healthy time")
+	}
+	if main.noteCourierHealthy(login, t0.Add(33*time.Minute-time.Second)) {
+		t.Fatal("cleared before the replacement's own lease was served")
+	}
+	if !main.noteCourierHealthy(login, t0.Add(33*time.Minute)) {
+		t.Fatal("the replacement's own fifteen minutes did not clear the run")
+	}
 }
 
 // Item 5: a fresh IMConnector — what a process restart builds — has no run:
@@ -462,7 +598,9 @@ func TestAPSEventEndsTheHealthLease(t *testing.T) {
 	internetProbeFunc = func(context.Context, string) internetprobe.Result { return reachableResult() }
 	client := newRecoveryTestClient()
 	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
-	client.Main.noteCourierHealthy(client.UserLogin.ID, time.Now())
+	// A stretch that began a minute ago, so the interruption has something
+	// to bank.
+	client.Main.noteCourierHealthy(client.UserLogin.ID, time.Now().Add(-time.Minute))
 	if client.Main.flapRunHealthySince(client.UserLogin.ID).IsZero() {
 		t.Fatal("precondition: the lease must be running")
 	}
@@ -472,17 +610,22 @@ func TestAPSEventEndsTheHealthLease(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for !client.Main.flapRunHealthySince(client.UserLogin.ID).IsZero() {
 		if time.Now().After(deadline) {
-			t.Fatal("an APS interruption did not end the health lease")
+			t.Fatal("an APS interruption did not end the healthy stretch")
 		}
 		time.Sleep(time.Millisecond)
 	}
 	if got := client.Main.flapRebuildCount(client.UserLogin.ID); got != 1 {
 		t.Fatalf("an interruption changed the run length to %d", got)
 	}
+	if got := client.Main.flapRunHealthyAccrued(client.UserLogin.ID); got < time.Minute {
+		t.Fatalf("the interruption discarded the stretch instead of banking it: accrued %v, want >= 1m", got)
+	}
 }
 
 // The healthy bound is rustpush's stall definition, five missed 60s keepalive
-// cycles: an age of 299s is a healthy tick, 301s ends the lease. Pinned with
+// cycles: an age of 299s is a healthy tick, 300s and 301s end the stretch (the
+// bound is exclusive, as rustpush's own `idle >= APNS_STALL_TIMEOUT` is
+// inclusive). Pinned with
 // literals so the bound cannot drift toward the 600s wedge threshold, where a
 // dead link would pass as healthy for ten minutes at a time.
 func TestWatchdogHealthBoundIsTheRustStallTimeout(t *testing.T) {
@@ -494,6 +637,7 @@ func TestWatchdogHealthBoundIsTheRustStallTimeout(t *testing.T) {
 		wantLeasing bool
 	}{
 		{299, true},
+		{300, false},
 		{301, false},
 	} {
 		scaleEventLoopTimingForTest(t)
@@ -522,5 +666,256 @@ func TestLogoutClearsTheFlapRun(t *testing.T) {
 	client.LogoutRemote(context.Background())
 	if client.Main.flapRecoveryDefersStatusKit(client.UserLogin.ID) || client.Main.flapRebuildCount(client.UserLogin.ID) != 0 {
 		t.Fatal("LogoutRemote must clear the flap run")
+	}
+}
+
+// Finding 2 (flap-run review): the deferred launch must carry Connect's
+// invite-sweep decision to the block itself. Observed where it lands —
+// runStatusKitStartup records the argument it received — not where it was
+// captured, so a launch that passes a constant fails for one of the two
+// values. Both a deferred activation (through the real watchdog) and a
+// normal Connect launch are driven, for both decisions.
+func TestStatusKitLaunchCarriesConnectsSweepDecision(t *testing.T) {
+	waitLaunched := func(t *testing.T, client *IMClient) int32 {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if got := client.statusKitLaunchedWith.Load(); got != statusKitLaunchNotYet {
+				return got
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("runStatusKitStartup never ran")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	want := func(skip bool) int32 {
+		if skip {
+			return statusKitLaunchSkippedSweep
+		}
+		return statusKitLaunchWithSweep
+	}
+	for _, skip := range []bool{true, false} {
+		name := "sweep"
+		if skip {
+			name = "sweep skipped"
+		}
+		t.Run("deferred activation/"+name, func(t *testing.T) {
+			scaleEventLoopTimingForTest(t)
+			scaleHealthyLeaseForTest(t, 20*time.Millisecond)
+			_ = recordStates(t)
+			internetProbeFunc = func(context.Context, string) internetprobe.Result { return reachableResult() }
+			client := newRecoveryTestClient()
+			healthySinceConnect(client, 30)
+			client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
+			client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
+			client.launchOrDeferStatusKit(zerolog.Nop(), skip)
+			if client.statusKitStartupLaunched() {
+				t.Fatal("precondition: the block must be deferred at Connect")
+			}
+
+			runWedgeWatchdogForTest(t, client, 200*time.Millisecond)
+
+			if !client.statusKitStartupLaunched() {
+				t.Fatal("the served lease did not launch the block")
+			}
+			if got := waitLaunched(t, client); got != want(skip) {
+				t.Fatalf("skipHeavyIDSSweep=%v at Connect, but the deferred launch ran the block with %d, want %d", skip, got, want(skip))
+			}
+		})
+		t.Run("normal launch/"+name, func(t *testing.T) {
+			client := newRecoveryTestClient()
+			client.launchOrDeferStatusKit(zerolog.Nop(), skip)
+			if got := waitLaunched(t, client); got != want(skip) {
+				t.Fatalf("skipHeavyIDSSweep=%v at Connect, but the launch ran the block with %d, want %d", skip, got, want(skip))
+			}
+		})
+	}
+}
+
+// Finding 3 (flap-run review): the inbound stamp rustpushgo seeds at
+// LoadUserLogin is not health. A courier that never delivers a frame reads a
+// small, constant age that is never smaller than the time since Connect, so
+// receive is never confirmed — and until it is, no tick feeds the lease, the
+// run is not cleared, and a deferred block is not activated.
+func TestSeededInboundStampDoesNotFeedTheLease(t *testing.T) {
+	scaleEventLoopTimingForTest(t)
+	scaleHealthyLeaseForTest(t, 5*time.Millisecond)
+	_ = recordStates(t)
+	internetProbeFunc = func(context.Context, string) internetprobe.Result { return reachableResult() }
+	client := newRecoveryTestClient()
+	// Connect just happened; the seed is 30s old and stays 30s old (no
+	// frame). 30 < time since startupTime is false for the whole run.
+	client.startupTime = time.Now()
+	apsSecondsSinceLastInbound = func(*rustpushgo.WrappedApsConnection) uint64 { return 30 }
+	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
+	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
+	client.launchOrDeferStatusKit(zerolog.Nop(), false)
+
+	runWedgeWatchdogForTest(t, client, 100*time.Millisecond)
+
+	if !client.Main.flapRunHealthySince(client.UserLogin.ID).IsZero() || client.Main.flapRunHealthyAccrued(client.UserLogin.ID) != 0 {
+		t.Fatal("the seeded stamp fed the lease before any real frame")
+	}
+	if got := client.Main.flapRebuildCount(client.UserLogin.ID); got != 2 {
+		t.Fatalf("a courier that never received cleared the run (count %d)", got)
+	}
+	if client.statusKitStartupLaunched() {
+		t.Fatal("a courier that never received activated the deferred StatusKit block")
+	}
+}
+
+// Finding 4 (flap-run review): the serving tick hands the watchdog's OWN stop
+// channel to the activation, so a teardown that lands between the tick's
+// dispatch and the activation starts nothing. Driven deterministically: the
+// inbound-age seam blocks inside the tick, the epoch is torn down while it is
+// blocked, then the tick is released to serve an already-accrued lease.
+func TestServingTickHonorsTheEpochStopChannel(t *testing.T) {
+	scaleEventLoopTimingForTest(t)
+	_ = recordStates(t)
+	internetProbeFunc = func(context.Context, string) internetprobe.Result { return reachableResult() }
+	client := newRecoveryTestClient()
+	client.startupTime = time.Now().Add(-2 * time.Hour)
+	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
+	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
+	client.launchOrDeferStatusKit(zerolog.Nop(), false)
+	// A stretch older than the lease: the first tick serves it.
+	client.Main.noteCourierHealthy(client.UserLogin.ID, time.Now().Add(-16*time.Minute))
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	apsSecondsSinceLastInbound = func(*rustpushgo.WrappedApsConnection) uint64 {
+		once.Do(func() {
+			close(entered)
+			<-release
+		})
+		return 30
+	}
+	client.connection = &rustpushgo.WrappedApsConnection{}
+	closeConn := closeAPSConnection
+	t.Cleanup(func() { closeAPSConnection = closeConn })
+	closeAPSConnection = func(*rustpushgo.WrappedApsConnection) {}
+	done := make(chan struct{})
+	go func() {
+		client.runReceiveWedgeWatchdog(client.stopChan, zerolog.Nop())
+		close(done)
+	}()
+
+	<-entered
+	client.Disconnect() // closes the epoch's stop channel mid-tick
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("wedge watchdog did not exit")
+	}
+
+	if got := client.Main.flapRebuildCount(client.UserLogin.ID); got != 0 {
+		t.Fatalf("precondition: the released tick must have served the lease (run length %d)", got)
+	}
+	if client.statusKitStartupLaunched() {
+		t.Fatal("the serving tick activated StatusKit against a torn-down epoch: it did not consult the epoch's stop channel")
+	}
+	if !client.statusKitDeferred.Load() {
+		t.Fatal("the deferral was dropped by teardown; a replacement decides for itself")
+	}
+}
+
+// Finding 6 (flap-run review): the "healthy time now accrues" notice is
+// logged once per epoch, not once per stretch. The stall link this lease is
+// built for starts a new stretch every few minutes, so a per-stretch line is
+// the unthrottled log the review found.
+func TestLeaseAccrualIsLoggedOncePerEpoch(t *testing.T) {
+	scaleEventLoopTimingForTest(t)
+	_ = recordStates(t)
+	internetProbeFunc = func(context.Context, string) internetprobe.Result { return reachableResult() }
+	client := newRecoveryTestClient()
+	client.startupTime = time.Now().Add(-2 * time.Hour)
+	// Healthy, unhealthy, healthy, ...: a new stretch every other tick.
+	var ticks atomic.Int64
+	apsSecondsSinceLastInbound = func(*rustpushgo.WrappedApsConnection) uint64 {
+		if ticks.Add(1)%2 == 1 {
+			return 30
+		}
+		return 400
+	}
+	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
+	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
+	client.launchOrDeferStatusKit(zerolog.Nop(), false)
+
+	var mu sync.Mutex
+	var output bytes.Buffer
+	log := zerolog.New(&lockedWriter{mu: &mu, w: &output})
+	client.connection = &rustpushgo.WrappedApsConnection{}
+	closeConn := closeAPSConnection
+	t.Cleanup(func() { closeAPSConnection = closeConn })
+	closeAPSConnection = func(*rustpushgo.WrappedApsConnection) {}
+	done := make(chan struct{})
+	go func() {
+		client.runReceiveWedgeWatchdog(client.stopChan, log)
+		close(done)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	client.Disconnect()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("wedge watchdog did not exit")
+	}
+
+	mu.Lock()
+	text := output.String()
+	mu.Unlock()
+	if stretches := ticks.Load() / 2; stretches < 5 {
+		t.Fatalf("precondition: only %d stretches were driven", stretches)
+	}
+	if got := strings.Count(text, "healthy time now accrues toward the lease"); got != 1 {
+		t.Fatalf("the accrual notice was logged %d times over many stretches, want exactly once per epoch\n%s", got, text)
+	}
+	if strings.Contains(text, "the health lease has started") {
+		t.Fatal("the notice still claims a lease has started")
+	}
+}
+
+// lockedWriter serializes a test log buffer against the reading test.
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+// A deferred epoch whose run is gone — served by the retired predecessor's
+// final tick racing this Connect's decision — has nothing left to wait for:
+// it activates on its first healthy tick instead of holding presence for a
+// lease no run will ever serve.
+func TestDeferredEpochWithoutARunActivatesOnFirstHealthyTick(t *testing.T) {
+	scaleEventLoopTimingForTest(t)
+	_ = recordStates(t)
+	internetProbeFunc = func(context.Context, string) internetprobe.Result { return reachableResult() }
+	client := newRecoveryTestClient()
+	healthySinceConnect(client, 30)
+	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
+	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
+	client.launchOrDeferStatusKit(zerolog.Nop(), false)
+	if !client.statusKitDeferred.Load() {
+		t.Fatal("precondition: the epoch must be deferred")
+	}
+	// The run ends under the deferred epoch, with the production lease in
+	// force so no tick can serve one.
+	client.Main.clearFlapRun(client.UserLogin.ID)
+
+	runWedgeWatchdogForTest(t, client, 100*time.Millisecond)
+
+	if !client.statusKitStartupLaunched() {
+		t.Fatal("a deferred epoch with no run never activated StatusKit")
+	}
+	if client.statusKitDeferred.Load() {
+		t.Fatal("the activation did not clear the deferred mark")
 	}
 }

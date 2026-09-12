@@ -718,12 +718,85 @@ func TestLoopStillRecoversNormallyAfterAnUnusableProbeHandBack(t *testing.T) {
 	healthy = true
 	mu.Unlock()
 
+	// The hand-back was a courier-failure rebuild request, so it is in the
+	// flap run (finding 5), and the follow-up recovered request is held 7m
+	// behind it — exactly as a dropped recovered request already holds its
+	// own follow-up. Pinned here (the run is written after the send, so it is
+	// polled), then the run is cleared to stand in for the hold expiring,
+	// which is what lets the recovered path be reached.
+	deadline := time.Now().Add(2 * time.Second)
+	for client.Main.flapRebuildCount(client.UserLogin.ID) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("flap run after an unusable-probe hand-back = %d, want 1", client.Main.flapRebuildCount(client.UserLogin.ID))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-recovered:
+		t.Fatal("a recovered request followed a hand-back inside the flap run's 7m hold")
+	case <-time.After(100 * time.Millisecond):
+	}
+	client.Main.clearFlapRun(client.UserLogin.ID)
+
 	select {
 	case <-recovered:
 	case <-time.After(10 * time.Second):
 		t.Fatal("after a hand-back the loop never recovered normally — the hand-back arm has latched and the stability/preflight path is unreachable")
 	}
 	stop()
+}
+
+// Finding 5 (flap-run review), through the real loop: on a host whose public
+// probe cannot get a socket, a courier-failure episode's only rebuild is the
+// unusable-probe hand-back. It is recorded in the flap run — the replacement
+// receives at once and clears handBackRun, so this is the only run that can
+// grow on such a host — and a run already in progress holds it.
+func TestUnusableProbeHandBackIsRecordedInAndHeldByTheFlapRun(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		priorRebuilds int
+		wantHandBacks int
+		wantRun       int
+	}{
+		{"no run: hand-back sent and the run started", 0, 1, 1},
+		{"a recent courier-failure rebuild: hand-back held, run unchanged", 1, 0, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scaleRecoveryTimingForTest(t)
+			retryDelayFunc = func(time.Duration) time.Duration { return time.Millisecond }
+			internetProbeFunc = func(context.Context, string) internetprobe.Result { return blockedResult() }
+			var mu sync.Mutex
+			handBacks := 0
+			sendRecoveryState = func(_ *bridgev2.Bridge, _ *bridgev2.BridgeStateQueue, st status.BridgeState) bool {
+				if st.Error == "im-internet-probe-unusable" {
+					mu.Lock()
+					handBacks++
+					mu.Unlock()
+				}
+				return true
+			}
+			client := newRecoveryTestClient()
+			for range tc.priorRebuilds {
+				// The hand-back run is clean (the previous replacement
+				// received a frame); only the flap run can hold.
+				client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
+			}
+
+			stop := runRecoveryLoopForTestFrom(t, client, verdictBlocked)
+			time.Sleep(300 * time.Millisecond)
+			stop()
+
+			mu.Lock()
+			got := handBacks
+			mu.Unlock()
+			if got != tc.wantHandBacks {
+				t.Fatalf("hand-backs = %d, want %d", got, tc.wantHandBacks)
+			}
+			if run := client.Main.flapRebuildCount(client.UserLogin.ID); run != tc.wantRun {
+				t.Fatalf("flap run length = %d, want %d", run, tc.wantRun)
+			}
+		})
+	}
 }
 
 // Root cause A1 (round 11). An unusable-probe hand-back rests on "nothing is
@@ -1009,12 +1082,13 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 	}
 
 	type stepCase struct {
-		name    string
-		episode func() *recoveryEpisode
-		verdict recoveryVerdict
-		hold    time.Duration
-		want    recoveryDecision
-		pending recoveryPending
+		name     string
+		episode  func() *recoveryEpisode
+		verdict  recoveryVerdict
+		hold     time.Duration
+		flapHold time.Duration
+		want     recoveryDecision
+		pending  recoveryPending
 		// Optional extra assertion on the resulting episode.
 		after func(t *testing.T, e *recoveryEpisode)
 	}
@@ -1222,6 +1296,32 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			verdict: verdictBlocked,
 			want:    recoveryDecision{action: actionHandBack, handBackCode: handBackCodeProbeUnusable},
 			pending: pendingHandBack,
+		},
+		{
+			// Finding 5 (flap-run review): the hatch is a courier-failure
+			// rebuild source too, and the flap run's widening schedule holds
+			// it exactly as it holds the clause-6 preflight.
+			name: "clause 7: the flap run holds the unusable-probe hand-back and logs the hold",
+			episode: func() *recoveryEpisode {
+				e := fresh()
+				e.lastVerdictAt = ago(timing.blockedGrace)
+				return e
+			},
+			verdict:  verdictBlocked,
+			flapHold: 6 * time.Minute,
+			want:     recoveryDecision{flapHoldLog: true},
+		},
+		{
+			name: "clause 7: the flap hold log is throttled to the re-ask cadence",
+			episode: func() *recoveryEpisode {
+				e := fresh()
+				e.lastVerdictAt = ago(timing.blockedGrace)
+				e.lastHoldLogAt = ago(time.Minute)
+				return e
+			},
+			verdict:  verdictBlocked,
+			flapHold: 6 * time.Minute,
+			want:     recoveryDecision{},
 		},
 		{
 			// Root cause A2: the precondition. The probe has said nothing for
@@ -1468,7 +1568,7 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			e := tc.episode()
-			got := e.step(recoveryRound{now: now, verdict: tc.verdict, retryDelay: retryDelay, handBackHold: tc.hold, timing: timing})
+			got := e.step(recoveryRound{now: now, verdict: tc.verdict, retryDelay: retryDelay, handBackHold: tc.hold, flapHold: tc.flapHold, timing: timing})
 			if got != tc.want {
 				t.Fatalf("decision = %+v, want %+v", got, tc.want)
 			}
@@ -1722,7 +1822,11 @@ func TestLoopStillReachesTheRecoveredPathAfterTheRetryGateAbsorbsAHandBack(t *te
 	}
 	// bridgev2 declined the hand-back (the loop is still alive), and the link is
 	// now healthy. The loop must be able to run the stability window and final
-	// preflight again and re-ask once its own retry gate opens.
+	// preflight again and re-ask once its own retry gate opens. The hand-back
+	// is in the flap run (finding 5) and would hold that re-ask 7m; cleared
+	// here to stand in for the hold expiring, so the retry gate is the only
+	// gate this test exercises.
+	client.Main.clearFlapRun(client.UserLogin.ID)
 	mu.Lock()
 	healthy = true
 	mu.Unlock()

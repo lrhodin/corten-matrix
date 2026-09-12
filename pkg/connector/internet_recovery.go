@@ -208,9 +208,11 @@ func (c *IMClient) runAPSConnectionEventLoop(stop <-chan struct{}, log zerolog.L
 				continue
 			}
 			// Any APS event — the courier left Generated, or a regeneration
-			// failed — ends the flap run's health lease for this login. The
-			// run itself is untouched; this is what re-asserts it.
-			c.Main.noteCourierUnhealthy(c.UserLogin.ID)
+			// failed — ends the flap run's current healthy stretch for this
+			// login. The run itself is untouched, and so is the healthy time
+			// already banked: an interruption pauses the lease, it does not
+			// restart it (flap_recovery.go, "why cumulative").
+			c.Main.noteCourierUnhealthy(c.UserLogin.ID, time.Now())
 			log.Info().
 				Str("platform", runtime.GOOS).
 				Strs("public_probe_targets", []string{internetprobe.CloudflareTarget, internetprobe.GoogleTarget}).
@@ -514,6 +516,19 @@ func (c *IMClient) runPublicOnlyInternetRecovery(log zerolog.Logger, entry recov
 			// homeserver outage is also precisely the case where a rebuild could
 			// not have helped. The decline alarm covers the dropped case.
 			main.noteHandBack(c.UserLogin.ID, now)
+			// A courier-failure episode's hand-back is a courier-failure
+			// rebuild like any other and is recorded in the flap run too. On
+			// a host whose public probe cannot get a socket this is the ONLY
+			// way such an episode rebuilds, and the replacement — a flapping
+			// courier — delivers a frame at once, which clears handBackRun;
+			// without this write the flap run would never grow on that host,
+			// so nothing would hold the next rebuild or defer presence.
+			if courierFailure {
+				main.noteFlapRebuild(c.UserLogin.ID, now)
+				log.Info().Int("flap_rebuilds", main.flapRebuildCount(c.UserLogin.ID)).
+					Dur("next_flap_rebuild_held_for", handBackDelay(main.flapRebuildCount(c.UserLogin.ID))).
+					Msg("This hand-back follows a courier failure on a link the probe could not judge; recorded in the flap run alongside the hand-back run")
+			}
 		case actionPreflight:
 			// Final public preflight immediately before authorizing a single
 			// bridgev2-owned reconstruction.
@@ -625,10 +640,11 @@ func (c *IMClient) logRecoveryDecision(log zerolog.Logger, phase string, result 
 	}
 	if d.flapHoldLog {
 		log.Info().
+			Str("verdict", round.verdict.String()).
 			Dur("next_flap_rebuild_in", round.flapHold).
 			Dur("hold_log_interval", round.retryDelay).
 			Int("flap_rebuilds", c.Main.flapRebuildCount(c.UserLogin.ID)).
-			Msg("Public Internet is stable, but the previous courier-failure rebuild was recent and consecutive ones back off (7m, 14m, 28m, then 45m); holding the rebuild request rather than rebuilding into another flap")
+			Msg("A rebuild is due, but the previous courier-failure rebuild was recent and consecutive ones back off (7m, 14m, 28m, then 45m); holding the rebuild request rather than rebuilding into another flap")
 	}
 	if d.holdAlarm {
 		log.Error().
@@ -834,7 +850,9 @@ type recoveryRound struct {
 	// Non-zero while the flap run is holding a courier-failure rebuild; the
 	// value is how much longer it holds. The loop sets it only for a
 	// courier-failure episode, so for a confirmed outage it is always zero and
-	// clause 6 is unchanged.
+	// clauses 6 and 7 are unchanged. Consulted by both rebuild sources: the
+	// stability-window preflight (clause 6) and the unusable-probe hand-back
+	// (clause 7).
 	flapHold time.Duration
 	timing   recoveryTiming
 }
@@ -848,7 +866,7 @@ type recoveryDecision struct {
 	stabilityStarted bool // first reachable round of a stability window
 	stabilityReset   bool // a window was in progress and this round ended it
 	holdLog          bool // the backoff hold is logged this round (throttled)
-	flapHoldLog      bool // the flap-run hold on a ready rebuild is logged this round (throttled)
+	flapHoldLog      bool // the flap-run hold on a due rebuild (clause 6 or 7) is logged this round (throttled)
 	declineAlarm     bool // a request is old and unanswered on a reachable link
 	holdAlarm        bool // a long confirmed outage is being held Apple-free (throttled)
 }
@@ -1001,10 +1019,21 @@ func (e *recoveryEpisode) step(in recoveryRound) recoveryDecision {
 		}
 		return d
 	}
+	// Both connector-level backoffs hold the hatch: the flap run (a
+	// courier-failure episode's widening schedule — zero for a confirmed
+	// outage, which cannot reach here anyway) and the hand-back run. Each is
+	// logged once per re-ask cadence, not every poll: a permanently wrong
+	// probe otherwise writes ~230 Info lines per 45-minute hold, forever. The
+	// two holds share lastHoldLogAt on purpose — one "held" line per cadence
+	// is the budget, whichever backoff is holding.
+	if in.flapHold > 0 {
+		if internetRecoveryHoldLogDue(now, e.lastHoldLogAt, in.retryDelay) {
+			e.lastHoldLogAt = now
+			d.flapHoldLog = true
+		}
+		return d
+	}
 	if in.handBackHold > 0 {
-		// Held behind the connector-level backoff. Logged once per re-ask
-		// cadence, not every poll: a permanently wrong probe otherwise writes
-		// ~230 Info lines per 45-minute hold, forever.
 		if internetRecoveryHoldLogDue(now, e.lastHoldLogAt, in.retryDelay) {
 			e.lastHoldLogAt = now
 			d.holdLog = true

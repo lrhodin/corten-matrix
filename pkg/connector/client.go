@@ -373,6 +373,10 @@ type IMClient struct {
 	statusKitStarts            atomic.Int32
 	statusKitDeferred          atomic.Bool
 	statusKitSkipHeavyIDSSweep bool
+	// statusKitLaunchedWith is the sweep decision runStatusKitStartup actually
+	// received (statusKitLaunchNotYet until it runs), so a test can pin that a
+	// deferred launch carries Connect's decision rather than a constant.
+	statusKitLaunchedWith atomic.Int32
 
 	// statusKitPassInFlight is a single-flight guard so only one
 	// syncCloudStatusKitPeers pass runs at a time. The periodic pull loop, the
@@ -1662,7 +1666,7 @@ func (c *IMClient) launchOrDeferStatusKit(log zerolog.Logger, skipHeavyIDSSweep 
 			Int("flap_rebuilds", c.Main.flapRebuildCount(c.UserLogin.ID)).
 			Dur("healthy_lease", flapRecoveryHealthyLease).
 			Uint64("healthy_max_idle_secs", courierHealthyMaxIdleSecs).
-			Msg("StatusKit startup DEFERRED: this client is a repeated rebuild after the APNs courier kept flapping, so presence (StatusKit init, subscriptions, invite sweep, startup share) is held until the courier stays healthy for the full lease; core iMessage send/receive is up normally, and explicit StatusKit commands still work")
+			Msg("StatusKit startup DEFERRED: this client is a repeated rebuild after the APNs courier kept flapping, so presence (StatusKit init, subscriptions, invite sweep, startup share) is held until the courier has accrued the full lease of healthy time this epoch; core iMessage send/receive is up normally, and explicit StatusKit commands still work")
 	} else {
 		c.startStatusKit(log, "connect")
 	}
@@ -1710,13 +1714,26 @@ func (c *IMClient) statusKitStartupLaunched() bool {
 	return c.statusKitStarts.Load() > 0
 }
 
+// Values of statusKitLaunchedWith.
+const (
+	statusKitLaunchNotYet       int32 = iota // runStatusKitStartup has not run
+	statusKitLaunchWithSweep                 // it ran with the invite sweep enabled
+	statusKitLaunchSkippedSweep              // it ran with the sweep skipped (full-connect cooldown)
+)
+
 // runStatusKitStartup is the StatusKit block itself, moved verbatim out of
 // Connect so it can be launched from more than one place through
 // startStatusKit. Initialize StatusKit presence system (non-fatal — runs in
 // background). Once initialized, the Rust receive loop intercepts StatusKit
 // APNs messages and invokes OnStatusUpdate for subscribed handles.
 func (c *IMClient) runStatusKitStartup(log zerolog.Logger, skipHeavyIDSSweep bool) {
-
+	// Recorded first, before any exit, so a test can observe the sweep
+	// decision that actually reached the block — not the one Connect captured.
+	if skipHeavyIDSSweep {
+		c.statusKitLaunchedWith.Store(statusKitLaunchSkippedSweep)
+	} else {
+		c.statusKitLaunchedWith.Store(statusKitLaunchWithSweep)
+	}
 	if c.client == nil || c.terminationRequested() {
 		return
 	}
@@ -2453,6 +2470,7 @@ func (c *IMClient) runReceiveWedgeWatchdog(stop chan struct{}, log zerolog.Logge
 	defer ticker.Stop()
 	receiveConfirmed := false
 	holdLogged := false
+	leaseLogged := false
 	for {
 		select {
 		case <-stop:
@@ -2470,25 +2488,39 @@ func (c *IMClient) runReceiveWedgeWatchdog(stop chan struct{}, log zerolog.Logge
 			// The flap run's health lease (flap_recovery.go). Fed only once a
 			// real frame has been seen this epoch — the seeded stamp is not
 			// health — and only while the age is under rustpush's own stall
-			// bound; an age past it ends the lease, as an APS event does in
-			// the event loop. The tick that serves the full lease ends the run
-			// and, for an epoch that deferred at Connect, launches StatusKit.
+			// bound; an age at or past it ends the current healthy stretch
+			// (banking it), as an APS event does in the event loop. The tick
+			// that serves the full lease ends the run and, for an epoch that
+			// deferred at Connect, launches StatusKit.
 			if receiveConfirmed && idle < courierHealthyMaxIdleSecs {
 				now := time.Now()
-				leaseWasRunning := !c.Main.flapRunHealthySince(c.UserLogin.ID).IsZero()
-				if c.Main.noteCourierHealthy(c.UserLogin.ID, now) {
+				switch {
+				case c.Main.noteCourierHealthy(c.UserLogin.ID, now):
 					log.Info().
 						Dur("healthy_lease", flapRecoveryHealthyLease).
 						Bool("statuskit_was_deferred", c.statusKitDeferred.Load()).
-						Msg("APNs courier has stayed continuously healthy for the full lease; the flap run is cleared and the next courier-failure rebuild gets normal timing")
+						Msg("APNs courier has accrued the full lease of healthy time this epoch; the flap run is cleared and the next courier-failure rebuild gets normal timing")
 					c.activateDeferredStatusKit(stop, log)
-				} else if !leaseWasRunning && c.statusKitDeferred.Load() {
+				case c.statusKitDeferred.Load() && c.Main.flapRebuildCount(c.UserLogin.ID) == 0:
+					// Deferred at Connect, but the run that justified it is
+					// gone — served by the retired predecessor's final tick,
+					// racing this Connect's decision. Nothing asserts flapping
+					// any more, so this epoch launches on its first healthy
+					// tick rather than waiting for a lease no run will serve.
+					log.Info().Msg("StatusKit startup was deferred, but the flap run it was deferred on has ended; activating on the first healthy tick")
+					c.activateDeferredStatusKit(stop, log)
+				case c.statusKitDeferred.Load() && !leaseLogged:
+					// Once per epoch, not once per stretch: the stall link
+					// this lease is built for starts a new stretch every few
+					// minutes.
+					leaseLogged = true
 					log.Info().
 						Dur("healthy_lease", flapRecoveryHealthyLease).
-						Msg("APNs courier confirmed receiving; the health lease has started — StatusKit startup (deferred for repeated flapping) activates when the lease is served without an interruption")
+						Dur("healthy_accrued", c.Main.flapRunHealthyAccrued(c.UserLogin.ID)).
+						Msg("APNs courier confirmed receiving; healthy time now accrues toward the lease — StatusKit startup (deferred for repeated flapping) activates once this epoch has accrued the full lease, interruptions pause the accrual but do not reset it")
 				}
 			} else if receiveConfirmed {
-				c.Main.noteCourierUnhealthy(c.UserLogin.ID)
+				c.Main.noteCourierUnhealthy(c.UserLogin.ID, time.Now())
 			}
 			if idle < receiveWedgeRecoverySecs {
 				continue
