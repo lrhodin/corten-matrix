@@ -198,6 +198,29 @@ func TestInternetRecoveryFallbackCeilingsAreOrdered(t *testing.T) {
 	}
 }
 
+// A recovered confirmation may discard the stale Interrupted event that began
+// it, but must preserve a terminal RetryFailed latched while probes were running.
+func TestDropPendingInterruptedEventPreservesRetryFailed(t *testing.T) {
+	client := &IMClient{connectionEventWake: make(chan struct{}, 1)}
+	client.OnConnectionEvent(rustpushgo.ApsConnectionEventRetryFailed)
+	client.dropPendingConnectionEvent()
+
+	event, ok := client.takeConnectionEvent()
+	if !ok || event != rustpushgo.ApsConnectionEventRetryFailed {
+		t.Fatalf("event = (%v, %v), want preserved RetryFailed", event, ok)
+	}
+}
+
+func TestDropPendingInterruptedEventDropsInterrupted(t *testing.T) {
+	client := &IMClient{connectionEventWake: make(chan struct{}, 1)}
+	client.OnConnectionEvent(rustpushgo.ApsConnectionEventInterrupted)
+	client.dropPendingConnectionEvent()
+
+	if event, ok := client.takeConnectionEvent(); ok {
+		t.Fatalf("event = %v, want stale Interrupted to be dropped", event)
+	}
+}
+
 func TestConnectionEventLatchPreservesRetryFailurePriority(t *testing.T) {
 	client := &IMClient{connectionEventWake: make(chan struct{}, 1)}
 	for range 100 {
@@ -1918,11 +1941,10 @@ func TestConfirmPublicOutageRequiresEveryRoundToFail(t *testing.T) {
 	}
 }
 
-// Mutations 12 and 13 through the loop: an interruption whose confirmation
-// window recovers must NOT tear the client down, and an event latched during
-// that window (the observer's RetryFailed escalation lands inside it) must be
-// dropped rather than driving an unconditional teardown on the next pass.
-func TestEventLoopDropsAnEventLatchedDuringAFailedConfirmation(t *testing.T) {
+// A terminal RetryFailed latched while confirmation probes run must survive a
+// recovered confirmation round and drive conservative recovery. Only the stale
+// Interrupted event that began confirmation may be discarded.
+func TestEventLoopPreservesRetryFailedLatchedDuringRecoveredConfirmation(t *testing.T) {
 	scaleEventLoopTimingForTest(t)
 	states := recordStates(t)
 	client := newRecoveryTestClient()
@@ -1940,20 +1962,21 @@ func TestEventLoopDropsAnEventLatchedDuringAFailedConfirmation(t *testing.T) {
 			// The observer escalates to RetryFailed mid-window.
 			client.OnConnectionEvent(rustpushgo.ApsConnectionEventRetryFailed)
 			return reachableResult()
+		case "aps_retry_failure_classification":
+			return reachableResult()
+		case "public_only_recovery":
+			return blockedResult()
 		}
-		t.Errorf("unexpected probe phase %q: the latched RetryFailed was acted on", phase)
-		return reachableResult()
+		t.Errorf("unexpected probe phase %q", phase)
+		return blockedResult()
 	}
 
 	runEventLoopForTest(t, client)
 	client.OnConnectionEvent(rustpushgo.ApsConnectionEventInterrupted)
 	time.Sleep(200 * time.Millisecond)
 
-	if enteredRecovery(states()) {
-		t.Fatal("the client was torn down for an outage the confirmation window watched recover")
-	}
-	if _, ok := client.takeConnectionEvent(); ok {
-		t.Fatal("the RetryFailed latched during the failed confirmation was not dropped")
+	if !enteredRecovery(states()) {
+		t.Fatal("RetryFailed latched during confirmation was discarded instead of entering conservative recovery")
 	}
 }
 
@@ -2002,6 +2025,23 @@ func TestEventLoopTreatsABurstOfInterruptionsAsAStorm(t *testing.T) {
 	}
 	if !enteredRecovery(states()) {
 		t.Fatal("a burst of interruptions on a reachable link never entered recovery")
+	}
+}
+
+func TestEventLoopTreatsBlockedProbeInterruptionsAsAStorm(t *testing.T) {
+	scaleEventLoopTimingForTest(t)
+	states := recordStates(t)
+	internetProbeFunc = func(context.Context, string) internetprobe.Result { return blockedResult() }
+	client := newRecoveryTestClient()
+	runEventLoopForTest(t, client)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !enteredRecovery(states()) && time.Now().Before(deadline) {
+		client.OnConnectionEvent(rustpushgo.ApsConnectionEventInterrupted)
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !enteredRecovery(states()) {
+		t.Fatal("a burst of interruptions with locally blocked probes never entered conservative recovery")
 	}
 }
 

@@ -1750,13 +1750,8 @@ func (c *IMClient) Connect(ctx context.Context) {
 			log.Warn().Msg("Local macOS contacts unavailable — contact names will not be resolved")
 		}
 	} else {
-		var cloudContacts *cloudContactsClient
-		if !c.Main.Config.DisableICloudContacts {
-			cloudContacts = newCloudContactsClient(c.client, log)
-		}
-		if c.Main.Config.DisableICloudContacts {
-			log.Info().Msg("iCloud contacts disabled before CardDAV setup")
-		} else if cloudContacts != nil {
+		cloudContacts := newCloudContactsClient(c.client, log)
+		if cloudContacts != nil {
 			c.contacts = cloudContacts
 			log.Info().Str("url_host", logSafeURL(cloudContacts.baseURL)).Msg("Cloud contacts available (iCloud CardDAV)")
 			if syncErr := cloudContacts.SyncContacts(log); syncErr != nil {
@@ -3490,21 +3485,17 @@ func (c *IMClient) OnConnectionEvent(event rustpushgo.ApsConnectionEvent) {
 	}
 }
 
-// dropPendingConnectionEvent discards a latched APS event. Used when a
-// confirmation window has just proven the network recovered: any event latched
-// during that window describes the interruption we rode out, and acting on it
-// would tear the client down for an outage that is already over. Safe to drop —
-// if APS is still failing, rustpush keeps republishing and the observer
-// re-escalates.
+// dropPendingConnectionEvent discards only a stale Interrupted event after a
+// confirmation window proves connectivity recovered. RetryFailed is a stronger,
+// terminal regeneration result and must remain latched for conservative recovery.
 func (c *IMClient) dropPendingConnectionEvent() {
-	// Clear and drain under the SAME lock hold. Splitting them let a concurrent
-	// OnConnectionEvent set pending after the clear and deposit its token before
-	// the drain, which then ate it — leaving an event latched with no wake token
-	// and the event loop asleep until some later event happened to find the
-	// channel empty. Measured at 3 per 200000 interleavings; zero with the drain
-	// held here.
+	// Inspect, clear, and drain under the same lock so a concurrent callback can
+	// never leave a pending event without its wake token.
 	c.connectionEventMu.Lock()
 	defer c.connectionEventMu.Unlock()
+	if c.connectionEventPending != 1 {
+		return
+	}
 	c.connectionEventPending = 0
 	select {
 	case <-c.connectionEventWake:

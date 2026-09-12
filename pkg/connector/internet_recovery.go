@@ -217,18 +217,27 @@ func (c *IMClient) runAPSConnectionEventLoop(stop <-chan struct{}, log zerolog.L
 				if channelClosed(stop) {
 					return
 				}
-				if result.Reachable() {
+				// A locally blocked public probe has no standing to call the
+				// Internet down, but it also cannot grant an unbounded exception
+				// to the flap-storm limit. Count every interruption for which the
+				// probe did not establish an outage; otherwise EACCES on the public
+				// sockets leaves Generated -> Generating -> Generated storms
+				// reconnecting to Apple without backoff forever.
+				if result.Reachable() || result.Blocked() {
 					interruptions = recordInterruption(interruptions, time.Now())
 					if burst, sustained, window := classifyFlapStorm(interruptions, time.Now()); burst || sustained {
 						log.Warn().
 							Int("interruptions", len(interruptions)).
 							Bool("burst", burst).
 							Bool("sustained", sustained).
+							Bool("probe_blocked", result.Blocked()).
 							Dur("window", window).
-							Msg("APS transport is flapping faster than a healthy link can explain while public Internet is reachable — treating as a reconnect storm and stopping Apple retries (rustpush reconnects this shape with no backoff at all)")
-						c.runPublicOnlyInternetRecovery(log, verdictReachable)
+							Msg("APS transport is flapping faster than a healthy link can explain; entering conservative recovery to stop unbounded Apple retries")
+						c.runPublicOnlyInternetRecovery(log, classifyRecoveryVerdict(result))
 						return
 					}
+				}
+				if result.Reachable() {
 					log.Info().
 						Int("interruptions_in_window", len(interruptions)).
 						Msg("APS transport interrupted while public Internet remains reachable; allowing immediate transport reconnect")
