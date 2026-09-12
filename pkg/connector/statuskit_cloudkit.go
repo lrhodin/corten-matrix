@@ -371,6 +371,10 @@ func (c *IMClient) onPresenceDecryptFailed(log zerolog.Logger) {
 // responsible for their own cooldown so they can't defeat the clique-kick rate
 // limit (see onPresenceDecryptFailed).
 func (c *IMClient) syncCloudStatusKitPeersForce(ctx context.Context, log zerolog.Logger, force bool) (err error) {
+	if c.statusKitDeferred.Load() {
+		log.Debug().Msg("StatusKit-CloudKit pass: deferred while repeated APNs flap recovery is serving its courier-health lease")
+		return nil
+	}
 	// This pass pulls peer keys from CloudKit and ends by running the
 	// alias-link pass, which queries Apple IDS. Several callers run it in a
 	// bare goroutine (onPresenceDecryptFailed, the sync controller), so a

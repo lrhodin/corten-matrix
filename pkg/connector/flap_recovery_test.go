@@ -18,6 +18,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/status"
 
 	"github.com/lrhodin/corten-matrix/pkg/internetprobe"
@@ -44,6 +45,7 @@ func scaleHealthyLeaseForTest(t *testing.T, lease time.Duration) {
 func healthySinceConnect(client *IMClient, idle uint64) {
 	client.startupTime = time.Now().Add(-2 * time.Hour)
 	apsSecondsSinceLastInbound = func(*rustpushgo.WrappedApsConnection) uint64 { return idle }
+	apsLastInboundLowerBound = func(_ *rustpushgo.WrappedApsConnection, now time.Time, _ uint64) time.Time { return now }
 }
 
 // Item 1: the run lives on IMConnector, so replacing the IMClient — which is
@@ -81,6 +83,42 @@ func TestFlapRunSurvivesClientReplacements(t *testing.T) {
 // Item 2: the first courier-failure rebuild is not held; the next ones are
 // held 7m, 14m, 28m, then 45m after the previous request. Pinned with
 // literal durations.
+func TestFlapRebuildIsCountedOnlyWhenReplacementConsumesRequest(t *testing.T) {
+	main := &IMConnector{}
+	login := networkid.UserLoginID("actual-rebuild")
+	t0 := time.Unix(61_000, 0)
+
+	main.markFlapRebuildRequested(login)
+	main.markFlapRebuildRequested(login)
+	if got := main.flapRebuildCount(login); got != 0 {
+		t.Fatalf("sent but unacted request counted as %d rebuilds, want 0", got)
+	}
+	if wait, ok := main.flapRebuildDue(login, t0.Add(time.Minute)); !ok || wait != 0 {
+		t.Fatalf("unacted first request held recovery: ok=%v wait=%v", ok, wait)
+	}
+
+	if !main.consumeFlapRebuildRequest(login, t0) {
+		t.Fatal("replacement did not consume the pending flap request")
+	}
+	if got := main.flapRebuildCount(login); got != 1 {
+		t.Fatalf("first actual replacement count = %d, want 1", got)
+	}
+	if main.flapRecoveryDefersStatusKit(login) {
+		t.Fatal("first actual replacement deferred StatusKit")
+	}
+	if main.consumeFlapRebuildRequest(login, t0.Add(time.Second)) {
+		t.Fatal("one pending request was consumed twice")
+	}
+
+	main.markFlapRebuildRequested(login)
+	if !main.consumeFlapRebuildRequest(login, t0.Add(7*time.Minute)) {
+		t.Fatal("second replacement did not consume its request")
+	}
+	if !main.flapRecoveryDefersStatusKit(login) {
+		t.Fatal("second actual replacement did not defer StatusKit")
+	}
+}
+
 func TestFlapRebuildScheduleIsPinnedWithLiterals(t *testing.T) {
 	main := &IMConnector{}
 	login := newRecoveryTestClient().UserLogin.ID
@@ -139,6 +177,51 @@ func TestOneInboundFrameDoesNotClearTheFlapRun(t *testing.T) {
 // clear, an interruption pauses the accrual (the stretch before it is banked,
 // the unhealthy time after it does not count) and does not restart it. Then
 // the same through the real watchdog with the lease scaled down.
+func TestOldPreInterruptionFrameCannotRestartHealthyLease(t *testing.T) {
+	main := &IMConnector{}
+	login := networkid.UserLoginID("lease-frame-order")
+	t0 := time.Unix(90_000, 0)
+	main.noteFlapRebuild(login, t0)
+
+	if main.noteCourierActivity(login, t0.Add(time.Second), t0.Add(5*time.Second)) {
+		t.Fatal("short first stretch unexpectedly served the lease")
+	}
+	main.noteCourierUnhealthy(login, t0.Add(10*time.Second))
+	accrued := main.flapRunHealthyAccrued(login)
+
+	// This is the last frame from before the interruption. Observing it on a
+	// later watchdog tick must not restart accrual.
+	if main.noteCourierActivity(login, t0.Add(9*time.Second), t0.Add(11*time.Second)) {
+		t.Fatal("pre-interruption frame served the lease")
+	}
+	if !main.flapRunHealthySince(login).IsZero() {
+		t.Fatal("pre-interruption frame restarted the healthy stretch")
+	}
+	if got := main.flapRunHealthyAccrued(login); got != accrued {
+		t.Fatalf("pre-interruption frame changed accrued health from %v to %v", accrued, got)
+	}
+
+	if main.noteCourierActivity(login, t0.Add(12*time.Second), t0.Add(13*time.Second)) {
+		t.Fatal("new post-interruption frame unexpectedly served the lease")
+	}
+	if got := main.flapRunHealthySince(login); !got.Equal(t0.Add(12 * time.Second)) {
+		t.Fatalf("post-interruption stretch started at %v, want frame time %v", got, t0.Add(12*time.Second))
+	}
+}
+
+func TestHealthyAccrualStartsAtFrameTimeNotWatchdogTick(t *testing.T) {
+	main := &IMConnector{}
+	login := networkid.UserLoginID("lease-frame-time")
+	t0 := time.Unix(91_000, 0)
+	main.noteFlapRebuild(login, t0)
+
+	main.noteCourierActivity(login, t0.Add(time.Second), t0.Add(time.Minute))
+	main.noteCourierUnhealthy(login, t0.Add(61*time.Second))
+	if got := main.flapRunHealthyAccrued(login); got != time.Minute {
+		t.Fatalf("banked health = %v, want 1m from frame to interruption", got)
+	}
+}
+
 func TestFifteenHealthyMinutesClearTheFlapRun(t *testing.T) {
 	if flapRecoveryHealthyLease != 15*time.Minute {
 		t.Fatalf("flapRecoveryHealthyLease = %v, want the specified 15 minutes", flapRecoveryHealthyLease)
@@ -275,6 +358,7 @@ func TestSelfHealingStallLinkActivatesDeferredStatusKit(t *testing.T) {
 		}
 		return 400
 	}
+	apsLastInboundLowerBound = func(_ *rustpushgo.WrappedApsConnection, now time.Time, _ uint64) time.Time { return now }
 	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
 	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
 	client.launchOrDeferStatusKit(zerolog.Nop(), false)
@@ -513,6 +597,60 @@ func TestExplicitStatusKitCommandsAreNotGatedByDeferral(t *testing.T) {
 	}
 }
 
+func TestAutomaticStatusKitAccessIsGatedWhileExplicitCommandsRemainAvailable(t *testing.T) {
+	saved := getStatusKitClient
+	t.Cleanup(func() { getStatusKitClient = saved })
+	calls := 0
+	want := &rustpushgo.WrappedStatusKitClient{}
+	getStatusKitClient = func(*rustpushgo.Client) (*rustpushgo.WrappedStatusKitClient, error) {
+		calls++
+		return want, nil
+	}
+
+	client := newRecoveryTestClient()
+	client.client = &rustpushgo.Client{}
+	defer func() { client.client = nil }()
+	client.statusKitDeferred.Store(true)
+
+	if sk, err := client.automaticStatusKitClient(); err == nil || sk != nil {
+		t.Fatalf("automatic getter during deferral = (%v, %v), want nil/error", sk, err)
+	}
+	if calls != 0 {
+		t.Fatalf("automatic getter reached Rust %d times during deferral", calls)
+	}
+	if sk, err := client.statusKitClientForCommand(); err != nil || sk != want {
+		t.Fatalf("explicit getter during deferral = (%v, %v), want client/nil", sk, err)
+	}
+	if calls != 1 {
+		t.Fatalf("explicit getter reached Rust %d times, want 1", calls)
+	}
+}
+
+func TestAutomaticStatusKitCloudPassIsGatedDuringDeferral(t *testing.T) {
+	client := newRecoveryTestClient()
+	client.client = &rustpushgo.Client{}
+	defer func() { client.client = nil }()
+	client.statusKitDeferred.Store(true)
+	if err := client.syncCloudStatusKitPeersForce(context.Background(), zerolog.Nop(), true); err != nil {
+		t.Fatalf("deferred automatic CloudKit pass returned error: %v", err)
+	}
+	if client.statusKitPassInFlight.Load() {
+		t.Fatal("deferred automatic CloudKit pass entered the Apple-facing body")
+	}
+}
+
+func TestAutomaticPresenceSubscriptionIsGatedDuringDeferral(t *testing.T) {
+	client := newRecoveryTestClient()
+	client.client = &rustpushgo.Client{}
+	defer func() { client.client = nil }()
+	client.statusKitDeferred.Store(true)
+
+	client.subscribeToContactPresence(zerolog.Nop())
+	if !client.lastPresenceSubscribe.IsZero() {
+		t.Fatal("automatic presence subscription entered its Apple-facing path during StatusKit deferral")
+	}
+}
+
 // Item 11, through the real loop: a confirmed-outage episode requests its
 // rebuild after the stability window regardless of the flap run, and does not
 // lengthen it; a courier-failure episode with the same run is held.
@@ -522,10 +660,11 @@ func TestConfirmedOutageRecoveryIgnoresTheFlapRun(t *testing.T) {
 		entry         recoveryVerdict
 		wantRecovered bool
 		wantRun       int
+		wantPending   bool
 	}{
-		{"confirmed outage: normal timing, run untouched", verdictUnreachable, true, 1},
-		{"courier failure: held behind the run", verdictReachable, false, 1},
-		{"courier failure with no prior run: normal timing, run started", verdictBlocked, true, 1},
+		{"confirmed outage: normal timing, run untouched", verdictUnreachable, true, 1, false},
+		{"courier failure: held behind the run", verdictReachable, false, 1, false},
+		{"courier failure with no prior run: request pending, run not advanced", verdictBlocked, true, 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scaleRecoveryTimingForTest(t)
@@ -558,6 +697,9 @@ func TestConfirmedOutageRecoveryIgnoresTheFlapRun(t *testing.T) {
 			}
 			if run := client.Main.flapRebuildCount(client.UserLogin.ID); run != tc.wantRun {
 				t.Fatalf("flap run length = %d, want %d", run, tc.wantRun)
+			}
+			if pending := client.Main.flapRebuildRequested(client.UserLogin.ID); pending != tc.wantPending {
+				t.Fatalf("pending rebuild = %v, want %v", pending, tc.wantPending)
 			}
 		})
 	}
@@ -597,10 +739,11 @@ func TestAPSEventEndsTheHealthLease(t *testing.T) {
 	_ = recordStates(t)
 	internetProbeFunc = func(context.Context, string) internetprobe.Result { return reachableResult() }
 	client := newRecoveryTestClient()
-	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
+	now := time.Now()
+	client.Main.noteFlapRebuild(client.UserLogin.ID, now.Add(-2*time.Minute))
 	// A stretch that began a minute ago, so the interruption has something
 	// to bank.
-	client.Main.noteCourierHealthy(client.UserLogin.ID, time.Now().Add(-time.Minute))
+	client.Main.noteCourierHealthy(client.UserLogin.ID, now.Add(-time.Minute))
 	if client.Main.flapRunHealthySince(client.UserLogin.ID).IsZero() {
 		t.Fatal("precondition: the lease must be running")
 	}
@@ -619,6 +762,26 @@ func TestAPSEventEndsTheHealthLease(t *testing.T) {
 	}
 	if got := client.Main.flapRunHealthyAccrued(client.UserLogin.ID); got < time.Minute {
 		t.Fatalf("the interruption discarded the stretch instead of banking it: accrued %v, want >= 1m", got)
+	}
+}
+
+func TestDiscardedAPSEventStillEndsTheHealthLease(t *testing.T) {
+	client := newRecoveryTestClient()
+	now := time.Now()
+	client.Main.noteFlapRebuild(client.UserLogin.ID, now.Add(-2*time.Minute))
+	client.Main.noteCourierHealthy(client.UserLogin.ID, now.Add(-time.Minute))
+	if client.Main.flapRunHealthySince(client.UserLogin.ID).IsZero() {
+		t.Fatal("precondition: the lease must be running")
+	}
+
+	// There is no event loop consuming the latch. The callback itself must end
+	// the stretch because controller policy may later coalesce or discard it.
+	client.OnConnectionEvent(rustpushgo.ApsConnectionEventRetryFailed)
+	if !client.Main.flapRunHealthySince(client.UserLogin.ID).IsZero() {
+		t.Fatal("an APS event left the healthy stretch running until controller consumption")
+	}
+	if got := client.Main.flapRunHealthyAccrued(client.UserLogin.ID); got < time.Minute {
+		t.Fatalf("discarded APS event failed to bank the stretch: accrued %v", got)
 	}
 }
 
@@ -666,6 +829,51 @@ func TestLogoutClearsTheFlapRun(t *testing.T) {
 	client.LogoutRemote(context.Background())
 	if client.Main.flapRecoveryDefersStatusKit(client.UserLogin.ID) || client.Main.flapRebuildCount(client.UserLogin.ID) != 0 {
 		t.Fatal("LogoutRemote must clear the flap run")
+	}
+}
+
+func TestLogoutWaitsForRecoveryWriterBeforeClearingFlapRun(t *testing.T) {
+	_, _, _ = installLifecycleSeams(t)
+	client := newLifecycleTestClient()
+	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
+
+	client.internetRecoveryMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			client.internetRecoveryMu.Unlock()
+		}
+	}()
+	done := make(chan struct{})
+	go func() {
+		client.LogoutRemote(context.Background())
+		close(done)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for !client.terminationRequested() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !client.terminationRequested() {
+		t.Fatal("logout did not begin")
+	}
+	select {
+	case <-done:
+		t.Fatal("logout cleared state without waiting for the active recovery writer")
+	default:
+	}
+
+	// Model the recovery writer's final action while it still owns the mutex.
+	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
+	client.internetRecoveryMu.Unlock()
+	locked = false
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("logout did not finish after the recovery writer exited")
+	}
+	if got := client.Main.flapRebuildCount(client.UserLogin.ID); got != 0 {
+		t.Fatalf("recovery recreated flap state after logout: count=%d", got)
 	}
 }
 
@@ -776,11 +984,12 @@ func TestServingTickHonorsTheEpochStopChannel(t *testing.T) {
 	internetProbeFunc = func(context.Context, string) internetprobe.Result { return reachableResult() }
 	client := newRecoveryTestClient()
 	client.startupTime = time.Now().Add(-2 * time.Hour)
-	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
-	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
+	t0 := time.Now().Add(-16 * time.Minute)
+	client.Main.noteFlapRebuild(client.UserLogin.ID, t0.Add(-time.Second))
+	client.Main.noteFlapRebuild(client.UserLogin.ID, t0.Add(-time.Second))
 	client.launchOrDeferStatusKit(zerolog.Nop(), false)
 	// A stretch older than the lease: the first tick serves it.
-	client.Main.noteCourierHealthy(client.UserLogin.ID, time.Now().Add(-16*time.Minute))
+	client.Main.noteCourierHealthy(client.UserLogin.ID, t0)
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -792,6 +1001,7 @@ func TestServingTickHonorsTheEpochStopChannel(t *testing.T) {
 		})
 		return 30
 	}
+	apsLastInboundLowerBound = func(_ *rustpushgo.WrappedApsConnection, now time.Time, _ uint64) time.Time { return now }
 	client.connection = &rustpushgo.WrappedApsConnection{}
 	closeConn := closeAPSConnection
 	t.Cleanup(func() { closeAPSConnection = closeConn })
@@ -840,6 +1050,7 @@ func TestLeaseAccrualIsLoggedOncePerEpoch(t *testing.T) {
 		}
 		return 400
 	}
+	apsLastInboundLowerBound = func(_ *rustpushgo.WrappedApsConnection, now time.Time, _ uint64) time.Time { return now }
 	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
 	client.Main.noteFlapRebuild(client.UserLogin.ID, time.Now())
 	client.launchOrDeferStatusKit(zerolog.Nop(), false)

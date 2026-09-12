@@ -917,6 +917,10 @@ func (c *IMClient) schedulePresenceSubscribe(log zerolog.Logger) {
 // known ghosts via StatusKit. Presence changes are delivered via
 // OnStatusUpdate and mapped to Matrix ghost presence.
 func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
+	if c.statusKitDeferred.Load() {
+		log.Debug().Msg("StatusKit presence subscription deferred until the APNs courier serves its healthy lease")
+		return
+	}
 	if c.client == nil {
 		return
 	}
@@ -1176,6 +1180,9 @@ const statusKitAutoInvite = false
 //     automatic paths leave it false to preserve the "invite once per peer"
 //     contract with peer iOS.
 func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respectSpacing bool, bypassLatch bool) {
+	if c.statusKitDeferred.Load() {
+		return
+	}
 	if c.client == nil || c.handle == "" {
 		log.Warn().Bool("client_nil", c.client == nil).Str("handle", logSafeHandle(c.handle)).Msg("StatusKit invite: skipped (client or handle not ready)")
 		return
@@ -1258,7 +1265,7 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 	// from the in-memory StatusKit state, which is hydrated from
 	// statuskit-state.plist at startup.
 	knownSet := make(map[string]struct{})
-	if sk, skErr := c.client.GetStatuskitClient(); skErr == nil && sk != nil {
+	if sk, skErr := c.automaticStatusKitClient(); skErr == nil && sk != nil {
 		for _, h := range sk.GetKnownHandles() {
 			knownSet[h] = struct{}{}
 		}
@@ -1426,7 +1433,7 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 }
 
 func (c *IMClient) publishStatusKitAvailableAfterInvite(log zerolog.Logger, reason string) {
-	if c.client == nil {
+	if c.client == nil || c.statusKitDeferred.Load() {
 		return
 	}
 	// Serialize the cooldown read / publish / cooldown write across
@@ -1453,7 +1460,7 @@ func (c *IMClient) publishStatusKitAvailableAfterInvite(log zerolog.Logger, reas
 	if err := c.safeRefreshPetTokenThrottled(); err != nil {
 		log.Debug().Err(err).Str("reason", reason).Msg("StatusKit post-invite share_status: PET refresh skipped")
 	}
-	sk, err := c.client.GetStatuskitClient()
+	sk, err := c.automaticStatusKitClient()
 	if err != nil || sk == nil {
 		log.Debug().Err(err).Str("reason", reason).Msg("StatusKit post-invite share_status skipped — client not ready")
 		return
@@ -1479,6 +1486,9 @@ func (c *IMClient) publishStatusKitAvailableAfterInvite(log zerolog.Logger, reas
 // TTL semantics). Same 30s per-invite timeout. KV updates on success match
 // the sweep so the periodic tick correctly skips this handle next.
 func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle string) {
+	if c.statusKitDeferred.Load() {
+		return
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			log.Warn().Interface("panic", r).Msg("inviteSingleHandleToStatusSharing panicked — skipped")
@@ -1518,7 +1528,7 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 
 	ctx := context.Background()
 
-	if sk, skErr := c.client.GetStatuskitClient(); skErr == nil && sk != nil {
+	if sk, skErr := c.automaticStatusKitClient(); skErr == nil && sk != nil {
 		for _, known := range sk.GetKnownHandles() {
 			if known == handle {
 				log.Debug().Str("handle", logSafeHandle(handle)).Msg("StatusKit invite (new portal): peer already keyed; skipping")

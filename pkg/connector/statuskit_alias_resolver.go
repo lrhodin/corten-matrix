@@ -606,7 +606,7 @@ func (c *IMClient) batchLinkStatusKitAliases(ctx context.Context, log zerolog.Lo
 	if c.client == nil {
 		return
 	}
-	sk, err := c.client.GetStatuskitClient()
+	sk, err := c.automaticStatusKitClient()
 	if err != nil || sk == nil {
 		log.Info().Err(err).Msg("StatusKit alias-resolver: batch link pass — StatusKit client not ready, skipping")
 		return

@@ -207,12 +207,8 @@ func (c *IMClient) runAPSConnectionEventLoop(stop <-chan struct{}, log zerolog.L
 			if !ok {
 				continue
 			}
-			// Any APS event — the courier left Generated, or a regeneration
-			// failed — ends the flap run's current healthy stretch for this
-			// login. The run itself is untouched, and so is the healthy time
-			// already banked: an interruption pauses the lease, it does not
-			// restart it (flap_recovery.go, "why cumulative").
-			c.Main.noteCourierUnhealthy(c.UserLogin.ID, time.Now())
+			// The FFI callback already ended and banked the healthy stretch at
+			// event time, before this controller could coalesce or discard it.
 			log.Info().
 				Str("platform", runtime.GOOS).
 				Strs("public_probe_targets", []string{internetprobe.CloudflareTarget, internetprobe.GoogleTarget}).
@@ -506,28 +502,21 @@ func (c *IMClient) runPublicOnlyInternetRecovery(log zerolog.Logger, entry recov
 			}) {
 				return
 			}
-			// Recorded after the send, and unconditionally. sendRecoveryState
-			// cannot tell whether BridgeStateQueue.Send enqueued the state or
-			// dropped it (it drops silently when 8+ states are already waiting,
-			// which only happens while the homeserver itself is unreachable). An
-			// unobservable drop must err toward FEWER Apple attempts, because the
-			// backoff exists to bound Apple contact and a dropped request costs at
-			// most one extra backoff step before the next hand-back — while a
-			// homeserver outage is also precisely the case where a rebuild could
-			// not have helped. The decline alarm covers the dropped case.
+			// The queue does not report whether it accepted the state, so retain
+			// the hand-back run's existing conservative request pacing. A dropped
+			// state cannot contact Apple and therefore does not itself advance the
+			// separate flap-rebuild schedule.
 			main.noteHandBack(c.UserLogin.ID, now)
-			// A courier-failure episode's hand-back is a courier-failure
-			// rebuild like any other and is recorded in the flap run too. On
-			// a host whose public probe cannot get a socket this is the ONLY
-			// way such an episode rebuilds, and the replacement — a flapping
-			// courier — delivers a frame at once, which clears handBackRun;
-			// without this write the flap run would never grow on that host,
-			// so nothing would hold the next rebuild or defer presence.
+			// Remember the request so LoadUserLogin can count it if and only if
+			// bridgev2 actually constructs a replacement. This is the path used
+			// when public probes are locally blocked; the first actual replacement
+			// remains normal, while later actual replacements widen and defer
+			// optional StatusKit startup.
 			if courierFailure {
-				main.noteFlapRebuild(c.UserLogin.ID, now)
-				log.Info().Int("flap_rebuilds", main.flapRebuildCount(c.UserLogin.ID)).
-					Dur("next_flap_rebuild_held_for", handBackDelay(main.flapRebuildCount(c.UserLogin.ID))).
-					Msg("This hand-back follows a courier failure on a link the probe could not judge; recorded in the flap run alongside the hand-back run")
+				main.markFlapRebuildRequested(c.UserLogin.ID)
+				log.Info().
+					Int("completed_flap_rebuilds", main.flapRebuildCount(c.UserLogin.ID)).
+					Msg("Requested a replacement after a courier failure on an unjudgeable link; the flap run advances only if LoadUserLogin constructs that replacement")
 			}
 		case actionPreflight:
 			// Final public preflight immediately before authorizing a single
@@ -566,16 +555,15 @@ func (c *IMClient) runPublicOnlyInternetRecovery(log zerolog.Logger, entry recov
 				}) {
 					return
 				}
-				// Recorded after the send and unconditionally, as noteHandBack
-				// is, and only for a courier-failure episode: this is the one
-				// writer that lengthens the flap run, and a confirmed-outage
-				// rebuild must not count toward it.
+				// Only courier-failure episodes mark a pending flap replacement.
+				// The widening schedule advances later, at actual construction; a
+				// confirmed-outage entry never enters this run.
 				if courierFailure {
-					main.noteFlapRebuild(c.UserLogin.ID, now)
-					log.Info().Int("flap_rebuilds", main.flapRebuildCount(c.UserLogin.ID)).
-						Dur("next_flap_rebuild_held_for", handBackDelay(main.flapRebuildCount(c.UserLogin.ID))).
+					main.markFlapRebuildRequested(c.UserLogin.ID)
+					log.Info().
+						Int("completed_flap_rebuilds", main.flapRebuildCount(c.UserLogin.ID)).
 						Dur("healthy_lease", flapRecoveryHealthyLease).
-						Msg("This rebuild follows a courier failure on a live link; recorded in the flap run — another courier-failure rebuild before the replacement stays healthy for the full lease is held behind the widening schedule, and a repeated one defers StatusKit startup")
+						Msg("Requested a replacement after an APNs courier failure; the flap run advances only if LoadUserLogin constructs that replacement")
 				}
 			}
 		}
@@ -590,7 +578,9 @@ func (c *IMClient) runPublicOnlyInternetRecovery(log zerolog.Logger, entry recov
 // this changes prev.Timestamp, which makes bridgev2's pending
 // unknownErrorReconnect decline at Debug level — the cost is one more of its
 // wait cycles once the link settles, and the benefit is not rebuilding into an
-// outage.
+// outage. The connector's uncounted flap lineage deliberately survives: the
+// waiter may already be past its final state check, and only actual construction
+// consumes and counts that lineage.
 func (c *IMClient) sendRecoveryWithdrawal(main *IMConnector, bridgeState *bridgev2.BridgeStateQueue) bool {
 	return sendRecoveryState(main.Bridge, bridgeState, status.BridgeState{
 		StateEvent: status.StateTransientDisconnect,

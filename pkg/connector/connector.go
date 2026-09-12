@@ -515,13 +515,20 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 		})
 	}
 
+	connection := rustpushgo.Connect(cfg, rustpushgo.NewWrappedApsState(apsStateStr))
+	if c.consumeFlapRebuildRequest(login.ID, time.Now()) {
+		log.Info().
+			Int("flap_rebuilds", c.flapRebuildCount(login.ID)).
+			Msg("Constructed the bridgev2 replacement requested after an APNs courier failure; advancing the cross-client flap backoff")
+	}
+
 	client := &IMClient{
 		Main:                    c,
 		UserLogin:               login,
 		config:                  cfg,
 		users:                   rustpushgo.NewWrappedIdsUsers(usersStr),
 		identity:                rustpushgo.NewWrappedIdsngmIdentity(identityStr),
-		connection:              rustpushgo.Connect(cfg, rustpushgo.NewWrappedApsState(apsStateStr)),
+		connection:              connection,
 		contactsReady:           false,
 		contactsReadyCh:         make(chan struct{}),
 		cloudStore:              newCloudBackfillStore(c.Bridge.DB.Database, login.ID),

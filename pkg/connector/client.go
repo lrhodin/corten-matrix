@@ -1834,7 +1834,7 @@ func (c *IMClient) runStatusKitStartup(log zerolog.Logger, skipHeavyIDSSweep boo
 						log.Warn().Interface("panic", r).Msg("StatusKit startup share panicked")
 					}
 				}()
-				sk, err := c.client.GetStatuskitClient()
+				sk, err := c.automaticStatusKitClient()
 				if err != nil || sk == nil {
 					log.Debug().Err(err).Msg("StatusKit startup share skipped — client not ready")
 					return
@@ -1903,7 +1903,7 @@ func (c *IMClient) runStatusKitStartup(log zerolog.Logger, skipHeavyIDSSweep boo
 
 		// Complement the `StatusKit startup` line above with the peer-key
 		// count, which is only available once the StatusKit client is ready.
-		if sk, skErr := c.client.GetStatuskitClient(); skErr == nil && sk != nil {
+		if sk, skErr := c.automaticStatusKitClient(); skErr == nil && sk != nil {
 			log.Info().Int("known_peer_keys", len(sk.GetKnownHandles())).Msg("StatusKit peer keys loaded")
 		}
 	}
@@ -2176,6 +2176,12 @@ var (
 	}
 	apsSecondsSinceLastInbound = func(conn *rustpushgo.WrappedApsConnection) uint64 {
 		return conn.SecondsSinceLastInbound()
+	}
+	// SecondsSinceLastInbound truncates to whole seconds. The production seam
+	// returns a conservative lower bound for the actual frame time; tests may
+	// provide exact synthetic frame times without sleeping for real minutes.
+	apsLastInboundLowerBound = func(_ *rustpushgo.WrappedApsConnection, now time.Time, idle uint64) time.Time {
+		return now.Add(-time.Duration(idle+1) * time.Second)
 	}
 	receiveWedgePollInterval = 60 * time.Second
 )
@@ -2481,7 +2487,13 @@ func (c *IMClient) runReceiveWedgeWatchdog(stop chan struct{}, log zerolog.Logge
 				continue
 			}
 			idle := apsSecondsSinceLastInbound(conn)
-			if !receiveConfirmed && idle < uint64(time.Since(c.startupTime)/time.Second) {
+			now := time.Now()
+			// SecondsSinceLastInbound truncates to whole seconds. Subtract one
+			// extra second to obtain a conservative lower bound for the frame
+			// time: a pre-interruption frame can never masquerade as post-event
+			// health, while at most one second per stretch is undercounted.
+			frameLowerBound := apsLastInboundLowerBound(conn, now, idle)
+			if !receiveConfirmed && frameLowerBound.After(c.startupTime) {
 				receiveConfirmed = true
 				c.Main.clearHandBacks(c.UserLogin.ID)
 			}
@@ -2493,9 +2505,8 @@ func (c *IMClient) runReceiveWedgeWatchdog(stop chan struct{}, log zerolog.Logge
 			// that serves the full lease ends the run and, for an epoch that
 			// deferred at Connect, launches StatusKit.
 			if receiveConfirmed && idle < courierHealthyMaxIdleSecs {
-				now := time.Now()
 				switch {
-				case c.Main.noteCourierHealthy(c.UserLogin.ID, now):
+				case c.Main.noteCourierActivity(c.UserLogin.ID, frameLowerBound, now):
 					log.Info().
 						Dur("healthy_lease", flapRecoveryHealthyLease).
 						Bool("statuskit_was_deferred", c.statusKitDeferred.Load()).
@@ -2520,7 +2531,11 @@ func (c *IMClient) runReceiveWedgeWatchdog(stop chan struct{}, log zerolog.Logge
 						Msg("APNs courier confirmed receiving; healthy time now accrues toward the lease — StatusKit startup (deferred for repeated flapping) activates once this epoch has accrued the full lease, interruptions pause the accrual but do not reset it")
 				}
 			} else if receiveConfirmed {
-				c.Main.noteCourierUnhealthy(c.UserLogin.ID, time.Now())
+				staleAt := frameLowerBound.Add(time.Duration(courierHealthyMaxIdleSecs) * time.Second)
+				if staleAt.After(now) {
+					staleAt = now
+				}
+				c.Main.noteCourierUnhealthy(c.UserLogin.ID, staleAt)
 			}
 			if idle < receiveWedgeRecoverySecs {
 				continue
@@ -2542,7 +2557,7 @@ func (c *IMClient) runReceiveWedgeWatchdog(stop chan struct{}, log zerolog.Logge
 				c.runPublicOnlyInternetRecovery(log, verdictUnreachable)
 				return
 			}
-			now := time.Now()
+			now = time.Now()
 			if wait, ok := c.Main.handBackDue(c.UserLogin.ID, now); !ok {
 				if !holdLogged {
 					holdLogged = true
@@ -2574,6 +2589,12 @@ func (c *IMClient) runReceiveWedgeWatchdog(stop chan struct{}, log zerolog.Logge
 
 func (c *IMClient) LogoutRemote(ctx context.Context) {
 	c.Disconnect()
+	// Disconnect closes recoveryDone. Wait for the recovery owner to observe
+	// cancellation and finish every final hand-back/flap write before clearing
+	// connector-level state; otherwise its last write can recreate the run after
+	// logout.
+	c.internetRecoveryMu.Lock()
+	c.internetRecoveryMu.Unlock()
 	// The hand-back and flap runs are keyed by login ID and live on the
 	// connector, which outlives this client; a logout ends both so a later
 	// re-login with the same ID starts with no backoff carried over.
@@ -3607,6 +3628,13 @@ func (c *IMClient) OnConnectionEvent(event rustpushgo.ApsConnectionEvent) {
 		priority = 2
 	default:
 		return
+	}
+
+	// End the lease at callback time, before controller coalescing or policy can
+	// discard the event. This also establishes the exact boundary that the
+	// watchdog requires a later inbound frame to cross.
+	if c.Main != nil && c.UserLogin != nil {
+		c.Main.noteCourierUnhealthy(c.UserLogin.ID, time.Now())
 	}
 
 	// Keep the highest-severity pending event. The one-slot wake channel may

@@ -143,11 +143,26 @@ func statusKitClientFromEvent(ce *commands.Event) (*rustpushgo.WrappedStatusKitC
 // errStatusKitClientUnavailable: there is no Rust client to ask (the login is
 // not connected).
 var errStatusKitClientUnavailable = errors.New("bridge client not available")
+var errStatusKitAutomaticDeferred = errors.New("automatic StatusKit access deferred during APNs flap recovery")
 
 // getStatusKitClient is the FFI seam the explicit-command path reaches the
 // StatusKit client through. Never reassigned in production.
 var getStatusKitClient = func(client *rustpushgo.Client) (*rustpushgo.WrappedStatusKitClient, error) {
 	return client.GetStatuskitClient()
+}
+
+// automaticStatusKitClient is the only getter for background and event-driven
+// StatusKit work. Unlike explicit commands, it honors the flap-recovery
+// deferral so hidden lazy getters cannot register IDS topics before the courier
+// serves its health lease.
+func (c *IMClient) automaticStatusKitClient() (*rustpushgo.WrappedStatusKitClient, error) {
+	if c.statusKitDeferred.Load() {
+		return nil, errStatusKitAutomaticDeferred
+	}
+	if c.client == nil {
+		return nil, errStatusKitClientUnavailable
+	}
+	return getStatusKitClient(c.client)
 }
 
 // statusKitClientForCommand is the explicit-command path to the StatusKit

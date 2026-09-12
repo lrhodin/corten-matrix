@@ -116,6 +116,15 @@ type flapRecoveryRun struct {
 	// already ended in this epoch. The lease is served when it plus the
 	// current stretch reaches flapRecoveryHealthyLease.
 	HealthyAccrued time.Duration
+	// HealthyAfter is the latest interruption/rebuild boundary. A frame must
+	// have arrived after this instant before a new healthy stretch may start.
+	HealthyAfter time.Time
+	// RebuildRequested preserves the lineage of a recovery state until an actual
+	// replacement consumes it or explicit logout clears the run. A withdrawal
+	// cannot safely erase this bit: bridgev2 may already have passed its final
+	// state check and be about to construct the client. The bit alone changes no
+	// delay or StatusKit behavior; only consumption advances the count.
+	RebuildRequested bool
 }
 
 // flapRecoveryHealthyLease is how much healthy time a courier must accrue
@@ -150,7 +159,8 @@ func (c *IMConnector) flapRun(login networkid.UserLoginID) *flapRecoveryRun {
 
 // flapRebuildDue reports whether a courier-failure rebuild may be requested
 // now, and if not, how much longer the widening schedule holds it. The first
-// request of a run is never held; the run's clock starts at the first request.
+// actual replacement of a run is never held; the run's clock starts only when
+// LoadUserLogin constructs that replacement, not when a lossy state is sent.
 func (c *IMConnector) flapRebuildDue(login networkid.UserLoginID, now time.Time) (wait time.Duration, ok bool) {
 	c.flapRunMu.Lock()
 	defer c.flapRunMu.Unlock()
@@ -165,18 +175,46 @@ func (c *IMConnector) flapRebuildDue(login networkid.UserLoginID, now time.Time)
 	return 0, true
 }
 
-// noteFlapRebuild records a courier-failure rebuild request, widening the next
-// interval. The healthy time is zeroed — the current stretch and the bank —
-// because the client being replaced is not the one whose health will refute
-// the run: the lease is always one epoch's own.
+// markFlapRebuildRequested records that bridgev2 was asked to replace the
+// client. It deliberately does not advance the widening schedule: BridgeState
+// delivery is lossy, so only LoadUserLogin consuming the request proves a new
+// APS ResourceManager was actually constructed.
+func (c *IMConnector) markFlapRebuildRequested(login networkid.UserLoginID) {
+	c.flapRunMu.Lock()
+	defer c.flapRunMu.Unlock()
+	c.flapRun(login).RebuildRequested = true
+}
+
+// consumeFlapRebuildRequest is called exactly when LoadUserLogin constructs the
+// requested replacement. It advances the run once, even if recovery sent the
+// same request repeatedly before bridgev2 acted.
+func (c *IMConnector) consumeFlapRebuildRequest(login networkid.UserLoginID, now time.Time) bool {
+	c.flapRunMu.Lock()
+	defer c.flapRunMu.Unlock()
+	run := c.flapRuns[login]
+	if run == nil || !run.RebuildRequested {
+		return false
+	}
+	run.RebuildRequested = false
+	c.noteFlapRebuildLocked(run, now)
+	return true
+}
+
+// noteFlapRebuild records an actual replacement directly. Production uses
+// consumeFlapRebuildRequest; this entry remains useful for deterministic state
+// tests and callers that already possess proof of construction.
 func (c *IMConnector) noteFlapRebuild(login networkid.UserLoginID, now time.Time) {
 	c.flapRunMu.Lock()
 	defer c.flapRunMu.Unlock()
-	run := c.flapRun(login)
+	c.noteFlapRebuildLocked(c.flapRun(login), now)
+}
+
+func (c *IMConnector) noteFlapRebuildLocked(run *flapRecoveryRun, now time.Time) {
 	run.ConsecutiveRebuilds++
 	run.LastRebuild = now
 	run.HealthySince = time.Time{}
 	run.HealthyAccrued = 0
+	run.HealthyAfter = now
 }
 
 // flapRebuildCount is the run's length, for logging and for Connect's
@@ -190,6 +228,13 @@ func (c *IMConnector) flapRebuildCount(login networkid.UserLoginID) int {
 	return 0
 }
 
+func (c *IMConnector) flapRebuildRequested(login networkid.UserLoginID) bool {
+	c.flapRunMu.Lock()
+	defer c.flapRunMu.Unlock()
+	run := c.flapRuns[login]
+	return run != nil && run.RebuildRequested
+}
+
 // flapRecoveryDefersStatusKit reports whether a Connect happening now is a
 // REPEATED courier-failure rebuild, in which case the epoch brings core
 // APNs/iMessage up normally and holds its optional StatusKit startup until the
@@ -199,20 +244,21 @@ func (c *IMConnector) flapRecoveryDefersStatusKit(login networkid.UserLoginID) b
 	return c.flapRebuildCount(login) >= flapRecoveryStatusKitDeferralThreshold
 }
 
-// noteCourierHealthy records one healthy receive-watchdog tick. The first
-// healthy tick after a rebuild or an interruption starts a stretch; a tick
-// that finds the banked time plus the current stretch at or past the lease
-// ends the run and reports cleared=true, exactly once per run. With no run in
-// progress there is nothing to lease and nothing is recorded.
-func (c *IMConnector) noteCourierHealthy(login networkid.UserLoginID, now time.Time) (cleared bool) {
+// noteCourierActivity records a watchdog observation whose last inbound frame is
+// conservatively known to be no earlier than frameAt. A new stretch may start
+// only when that frame is after the latest rebuild/interruption boundary.
+func (c *IMConnector) noteCourierActivity(login networkid.UserLoginID, frameAt, now time.Time) (cleared bool) {
 	c.flapRunMu.Lock()
 	defer c.flapRunMu.Unlock()
 	run := c.flapRuns[login]
-	if run == nil {
+	if run == nil || !frameAt.After(run.HealthyAfter) {
 		return false
 	}
+	if frameAt.After(now) {
+		frameAt = now
+	}
 	if run.HealthySince.IsZero() {
-		run.HealthySince = now
+		run.HealthySince = frameAt
 	}
 	if run.HealthyAccrued+now.Sub(run.HealthySince) < flapRecoveryHealthyLease {
 		return false
@@ -221,25 +267,29 @@ func (c *IMConnector) noteCourierHealthy(login networkid.UserLoginID, now time.T
 	return true
 }
 
-// noteCourierUnhealthy ends the current healthy stretch and banks it: an APS
-// connection event (the courier left Generated, or a regeneration failed) or
-// an inbound-frame age past the healthy bound. The run itself is untouched,
-// and so is the healthy time already accrued — the interruption costs the run
-// only the unhealthy time that follows it (see the header comment for why).
-// now is the caller's clock; the two callers run on different goroutines, so
-// a stretch whose end reads before its start is banked as nothing rather than
-// as negative time.
+// noteCourierHealthy is the direct-observation form used by state tests.
+func (c *IMConnector) noteCourierHealthy(login networkid.UserLoginID, now time.Time) bool {
+	return c.noteCourierActivity(login, now, now)
+}
+
+// noteCourierUnhealthy ends and banks the current stretch and establishes a
+// boundary that requires a later inbound frame before accrual can resume.
 func (c *IMConnector) noteCourierUnhealthy(login networkid.UserLoginID, now time.Time) {
 	c.flapRunMu.Lock()
 	defer c.flapRunMu.Unlock()
 	run := c.flapRuns[login]
-	if run == nil || run.HealthySince.IsZero() {
+	if run == nil {
 		return
 	}
-	if stretch := now.Sub(run.HealthySince); stretch > 0 {
-		run.HealthyAccrued += stretch
+	if !run.HealthySince.IsZero() {
+		if stretch := now.Sub(run.HealthySince); stretch > 0 {
+			run.HealthyAccrued += stretch
+		}
+		run.HealthySince = time.Time{}
 	}
-	run.HealthySince = time.Time{}
+	if now.After(run.HealthyAfter) {
+		run.HealthyAfter = now
+	}
 }
 
 // flapRunHealthySince exposes the current stretch's start for logging and

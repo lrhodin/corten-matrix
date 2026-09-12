@@ -718,48 +718,41 @@ func TestLoopStillRecoversNormallyAfterAnUnusableProbeHandBack(t *testing.T) {
 	healthy = true
 	mu.Unlock()
 
-	// The hand-back was a courier-failure rebuild request, so it is in the
-	// flap run (finding 5), and the follow-up recovered request is held 7m
-	// behind it — exactly as a dropped recovered request already holds its
-	// own follow-up. Pinned here (the run is written after the send, so it is
-	// polled), then the run is cleared to stand in for the hold expiring,
-	// which is what lets the recovered path be reached.
+	// Sending a bridge state is not proof that bridgev2 constructed a client.
+	// The request is pending, but it must not advance the flap schedule or hold
+	// this same episode's recovered follow-up when bridgev2 declines it.
 	deadline := time.Now().Add(2 * time.Second)
-	for client.Main.flapRebuildCount(client.UserLogin.ID) != 1 {
+	for !client.Main.flapRebuildRequested(client.UserLogin.ID) {
 		if time.Now().After(deadline) {
-			t.Fatalf("flap run after an unusable-probe hand-back = %d, want 1", client.Main.flapRebuildCount(client.UserLogin.ID))
+			t.Fatal("unusable-probe hand-back was not recorded as pending")
 		}
 		time.Sleep(time.Millisecond)
 	}
-	select {
-	case <-recovered:
-		t.Fatal("a recovered request followed a hand-back inside the flap run's 7m hold")
-	case <-time.After(100 * time.Millisecond):
+	if got := client.Main.flapRebuildCount(client.UserLogin.ID); got != 0 {
+		t.Fatalf("unacted hand-back advanced the flap run to %d, want 0", got)
 	}
-	client.Main.clearFlapRun(client.UserLogin.ID)
 
 	select {
 	case <-recovered:
 	case <-time.After(10 * time.Second):
-		t.Fatal("after a hand-back the loop never recovered normally — the hand-back arm has latched and the stability/preflight path is unreachable")
+		t.Fatal("a declined hand-back incorrectly held the same episode's recovered request")
 	}
 	stop()
 }
 
-// Finding 5 (flap-run review), through the real loop: on a host whose public
-// probe cannot get a socket, a courier-failure episode's only rebuild is the
-// unusable-probe hand-back. It is recorded in the flap run — the replacement
-// receives at once and clears handBackRun, so this is the only run that can
-// grow on such a host — and a run already in progress holds it.
-func TestUnusableProbeHandBackIsRecordedInAndHeldByTheFlapRun(t *testing.T) {
+// A courier-failure hand-back becomes pending when sent, but only an actual
+// LoadUserLogin replacement advances the flap run. A prior actual replacement
+// still holds a later hand-back on the widening schedule.
+func TestUnusableProbeHandBackIsPendingAndHeldOnlyByActualRebuilds(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		priorRebuilds int
 		wantHandBacks int
 		wantRun       int
+		wantPending   bool
 	}{
-		{"no run: hand-back sent and the run started", 0, 1, 1},
-		{"a recent courier-failure rebuild: hand-back held, run unchanged", 1, 0, 1},
+		{"no run: hand-back sent but not counted until replacement", 0, 1, 0, true},
+		{"a recent actual rebuild: hand-back held, run unchanged", 1, 0, 1, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scaleRecoveryTimingForTest(t)
@@ -794,6 +787,9 @@ func TestUnusableProbeHandBackIsRecordedInAndHeldByTheFlapRun(t *testing.T) {
 			}
 			if run := client.Main.flapRebuildCount(client.UserLogin.ID); run != tc.wantRun {
 				t.Fatalf("flap run length = %d, want %d", run, tc.wantRun)
+			}
+			if pending := client.Main.flapRebuildRequested(client.UserLogin.ID); pending != tc.wantPending {
+				t.Fatalf("pending rebuild = %v, want %v", pending, tc.wantPending)
 			}
 		})
 	}
@@ -857,6 +853,12 @@ func TestUnusableProbeHandBackIsWithdrawnByALaterOutageVerdict(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("a confirmed outage arrived while an unusable-probe hand-back was pending and the loop did not withdraw it: bridgev2 will reconnect to Apple into the outage")
 	}
+	if !client.Main.flapRebuildRequested(client.UserLogin.ID) {
+		t.Fatal("withdrawal erased the unresolved flap lineage before bridgev2 could finish an already-committed replacement")
+	}
+	if got := client.Main.flapRebuildCount(client.UserLogin.ID); got != 0 {
+		t.Fatalf("withdrawal counted an unconstructed replacement: %d", got)
+	}
 	// And nothing may re-ask while the verdict stays Unreachable.
 	select {
 	case code := <-rebuiltAgain:
@@ -864,6 +866,71 @@ func TestUnusableProbeHandBackIsWithdrawnByALaterOutageVerdict(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 	stop()
+	if !client.Main.consumeFlapRebuildRequest(client.UserLogin.ID, time.Now()) {
+		t.Fatal("an actual replacement committed before withdrawal could not consume the retained lineage")
+	}
+	if got := client.Main.flapRebuildCount(client.UserLogin.ID); got != 1 {
+		t.Fatalf("actual replacement after withdrawal advanced flap count to %d, want 1", got)
+	}
+}
+
+func TestFailedFinalPreflightRetainsUncountedLineageForCommittedReplacement(t *testing.T) {
+	scaleRecoveryTimingForTest(t)
+	retryDelayFunc = func(time.Duration) time.Duration { return time.Millisecond }
+
+	var mu sync.Mutex
+	handedBack := false
+	internetProbeFunc = func(_ context.Context, phase string) internetprobe.Result {
+		mu.Lock()
+		defer mu.Unlock()
+		if !handedBack {
+			return blockedResult()
+		}
+		if phase == recoveryPhasePreflight {
+			return unreachableResult()
+		}
+		return reachableResult()
+	}
+
+	handBackCh := make(chan struct{})
+	withdrawn := make(chan struct{})
+	var onceH, onceW sync.Once
+	sendRecoveryState = func(_ *bridgev2.Bridge, _ *bridgev2.BridgeStateQueue, st status.BridgeState) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case st.Error == "im-internet-probe-unusable" && !handedBack:
+			handedBack = true
+			onceH.Do(func() { close(handBackCh) })
+		case handedBack && st.StateEvent == status.StateTransientDisconnect:
+			onceW.Do(func() { close(withdrawn) })
+		}
+		return true
+	}
+
+	client := newRecoveryTestClient()
+	stop := runRecoveryLoopForTestFrom(t, client, verdictReachable)
+	defer stop()
+	select {
+	case <-handBackCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("never reached the unusable-probe hand-back")
+	}
+	select {
+	case <-withdrawn:
+	case <-time.After(10 * time.Second):
+		t.Fatal("failed final preflight did not withdraw the pending hand-back")
+	}
+	if !client.Main.flapRebuildRequested(client.UserLogin.ID) {
+		t.Fatal("failed final preflight erased lineage for a bridgev2 waiter already committed past its final state check")
+	}
+	if got := client.Main.flapRebuildCount(client.UserLogin.ID); got != 0 {
+		t.Fatalf("failed final preflight counted an unconstructed replacement: %d", got)
+	}
+	stop()
+	if !client.Main.consumeFlapRebuildRequest(client.UserLogin.ID, time.Now()) {
+		t.Fatal("committed replacement could not consume lineage after failed final preflight")
+	}
 }
 
 func TestHandBackDelayBacksOffAndCaps(t *testing.T) {
@@ -1923,9 +1990,9 @@ func TestHoldLogThrottlesToTheInterval(t *testing.T) {
 func scaleEventLoopTimingForTest(t *testing.T) {
 	t.Helper()
 	scaleRecoveryTimingForTest(t)
-	confirm, wedge, inbound := internetOutageConfirmDelay, receiveWedgePollInterval, apsSecondsSinceLastInbound
+	confirm, wedge, inbound, inboundAt := internetOutageConfirmDelay, receiveWedgePollInterval, apsSecondsSinceLastInbound, apsLastInboundLowerBound
 	t.Cleanup(func() {
-		internetOutageConfirmDelay, receiveWedgePollInterval, apsSecondsSinceLastInbound = confirm, wedge, inbound
+		internetOutageConfirmDelay, receiveWedgePollInterval, apsSecondsSinceLastInbound, apsLastInboundLowerBound = confirm, wedge, inbound, inboundAt
 	})
 	internetOutageConfirmDelay = time.Millisecond
 	receiveWedgePollInterval = time.Millisecond
