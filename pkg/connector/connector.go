@@ -12,8 +12,10 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"sync"
 	"time"
 
+	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -30,6 +32,11 @@ func isRunningOnMacOS() bool {
 type IMConnector struct {
 	Bridge *bridgev2.Bridge
 	Config IMConfig
+
+	// Internet-recovery hand-back backoff, per login. Kept here rather than on
+	// IMClient because a hand-back exists to make bridgev2 replace the IMClient.
+	handBackMu sync.Mutex
+	handBacks  map[networkid.UserLoginID]*handBackRun
 }
 
 var _ bridgev2.NetworkConnector = (*IMConnector)(nil)
@@ -73,18 +80,37 @@ func (c *IMConnector) Start(ctx context.Context) error {
 		c.Bridge.Config.UnknownErrorAutoReconnect = 5 * time.Minute
 		c.Bridge.Log.Info().Msg("Defaulting unknown_error_auto_reconnect to 5m so the APNs receive-wedge watchdog can rebuild the client")
 	}
-	// bridgev2 counts unknown-error reconnects against UnknownErrorMaxAutoReconnects
-	// and NEVER resets the counter in-process (bridgestate.go: incremented only).
-	// The default (0/low) exhausts the budget after ~1 rebuild → the watchdog
-	// silently reverts to manual-restart-only on a long-uptime deploy. Raise it so
-	// recovery survives many wedges. Apple-safe even at this count: rebuilds are
-	// rate-limited (10-min wedge threshold + 5-min reconnect delay ⇒ ≤~4/hr) AND
-	// kept LIGHT (the 20+-handle IDS invite sweep + FT pre-mint are gated by the
-	// full-connect cooldown), so even a long run of rebuilds stays far below any
-	// abuse threshold; the finite bound still stops infinite churn on a truly
-	// permanent failure. Counter refreshes on process restart.
-	if c.Bridge.Config.UnknownErrorMaxAutoReconnects < 100 {
-		c.Bridge.Config.UnknownErrorMaxAutoReconnects = 100
+	// Effectively unbounded. The counter is incremented and NEVER reset in
+	// process (bridgestate.go), so ANY finite cap is a scheduled outage: the
+	// budget is spent by recovery *succeeding* — every wedge rebuild, every
+	// restored outage — so the more reliably recovery works, the sooner the
+	// bridge dies. Exhaustion is silent (a Warn, no bridge state, no notice),
+	// and because the Internet-recovery path tears the client down BEFORE
+	// asking for the rebuild, the login is left dead rather than merely
+	// degraded, with Restart=always no help because the process never exits.
+	// The cap bought no Apple safety anyway. Each rebuild source has its own
+	// bound, and only the first two widen: the recovery loop's ceiling
+	// hand-backs and the wedge watchdog's rebuild are behind the widening
+	// hand-back backoff (7m to 45m); the recovery loop's normal exit,
+	// im-internet-recovered, is bounded only by its stability window (60s of
+	// continuously reachable probes plus a passing preflight) and bridgev2's
+	// own 4-6m wait, so a courier that keeps flapping on a reachable link is
+	// rebuilt about every 5-7 minutes, ~10 courier reconnects per hour, for as
+	// long as it flaps — and it cannot be put behind the hand-back run, which
+	// a flapping courier clears by delivering frames. That is accepted: it is
+	// well under the ~120/hour rustpush's own retry loop makes, the
+	// Apple-heavy IDS sweep on each rebuild is gated by fullConnectIDSCooldown
+	// (30m) independently of how often rebuilds happen, and it is the sweep,
+	// not the courier reconnect, that the account-disable history is about.
+	// A rebuild re-registers with IDS only when identity_manager.rs
+	// decides it must anyway: a service with no stored registration or whose
+	// data hash changed (IdentityResource::new, `.unwrap_or(true)`), or a
+	// stored registration already past its renewal time (schedule_rereg
+	// returns at once when calculate_rereg_time_s() <= 0 and the outer loop
+	// re-registers). None of those hold on an ordinary rebuild — it is a
+	// courier reconnect, roughly what an iPhone does on any network change.
+	if c.Bridge.Config.UnknownErrorMaxAutoReconnects < math.MaxInt32 {
+		c.Bridge.Config.UnknownErrorMaxAutoReconnects = math.MaxInt32
 	}
 
 	// iMessage's primary identifier IS the phone number, and the Matrix client
@@ -298,6 +324,112 @@ func (c *IMConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flow
 	}
 }
 
+// handBackRun tracks consecutive Internet-recovery hand-backs for one login. It
+// lives here, not on IMClient, because a hand-back's whole purpose is to make
+// bridgev2 replace the IMClient — so per-client state is destroyed exactly when
+// the backoff needs to widen.
+type handBackRun struct {
+	last  time.Time
+	count int
+}
+
+// handBackDue reports whether enough time has passed since the previous
+// hand-back for this login, and if not, how much longer to wait.
+func (c *IMConnector) handBackDue(login networkid.UserLoginID, now time.Time) (wait time.Duration, ok bool) {
+	c.handBackMu.Lock()
+	defer c.handBackMu.Unlock()
+	run := c.handBacks[login]
+	if run == nil || run.last.IsZero() {
+		return 0, true
+	}
+	required := handBackDelay(run.count)
+	if elapsed := now.Sub(run.last); elapsed < required {
+		return required - elapsed, false
+	}
+	return 0, true
+}
+
+// noteHandBack records a hand-back, widening the next interval.
+func (c *IMConnector) noteHandBack(login networkid.UserLoginID, now time.Time) {
+	c.handBackMu.Lock()
+	defer c.handBackMu.Unlock()
+	if c.handBacks == nil {
+		c.handBacks = make(map[networkid.UserLoginID]*handBackRun)
+	}
+	run := c.handBacks[login]
+	if run == nil {
+		run = &handBackRun{}
+		c.handBacks[login] = run
+	}
+	run.last = now
+	run.count++
+}
+
+// clearHandBacks resets the backoff. Called by the receive-wedge watchdog when
+// the first inbound APS frame of a connect epoch arrives — the only evidence
+// that a rebuild produced a working courier connection — and by LogoutRemote.
+// Deliberately NOT by markConnected: every rebuild reaches that whether or not
+// APS came up (see markConnected), and clearing there meant no rebuild source
+// ever widened.
+func (c *IMConnector) clearHandBacks(login networkid.UserLoginID) {
+	c.handBackMu.Lock()
+	defer c.handBackMu.Unlock()
+	delete(c.handBacks, login)
+}
+
+// loadUserLoginDisconnectTimeout bounds how long a load waits for a prior
+// client to tear down. bridgev2's NewLogin holds the bridge-wide cacheLock across
+// this call and Disconnect() blocks on lifecycleMu, which Connect holds for its
+// whole body, so an unbounded wait stalls every portal and ghost operation.
+// Exceeding it fails the load rather than racing a duplicate APNs connection.
+// A var only so tests can shrink it; never reassigned in production.
+var loadUserLoginDisconnectTimeout = 30 * time.Second
+
+// retirePreviousClient is the ONE way a load path retires the IMClient that
+// bridgev2 already holds for a login, shared by IMConnector.LoadUserLogin and
+// the re-login closure in completeLoginWithMeta so the two cannot drift: both
+// call sites face the same hazard and must fail the same way.
+//
+// The predicate is IMClient.needsRetirement: a Rust client installed, a live
+// connect epoch, or an orphaned recovery loop. Each of the two earlier
+// predicates missed one of those. `client != nil` alone skipped the client
+// Internet recovery had torn down with its loop still armed, which could push
+// StateUnknownError on the SHARED ul.BridgeState (NewLogin reuses the same
+// UserLogin for the same user+ID) and make bridgev2 tear down the healthy
+// replacement. Adding hasOrphanedRecovery() still skipped a client in the
+// MIDDLE of Connect: c.client is nil until NewClient returns (up to 300s) and
+// stopChan is open, so neither half matched, the load installed a replacement,
+// and the first Connect went on to finish — a second APS connection on the
+// same device token, StateConnected on the shared queue, and a wedge watchdog
+// and APS event loop on a stopChan nobody would close.
+//
+// Retiring a mid-Connect client means Disconnect() waits on lifecycleMu for
+// that Connect, which is why the wait is bounded: bridgev2's NewLogin holds
+// the bridge-wide cacheLock across this call. Disconnect flags the client
+// before it waits, so the running Connect abandons itself at its next commit
+// point instead of finishing (see terminationRequested), and the background
+// teardown completes the moment it returns.
+//
+// On timeout it returns an error and the caller must NOT continue: building a
+// second APSConnection on the same persisted device token while the first is
+// still live is the duplicate-token "early eof" storm, which rustpush drives
+// with an unbounded <=30s retry loop. Failing the load releases the cacheLock
+// and lets bridgev2 (or the user) retry; the abandoned teardown finishes in
+// the background so the next attempt finds a clean slate. Disconnect() is
+// idempotent.
+func retirePreviousClient(previous *IMClient, log zerolog.Logger) error {
+	if previous == nil || !previous.needsRetirement() {
+		return nil
+	}
+	log.Info().Msg("Retiring the previous iMessage client before installing a new one (avoids a duplicate APNs connection on the same device token, and retires any armed recovery loop)")
+	if previous.disconnectWithTimeout(loadUserLoginDisconnectTimeout) {
+		return nil
+	}
+	log.Error().Dur("timeout", loadUserLoginDisconnectTimeout).
+		Msg("Previous iMessage client teardown did not finish in time; aborting this load rather than opening a duplicate APNs connection on the same device token")
+	return fmt.Errorf("previous iMessage client teardown did not finish within %s; not opening a duplicate APNs connection", loadUserLoginDisconnectTimeout)
+}
+
 func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
 	meta := login.Metadata.(*UserLoginMetadata)
 	log := c.Bridge.Log.With().Str("component", "imessage").Logger()
@@ -312,9 +444,11 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 	// Apple drops ("early eof"), which rustpush's no-backoff reconnect loop
 	// turns into the self-sustaining receive-stall storm. Disconnect closes the
 	// old connection and stops its goroutines, so the rebuild starts clean.
-	if existing, ok := login.Client.(*IMClient); ok && existing != nil && existing.client != nil {
-		log.Info().Msg("LoadUserLogin: disconnecting existing client before reconnect (avoids a duplicate APNs connection on the same device token)")
-		existing.Disconnect()
+	// See retirePreviousClient for why the predicate and the abort both matter.
+	if existing, ok := login.Client.(*IMClient); ok {
+		if err := retirePreviousClient(existing, log); err != nil {
+			return err
+		}
 	}
 
 	var cfg *rustpushgo.WrappedOsConfig

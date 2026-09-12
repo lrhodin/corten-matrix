@@ -458,8 +458,10 @@ type IMClient struct {
 	recoveryBridgeState *bridgev2.BridgeStateQueue
 	// Serializes the complete Connect/Disconnect lifecycle so an asynchronous
 	// logout cannot finish teardown before Connect installs its Rust client.
-	lifecycleMu         sync.Mutex
-	lifecycleTerminated bool
+	lifecycleMu sync.Mutex
+	// Set by Disconnect() BEFORE it waits on lifecycleMu, so a Connect that is
+	// still running can see it has been retired — see terminationRequested.
+	lifecycleTerminated atomic.Bool
 	// Serializes the teardown body — see the comment there.
 	disconnectMu sync.Mutex
 	// Serializes this login's event-driven Internet recovery episode.
@@ -1126,12 +1128,53 @@ func safeFinish(
 	return session.Finish(config, conn, existingIdentity, existingUsers)
 }
 
+// beginConnect takes the lifecycle lock and holds it for the whole Connect body
+// (endConnect releases it), which is what closes the race where an
+// asynchronously launched Connect installs a Rust client after a normal
+// Disconnect already finished tearing one down.
+//
+// The cost of holding it that long is that a teardown issued mid-Connect waits
+// for Connect to finish instead of racing it: bridge shutdown is bounded by
+// bridgev2's DisconnectWithTimeout, but LogoutRemote and unknownErrorReconnect
+// both wait indefinitely. That is the intended trade — a logout that waits is
+// recoverable, a client installed after teardown is not.
 func (c *IMClient) beginConnect() bool {
 	c.lifecycleMu.Lock()
-	if c.lifecycleTerminated {
+	if c.lifecycleTerminated.Load() {
 		c.lifecycleMu.Unlock()
 		return false
 	}
+	return true
+}
+
+// terminationRequested reports whether Disconnect() has been called on this
+// client, including a Disconnect that is still parked on lifecycleMu waiting
+// for the running Connect to return. Connect consults it (via abandonIfRetired)
+// before each stage of its tail that either touches Apple or writes state a
+// replacement client would read — after NewClient returns, before the
+// full-connect IDS-sweep gate stamps im.last_full_connect, before the StatusKit
+// initialization launches (IDS topics, presence subscriptions, the contact
+// invite sweep, ShareStatus), and in markConnected — so a Connect that a load
+// path has already retired stops at the next such boundary instead of finishing
+// into a second live client. Nothing can stop it mid-stage: a boundary is
+// where the check runs, and the stages between boundaries are local work. The
+// pending Disconnect completes the teardown (Stop/Destroy of c.client, closing
+// the APS connection and the epoch channels) the moment Connect releases
+// lifecycleMu.
+func (c *IMClient) terminationRequested() bool {
+	return c.lifecycleTerminated.Load()
+}
+
+// abandonIfRetired is the check Connect makes at each of its tail boundaries:
+// true means a Disconnect is pending and Connect must return now, leaving the
+// installed Rust client for that Disconnect to stop and destroy. Logged so an
+// abandoned Connect never presents as a silent dead bridge.
+func (c *IMClient) abandonIfRetired(log zerolog.Logger, after string) bool {
+	if !c.terminationRequested() {
+		return false
+	}
+	log.Warn().Str("after", after).
+		Msg("This iMessage client was retired while Connect was running; abandoning Connect here so the pending teardown can complete instead of finishing into a duplicate APNs connection")
 	return true
 }
 
@@ -1140,25 +1183,44 @@ func (c *IMClient) endConnect() {
 }
 
 func (c *IMClient) Connect(ctx context.Context) {
+	log := c.UserLogin.Log.With().Str("component", "imessage").Logger()
 	if !c.beginConnect() {
+		// Say so out loud. bridgev2 logs "Reconnection finished" either way, so a
+		// silent return here would present as a dead bridge with no diagnostics.
+		// Not reachable through bridgev2 today — every Connect call site is either
+		// first start or immediately follows recreateClient, and LoadUserLogin
+		// always builds a fresh IMClient — but a future caller that reuses a
+		// client would otherwise fail invisibly.
+		log.Warn().Msg("Refusing to Connect: this client already completed a normal lifecycle teardown — the caller must build a fresh client via LoadUserLogin")
 		return
 	}
 	defer c.endConnect()
 
 	c.startupTime = time.Now()
-	log := c.UserLogin.Log.With().Str("component", "imessage").Logger()
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
 
 	// Create this connect epoch's cancellation and APNs-event channels before
 	// NewClient installs the Rust callback. An initial APS failure can callback
 	// while NewClient is still returning; the buffered event must already exist.
+	// Written under disconnectMu as well as lifecycleMu: disconnect() and
+	// connectEpochActive() read these under disconnectMu alone, so without the
+	// inner lock there is no happens-before edge with a Matrix-command
+	// goroutine that lands mid-Connect. Order matches disconnect()'s
+	// lifecycleMu -> disconnectMu, so it cannot invert.
+	c.disconnectMu.Lock()
 	c.stopChan = make(chan struct{})
 	c.stopChanClosed = false
 	c.recoveryDone = make(chan struct{})
 	c.recoveryDoneClosed = false
 	c.recoveryBridgeState = c.UserLogin.BridgeState
-	c.connectionEventWake = make(chan struct{}, 1)
+	c.disconnectMu.Unlock()
+	// The wake channel is read under connectionEventMu by OnConnectionEvent and
+	// dropPendingConnectionEvent, so it is written under it too. The APS event
+	// loop's select reads it WITHOUT the mutex; that read is ordered by this
+	// goroutine launching the loop further down in Connect (goroutine creation
+	// happens-before), not by the lock, and the loop is the only such reader.
 	c.connectionEventMu.Lock()
+	c.connectionEventWake = make(chan struct{}, 1)
 	c.connectionEventPending = 0
 	c.connectionEventMu.Unlock()
 
@@ -1169,7 +1231,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 	// bridge DB kept the old state, every IDS operation would fail with
 	// "Keystore error Key not found".  Detect this early and ask the user to
 	// re-login instead of producing a cryptic send-time error.
-	if c.users != nil && !c.users.ValidateKeystore() {
+	if c.users != nil && !validateKeystore(c.users) {
 		log.Error().Msg("Keystore keys missing for saved user state — clearing stale login, please re-login")
 		meta := c.UserLogin.Metadata.(*UserLoginMetadata)
 		meta.IDSUsers = ""
@@ -1178,7 +1240,15 @@ func (c *IMClient) Connect(ctx context.Context) {
 		if err := c.UserLogin.Save(ctx); err != nil {
 			log.Error().Err(err).Msg("Failed to persist cleared login state after key loss")
 		}
-		c.UserLogin.BridgeState.Send(status.BridgeState{
+		// Same leak as the NewClient path below: LoadUserLogin already built the
+		// APS connection, whose ResourceManager retries Apple every <=30s with
+		// with_max_times(usize::MAX). StateBadCredentials spawns no reconnect, so
+		// nothing would ever call Disconnect() — the loop would outlive this
+		// Connect for the life of the process, and the next re-login would open a
+		// SECOND connection on the same device token (the duplicate-token "early
+		// eof" storm). Neither LoadUserLogin predicate can retire it, because this
+		// path leaves stopChan open with c.client nil.
+		c.abandonConnectEpoch(status.BridgeState{
 			StateEvent: status.StateBadCredentials,
 			Message:    "Signing keys lost — please re-login to iMessage",
 		})
@@ -1220,16 +1290,47 @@ func (c *IMClient) Connect(ctx context.Context) {
 		}
 	}
 
-	client, err := rustpushgo.NewClient(c.connection, c.users, c.identity, c.config, c.tokenProvider, c, c)
+	client, err := newRustClient(c.connection, c.users, c.identity, c.config, c.tokenProvider, c, c)
 	if err != nil {
 		log.Err(err).Msg("Failed to create rustpush client")
-		c.UserLogin.BridgeState.Send(status.BridgeState{
-			StateEvent: status.StateBadCredentials,
+		// What this branch is, precisely: NewClient returns a non-nil error only
+		// for a declared WrappedError (rustpushgo.go checkCallStatus, status 1).
+		// A Rust panic does NOT arrive here — status 2 panics the Go process in
+		// checkCallStatus and checkCallStatusUnknown alike. And new_client
+		// (lib.rs) has exactly one return, Ok(client), with every fallible step
+		// running inside spawned tasks, so as of the pinned rustpush this branch
+		// is unreachable. It is kept because the signature allows it and a
+		// future rustpush could add an Err path; the handling below is what
+		// would be correct if it ever ran, and nothing here rests on it running.
+		//
+		// StateUnknownError, NOT StateBadCredentials, so bridgev2 would retry:
+		// it spawns unknownErrorReconnect only for StateUnknownError
+		// (bridgestate.go immediateSendBridgeState), and this return happens
+		// BEFORE the receive-wedge watchdog and APS event loop launch, so
+		// terminating here would leave nothing able to recover the login.
+		//
+		// abandonConnectEpoch closes the APS resource LoadUserLogin built —
+		// whose ResourceManager retries Apple every <=30s with
+		// with_max_times(usize::MAX) (rustpush aps.rs) — so a retry cannot stack
+		// a second Apple-facing loop on the first, and closes the epoch so the
+		// lifecycle predicates do not report a live epoch for a client with no
+		// Rust client.
+		c.abandonConnectEpoch(status.BridgeState{
+			StateEvent: status.StateUnknownError,
+			Error:      "im-client-create-failed",
 			Message:    fmt.Sprintf("Failed to connect: %v", err),
 		})
 		return
 	}
+	// Under disconnectMu, like the epoch channels above: needsRetirement reads
+	// c.client from the load goroutine while this Connect is still running,
+	// and disconnect() nils it under the same lock.
+	c.disconnectMu.Lock()
 	c.client = client
+	c.disconnectMu.Unlock()
+	if c.abandonIfRetired(log, "building the rustpush client") {
+		return
+	}
 
 	// Hydrate the persistent alias→portal cache and pre-warm from the ghost
 	// table so the first StatusKit presence update after a restart can
@@ -1308,21 +1409,9 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	log.Info().Str("selected_handle", logSafeHandle(c.handle)).Strs("handles", logSafeHandles(handles)).Msg("Connected to iMessage")
 
-	// See lastFullConnectKVKey: skip the Apple-heavy IDS sweep (the StatusKit
-	// contact-invite burst) when a full connect happened within the
-	// cooldown — a reconnect/rebuild must not re-fire that burst at Apple
-	// mid-storm. Degrades safe: any KV/parse miss → treated as "not recent" →
-	// runs exactly as before. Receiving is unaffected (handled by the APS
-	// reconnect + StatusKit subscribe, neither gated here).
-	skipHeavyIDSSweep := false
-	if raw := c.Main.Bridge.DB.KV.Get(context.Background(), lastFullConnectKVKey); raw != "" {
-		if last, perr := time.Parse(time.RFC3339, raw); perr == nil && time.Since(last) < fullConnectIDSCooldown {
-			skipHeavyIDSSweep = true
-			log.Info().Time("last_full_connect", last).Msg("Skipping FT pre-mint + StatusKit invite sweep — full connect within cooldown (avoids a redundant mid-reconnect IDS burst to Apple)")
-		}
-	}
-	if !skipHeavyIDSSweep {
-		c.Main.Bridge.DB.KV.Set(context.Background(), lastFullConnectKVKey, time.Now().Format(time.RFC3339))
+	skipHeavyIDSSweep, retired := c.gateFullConnectIDSSweep(log, time.Now())
+	if retired {
+		return
 	}
 
 	if c.Main.Config.VideoTranscoding {
@@ -1347,11 +1436,18 @@ func (c *IMClient) Connect(ctx context.Context) {
 		c.client.ResetStatuskitCursors()
 	}
 
+	// The StatusKit block below is the Apple-heavy part of Connect: IDS topic
+	// registration, presence subscriptions, the contact invite sweep and
+	// ShareStatus. A retired Connect must not launch it.
+	if c.abandonIfRetired(log, "persisting state") {
+		return
+	}
+
 	// Initialize StatusKit presence system (non-fatal — runs in background).
 	// Once initialized, the Rust receive loop intercepts StatusKit APNs
 	// messages and invokes OnStatusUpdate for subscribed handles.
 	go func() {
-		if c.client == nil {
+		if c.client == nil || c.terminationRequested() {
 			return
 		}
 		// Wrapped in a 30s timeout to prevent silent goroutine hangs if the
@@ -1605,13 +1701,18 @@ func (c *IMClient) Connect(ctx context.Context) {
 				Msg("Re-armed backfill for portals that were marked done with no bridged messages")
 		}
 	}
-	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+	if !c.markConnected() {
+		log.Warn().Msg("This iMessage client was retired while Connect was finishing; not reporting StateConnected or starting epoch workers, the pending teardown completes when Connect returns")
+		return
+	}
 
 	// Backstop the APNs receive path: if it goes fully silent (no frames, not
 	// even keepalive Pongs) for far longer than a healthy link ever would,
 	// auto-rebuild the client. This recovers the daily "can send but stopped
 	// receiving" reconnect-storm stall without a manual restart. Passed
-	// c.stopChan by value so it tracks this connect epoch.
+	// c.stopChan by value so it tracks this connect epoch. The watchdog is also
+	// what clears the connector-level hand-back backoff, on the first inbound
+	// frame it sees — see clearHandBacks.
 	go c.runReceiveWedgeWatchdog(c.stopChan, log.With().Str("component", "receive_wedge_watchdog").Logger())
 
 	// Eagerly silence bridge bot push notifications so the rule is in place
@@ -1649,8 +1750,13 @@ func (c *IMClient) Connect(ctx context.Context) {
 			log.Warn().Msg("Local macOS contacts unavailable — contact names will not be resolved")
 		}
 	} else {
-		cloudContacts := newCloudContactsClient(c.client, log)
-		if cloudContacts != nil {
+		var cloudContacts *cloudContactsClient
+		if !c.Main.Config.DisableICloudContacts {
+			cloudContacts = newCloudContactsClient(c.client, log)
+		}
+		if c.Main.Config.DisableICloudContacts {
+			log.Info().Msg("iCloud contacts disabled before CardDAV setup")
+		} else if cloudContacts != nil {
 			c.contacts = cloudContacts
 			log.Info().Str("url_host", logSafeURL(cloudContacts.baseURL)).Msg("Cloud contacts available (iCloud CardDAV)")
 			if syncErr := cloudContacts.SyncContacts(log); syncErr != nil {
@@ -1922,10 +2028,189 @@ func (c *IMClient) existingManagementRoom() id.RoomID {
 }
 
 func (c *IMClient) Disconnect() {
+	// Flag BEFORE taking lifecycleMu, not after: Connect holds that lock for
+	// its whole body (NewClient alone can take 300s), and a load path that
+	// retires this client gives up waiting after loadUserLoginDisconnectTimeout.
+	// Setting the flag first is what lets the still-running Connect see, at its
+	// next commit point, that it has been retired — see terminationRequested.
+	c.lifecycleTerminated.Store(true)
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
-	c.lifecycleTerminated = true
 	c.disconnect(true)
+}
+
+// Seams for tests. Connect cannot be driven to its NewClient-failure return
+// with a real rustpush connection (Lower(nil) dereferences), and the wedge
+// watchdog cannot be driven without a connection that reports inbound-frame
+// age. Never reassigned in production.
+var (
+	newRustClient    = rustpushgo.NewClient
+	validateKeystore = func(users *rustpushgo.WrappedIdsUsers) bool {
+		return users.ValidateKeystore()
+	}
+	closeAPSConnection = func(conn *rustpushgo.WrappedApsConnection) {
+		if conn != nil {
+			conn.Close()
+		}
+	}
+	apsSecondsSinceLastInbound = func(conn *rustpushgo.WrappedApsConnection) uint64 {
+		return conn.SecondsSinceLastInbound()
+	}
+	receiveWedgePollInterval = 60 * time.Second
+)
+
+// abandonConnectEpoch is the single exit for every Connect return that happens
+// after LoadUserLogin built the APS connection but before any epoch worker
+// started. It closes that connection (its ResourceManager otherwise retries
+// Apple every <=30s with with_max_times(usize::MAX) for the life of the
+// process, with nothing left to stop it: StateBadCredentials spawns no
+// reconnect, and the next re-login would open a SECOND connection on the same
+// device token — the duplicate-token "early eof" storm), closes both epoch
+// channels so connectEpochActive and hasOrphanedRecovery report the truth (no
+// live epoch, no recovery loop to retire), and reports the reason.
+func (c *IMClient) abandonConnectEpoch(state status.BridgeState) {
+	closeAPSConnection(c.connection)
+	c.disconnectMu.Lock()
+	if c.stopChan != nil && !c.stopChanClosed {
+		close(c.stopChan)
+		c.stopChanClosed = true
+	}
+	// No recovery loop was started in this epoch, so nothing owns recoveryDone;
+	// leaving it open made hasOrphanedRecovery() claim an armed loop that did
+	// not exist, and LoadUserLogin would wait on a teardown with nothing to do.
+	if c.recoveryDone != nil && !c.recoveryDoneClosed {
+		close(c.recoveryDone)
+		c.recoveryDoneClosed = true
+	}
+	c.disconnectMu.Unlock()
+	sendRecoveryState(c.Main.Bridge, c.UserLogin.BridgeState, state)
+}
+
+// markConnected is the one place a connect epoch reports StateConnected. It
+// refuses — returning false and sending nothing — when a Disconnect is already
+// pending for this client, so a retired Connect cannot report a connection the
+// teardown is about to end (the queue is shared with the replacement client).
+//
+// It deliberately does NOT clear the connector-level hand-back backoff.
+// Reaching this point proves only that NewClient returned, which it always
+// does (lib.rs new_client has a single Ok return and rustpushgo.Connect logs a
+// failed initial APS generate as non-fatal), so it is no evidence that the
+// courier connection works. Clearing here made every rebuild — wedge or
+// recovery — reset the run, and the backoff never widened. The receive-wedge
+// watchdog clears it on the first inbound APS frame instead.
+func (c *IMClient) markConnected() bool {
+	if c.terminationRequested() {
+		return false
+	}
+	// Through the same seam as every recovery state, so a test can observe
+	// that the send happens only past the check.
+	sendRecoveryState(c.Main.Bridge, c.UserLogin.BridgeState, status.BridgeState{StateEvent: status.StateConnected})
+	return true
+}
+
+// gateFullConnectIDSSweep decides whether this Connect runs the Apple-heavy IDS
+// sweep (the StatusKit contact-invite burst — see lastFullConnectKVKey) and,
+// when it will, stamps im.last_full_connect so the next Connect inside the
+// cooldown skips it: a reconnect/rebuild must not re-fire that burst at Apple
+// mid-storm. Degrades safe: any KV/parse miss is treated as "not recent" and
+// the sweep runs. Receiving is unaffected (the APS reconnect and the StatusKit
+// subscribe are not gated here).
+//
+// retired is true when a Disconnect is pending for this client, in which case
+// nothing is stamped and Connect must return: the stamp is read by the
+// REPLACEMENT client's Connect, which the load path starts immediately, and a
+// stamp written by a dying client would make the surviving one skip its sweep
+// for the whole cooldown (round-9 finding).
+func (c *IMClient) gateFullConnectIDSSweep(log zerolog.Logger, now time.Time) (skipHeavyIDSSweep, retired bool) {
+	if c.abandonIfRetired(log, "selecting the handle") {
+		return true, true
+	}
+	if raw := c.Main.Bridge.DB.KV.Get(context.Background(), lastFullConnectKVKey); raw != "" {
+		if last, perr := time.Parse(time.RFC3339, raw); perr == nil && now.Sub(last) < fullConnectIDSCooldown {
+			log.Info().Time("last_full_connect", last).Msg("Skipping FT pre-mint + StatusKit invite sweep — full connect within cooldown (avoids a redundant mid-reconnect IDS burst to Apple)")
+			return true, false
+		}
+	}
+	c.Main.Bridge.DB.KV.Set(context.Background(), lastFullConnectKVKey, now.Format(time.RFC3339))
+	return false, false
+}
+
+// disconnectWithTimeout bounds how long a caller waits for teardown. Disconnect()
+// blocks on lifecycleMu, which Connect holds for its entire body — including a
+// long CardDAV/CloudKit tail — and bridgev2's NewLogin holds the bridge-wide
+// cacheLock across LoadUserLogin. Without a bound, a re-login during a connect
+// stalls every portal and ghost operation bridge-wide. Reports whether teardown
+// finished; the goroutine completes it either way (same shape as bridgev2's own
+// disconnectInternal).
+func (c *IMClient) disconnectWithTimeout(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		c.Disconnect()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// hasOrphanedRecovery reports a client that Internet recovery tore down while
+// deliberately leaving its recovery loop armed. Such a client still owns a loop
+// that can tear down a replacement, so it needs lifecycle termination even
+// though c.client is nil. An in-progress Connect has stopChan open and so is
+// never matched — which matters, because Disconnect() would otherwise block on
+// lifecycleMu for the length of that Connect.
+func (c *IMClient) hasOrphanedRecovery() bool {
+	c.disconnectMu.Lock()
+	defer c.disconnectMu.Unlock()
+	return c.hasOrphanedRecoveryLocked()
+}
+
+func (c *IMClient) hasOrphanedRecoveryLocked() bool {
+	return c.stopChan != nil && c.stopChanClosed &&
+		c.recoveryDone != nil && !c.recoveryDoneClosed
+}
+
+// connectEpochActive reports whether this client still has a live connect epoch.
+// stopChan is closed rather than nil'd on teardown so workers observe shutdown,
+// so "closed" — not "nil" — is what means torn down.
+func (c *IMClient) connectEpochActive() bool {
+	c.disconnectMu.Lock()
+	defer c.disconnectMu.Unlock()
+	return c.connectEpochActiveLocked()
+}
+
+func (c *IMClient) connectEpochActiveLocked() bool {
+	return c.stopChan != nil && !c.stopChanClosed
+}
+
+// needsRetirement reports whether a load path must put this client through
+// Disconnect() before installing a replacement for the same login. It is the
+// union of every state that still owns something able to touch Apple or the
+// shared bridge-state queue, kept in one predicate so a load path cannot test
+// a subset of them:
+//
+//   - a Rust client is installed: it owns a live APS connection;
+//   - a connect epoch is live (connectEpochActive): Connect is still running.
+//     c.client is nil until NewClient returns — up to 300s — and without
+//     retirement that Connect finishes into a second APS connection on the
+//     same device token, pushes StateConnected on the shared queue, and starts
+//     a wedge watchdog and APS event loop nobody would ever stop;
+//   - Internet recovery tore the client down but left its loop armed
+//     (hasOrphanedRecovery): the loop can still push states that make bridgev2
+//     tear down the replacement.
+//
+// The first two overlap for most of an epoch's life; the second is the one the
+// round-8 audit found missing. One snapshot under disconnectMu: this is read
+// from the load goroutine while Connect may be installing c.client (which it
+// therefore does under the same lock) and while disconnect() may be nil'ing
+// it, and the epoch fields are ordered by that lock alone.
+func (c *IMClient) needsRetirement() bool {
+	c.disconnectMu.Lock()
+	defer c.disconnectMu.Unlock()
+	return c.client != nil || c.connectEpochActiveLocked() || c.hasOrphanedRecoveryLocked()
 }
 
 func (c *IMClient) disconnectForInternetRecovery() {
@@ -1935,11 +2220,12 @@ func (c *IMClient) disconnectForInternetRecovery() {
 }
 
 func (c *IMClient) disconnect(cancelRecovery bool) {
-	// bridgev2 serializes its own Disconnect calls (disconnectOnce), but
-	// LogoutRemote invokes this method directly, so two teardowns can run
-	// concurrently: double-close of stopChan, or one frame nil-ing c.client
-	// while the other's Stop() goroutine still reads it. Serialize here; the
-	// second caller then no-ops on the already-nil'd fields.
+	// Both entry points now take lifecycleMu first, so the concurrent-teardown
+	// race this originally guarded (LogoutRemote racing bridgev2's Disconnect)
+	// can no longer occur. disconnectMu is still required: hasOrphanedRecovery and
+	// connectEpochActive read stopChan/stopChanClosed/recoveryDone under it alone,
+	// without lifecycleMu, so this is the lock that orders those reads against
+	// Connect's epoch-field writes and this teardown.
 	c.disconnectMu.Lock()
 	defer c.disconnectMu.Unlock()
 	if cancelRecovery && c.recoveryDone != nil && !c.recoveryDoneClosed {
@@ -1958,9 +2244,7 @@ func (c *IMClient) disconnect(cancelRecovery bool) {
 	// nothing is still generating traffic while the client shuts down.
 	// Don't nil c.connection — the watchdog may still poll it; Close()
 	// signals stop without freeing the Go object.
-	if c.connection != nil {
-		c.connection.Close()
-	}
+	closeAPSConnection(c.connection)
 	if c.client != nil {
 		// Stop() is an async Rust/UniFFI call; bound it with a timeout as
 		// insurance so a wedge can't hang Disconnect (never observed in
@@ -2017,16 +2301,41 @@ const fullConnectIDSCooldown = 30 * time.Minute
 // runReceiveWedgeWatchdog watches the connection-level "seconds since last
 // inbound frame" signal and, on a prolonged wedge, asks bridgev2 to rebuild
 // the client by reporting StateUnknownError (→ recreateClient → Connect,
-// bounded by UnknownErrorMaxAutoReconnects so it can't loop forever). It is the
-// automated form of the manual restart that recovers the daily "can send but
-// stopped receiving" stall. One-shot: after firing it returns; the rebuilt
-// client starts a fresh watchdog. Gated by `stop` (taken by value so it tracks
-// this connect epoch, like the body-scrub loop) so a normal teardown ends it.
-// Polls c.connection (which Disconnect only closes, never destroys), so the
-// poll can never touch a freed handle.
+// NOT bounded by UnknownErrorMaxAutoReconnects — connector.go forces that
+// effectively unbounded, because a finite cap is spent by recovery SUCCEEDING and
+// silently kills the login). It is the automated form of the manual restart
+// that recovers the daily "can send but stopped receiving" stall. One-shot:
+// after firing it returns; the rebuilt client starts a fresh watchdog. Gated by
+// `stop` (taken by value so it tracks this connect epoch, like the body-scrub
+// loop) so a normal teardown ends it. Polls c.connection (which Disconnect
+// only closes, never destroys), so the poll can never touch a freed handle.
+//
+// It is also the arbiter of the connector-level hand-back backoff, because the
+// inbound-frame age is the only evidence this side has that a connect epoch's
+// courier connection actually works (markConnected is reached by every rebuild
+// whether or not APS came up):
+//
+//   - The first frame that arrives after this Connect began clears the run.
+//     rustpushgo seeds last_inbound_ms to "now" when LoadUserLogin builds the
+//     connection, which is before Connect stamps startupTime, so an age smaller
+//     than the time since startupTime can only come from a real frame. (The
+//     forced wedge backdates the stamp by an hour, which reads as no frame —
+//     correct, it is asking for a rebuild.) The stamp is wall-clock and
+//     startupTime monotonic; a clock step inside the window can misjudge one
+//     clear, costing at most one rebuild at the base cadence.
+//   - A rebuild request is held behind handBackDue and recorded with
+//     noteHandBack — the same widening interval the recovery loop's hand-backs
+//     use, so the two rebuild sources share one run. A client that is rebuilt
+//     and never receives a frame is therefore rebuilt on the widening schedule
+//     rather than every wedge threshold + bridgev2 delay (~15m) forever, while
+//     a client that did receive — the ordinary daily stall — has a clean run
+//     and rebuilds at once. The hold does not delay Apple-free recovery: the
+//     link is classified first, and an outage enters recovery regardless.
 func (c *IMClient) runReceiveWedgeWatchdog(stop chan struct{}, log zerolog.Logger) {
-	ticker := time.NewTicker(60 * time.Second)
+	ticker := time.NewTicker(receiveWedgePollInterval)
 	defer ticker.Stop()
+	receiveConfirmed := false
+	holdLogged := false
 	for {
 		select {
 		case <-stop:
@@ -2036,24 +2345,67 @@ func (c *IMClient) runReceiveWedgeWatchdog(stop chan struct{}, log zerolog.Logge
 			if conn == nil {
 				continue
 			}
-			idle := conn.SecondsSinceLastInbound()
-			if idle >= receiveWedgeRecoverySecs {
-				log.Warn().
-					Uint64("idle_secs", idle).
-					Msg("APNs receive path wedged far past the keepalive cadence and the in-process reconnect — forcing a full client rebuild (StateUnknownError → recreateClient → Connect)")
-				c.UserLogin.BridgeState.Send(status.BridgeState{
-					StateEvent: status.StateUnknownError,
-					Error:      "im-receive-wedged",
-					Message:    "iMessage stopped receiving; reconnecting",
-				})
+			idle := apsSecondsSinceLastInbound(conn)
+			if !receiveConfirmed && idle < uint64(time.Since(c.startupTime)/time.Second) {
+				receiveConfirmed = true
+				c.Main.clearHandBacks(c.UserLogin.ID)
+			}
+			if idle < receiveWedgeRecoverySecs {
+				continue
+			}
+			// A wedge is the only signal left when connectivity dies without the
+			// APS resource ever leaving Generated (half-open socket, no state
+			// transition), so this watchdog has to cover that case too. Classify
+			// first: rebuilding through an Internet outage just re-contacts Apple
+			// every wedge cycle for the whole outage, which is exactly what the
+			// recovery controller exists to avoid.
+			result := runLoggedInternetProbe(c.bridgeRecoveryContext(), log, "receive_wedge_classification")
+			if channelClosed(stop) {
 				return
 			}
+			if !result.Reachable() && !result.Blocked() {
+				log.Warn().
+					Uint64("idle_secs", idle).
+					Msg("APNs receive path wedged and both public Internet probes failed — entering Apple-free recovery instead of rebuilding into an outage")
+				c.runPublicOnlyInternetRecovery(log, false)
+				return
+			}
+			now := time.Now()
+			if wait, ok := c.Main.handBackDue(c.UserLogin.ID, now); !ok {
+				if !holdLogged {
+					holdLogged = true
+					log.Info().
+						Uint64("idle_secs", idle).
+						Dur("next_rebuild_in", wait).
+						Msg("APNs receive path is wedged, but the previous rebuild was recent and never restored receiving; holding the next rebuild behind the widening backoff rather than re-contacting Apple on the same cadence")
+				}
+				continue
+			}
+			log.Warn().
+				Uint64("idle_secs", idle).
+				Bool("internet_reachable", result.Reachable()).
+				Bool("probe_blocked", result.Blocked()).
+				Msg("APNs receive path wedged far past the keepalive cadence and the in-process reconnect — forcing a full client rebuild (StateUnknownError → recreateClient → Connect)")
+			sendRecoveryState(c.Main.Bridge, c.UserLogin.BridgeState, status.BridgeState{
+				StateEvent: status.StateUnknownError,
+				Error:      "im-receive-wedged",
+				Message:    "iMessage stopped receiving; reconnecting",
+			})
+			// Recorded unconditionally after the send, as the recovery loop
+			// does: an unobservable queue drop must err toward fewer Apple
+			// attempts.
+			c.Main.noteHandBack(c.UserLogin.ID, now)
+			return
 		}
 	}
 }
 
 func (c *IMClient) LogoutRemote(ctx context.Context) {
 	c.Disconnect()
+	// The hand-back run is keyed by login ID and lives on the connector, which
+	// outlives this client; a logout ends the run so a later re-login with the
+	// same ID starts with no backoff carried over.
+	c.Main.clearHandBacks(c.UserLogin.ID)
 }
 
 func (c *IMClient) IsThisUser(_ context.Context, userID networkid.UserID) bool {
@@ -3087,17 +3439,42 @@ func (c *IMClient) OnConnectionEvent(event rustpushgo.ApsConnectionEvent) {
 	// Keep the highest-severity pending event. The one-slot wake channel may
 	// coalesce notifications, but RetryFailed can never be dropped behind a
 	// burst of ordinary Interrupted events.
+	// Latch and wake under one lock hold, so a concurrent
+	// dropPendingConnectionEvent cannot observe the latch without the token or
+	// drain a token whose latch it did not clear. The send is non-blocking, so
+	// holding the mutex across it cannot stall this FFI callback.
 	c.connectionEventMu.Lock()
+	defer c.connectionEventMu.Unlock()
 	if uint8(priority) > c.connectionEventPending {
 		c.connectionEventPending = uint8(priority)
 	}
-	wake := c.connectionEventWake
-	c.connectionEventMu.Unlock()
-	if wake == nil {
+	if c.connectionEventWake == nil {
 		return
 	}
 	select {
-	case wake <- struct{}{}:
+	case c.connectionEventWake <- struct{}{}:
+	default:
+	}
+}
+
+// dropPendingConnectionEvent discards a latched APS event. Used when a
+// confirmation window has just proven the network recovered: any event latched
+// during that window describes the interruption we rode out, and acting on it
+// would tear the client down for an outage that is already over. Safe to drop —
+// if APS is still failing, rustpush keeps republishing and the observer
+// re-escalates.
+func (c *IMClient) dropPendingConnectionEvent() {
+	// Clear and drain under the SAME lock hold. Splitting them let a concurrent
+	// OnConnectionEvent set pending after the clear and deposit its token before
+	// the drain, which then ate it — leaving an event latched with no wake token
+	// and the event loop asleep until some later event happened to find the
+	// channel empty. Measured at 3 per 200000 interleavings; zero with the drain
+	// held here.
+	c.connectionEventMu.Lock()
+	defer c.connectionEventMu.Unlock()
+	c.connectionEventPending = 0
+	select {
+	case <-c.connectionEventWake:
 	default:
 	}
 }
@@ -4850,6 +5227,13 @@ func (c *IMClient) startRestoreBackfillPipeline(opts restorePipelineOptions) err
 	portalID := strings.TrimSpace(opts.PortalID)
 	if portalID == "" {
 		return fmt.Errorf("restore portal ID is empty")
+	}
+	// The pipeline wires its CloudKit fetch context to this epoch's stop channel,
+	// which stays closed (not nil) after teardown — including while Internet
+	// recovery holds the client down. Starting anyway would cancel the fetch on
+	// its first step and report that as a restore failure, so refuse up front.
+	if !c.connectEpochActive() {
+		return fmt.Errorf("not connected to iMessage right now — wait for the bridge to reconnect and try again")
 	}
 	opts.PortalID = portalID
 	if opts.PortalKey.ID == "" {

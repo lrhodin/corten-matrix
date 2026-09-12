@@ -53,9 +53,24 @@ type AppleIDLogin struct {
 
 var _ bridgev2.LoginProcessUserInput = (*AppleIDLogin)(nil)
 
-func (l *AppleIDLogin) Cancel() {}
+// Cancel releases the APS connection the flow opened in Start. Without this a
+// user who abandons the interactive flow leaves a ResourceManager retrying
+// Apple every <=30s for the life of the process.
+func (l *AppleIDLogin) Cancel() {
+	(&loginConn{l.conn}).close()
+}
 
 func (l *AppleIDLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
+	step, err := l.start(ctx)
+	return closeConnOnError(&loginConn{l.conn}, step, err)
+}
+
+func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
+	step, err := l.submitUserInput(ctx, input)
+	return closeConnOnError(&loginConn{l.conn}, step, err)
+}
+
+func (l *AppleIDLogin) start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	rustpushgo.InitLogger()
 
 	cfg, err := rustpushgo.CreateLocalMacosConfig()
@@ -92,7 +107,7 @@ func (l *AppleIDLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	}, nil
 }
 
-func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
+func (l *AppleIDLogin) submitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
 	// Device passcode step (after device selection, before handle selection)
 	if passcode, ok := input["passcode"]; ok && l.result != nil {
 		return l.handlePasscodeAndContinue(ctx, passcode)
@@ -275,7 +290,16 @@ type ExternalKeyLogin struct {
 
 var _ bridgev2.LoginProcessUserInput = (*ExternalKeyLogin)(nil)
 
-func (l *ExternalKeyLogin) Cancel() {}
+// Cancel releases the APS connection the flow opened at its hardware-key
+// step, if it got that far. See AppleIDLogin.Cancel.
+func (l *ExternalKeyLogin) Cancel() {
+	(&loginConn{l.conn}).close()
+}
+
+func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
+	step, err := l.submitUserInput(ctx, input)
+	return closeConnOnError(&loginConn{l.conn}, step, err)
+}
 
 func (l *ExternalKeyLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	return &bridgev2.LoginStep{
@@ -294,7 +318,7 @@ func (l *ExternalKeyLogin) Start(ctx context.Context) (*bridgev2.LoginStep, erro
 	}, nil
 }
 
-func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
+func (l *ExternalKeyLogin) submitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
 	// Device passcode step (after device selection, before handle selection)
 	if passcode, ok := input["passcode"]; ok && l.result != nil {
 		return l.handlePasscodeAndContinue(ctx, passcode)
@@ -812,6 +836,67 @@ func parseHandleSelection(selected string, handles []string) string {
 // completeLoginWithMeta is the shared tail of both login flows: creates the
 // IMClient, persists metadata, saves the identity backup file, and starts the
 // bridge connection.
+// installReLoginClient is the LoadUserLogin override used by completeLoginWithMeta.
+// bridgev2 prefers this closure over IMConnector.LoadUserLogin, and this is the
+// ONE path where a live client can genuinely exist at load time: an interactive
+// re-login over a running bridge. It retires that client exactly as
+// IMConnector.LoadUserLogin would — same predicate, same bound, same abort —
+// because the hazard is identical: NewLogin reuses the same UserLogin for the
+// same user+ID, so a surviving orphan shares ul.BridgeState with the new client
+// and can have bridgev2 tear the healthy one down. Warning and proceeding here
+// while connector.go aborted was the asymmetry round 7 found.
+func installReLoginClient(login *bridgev2.UserLogin, client *IMClient) error {
+	if previous, ok := login.Client.(*IMClient); ok && previous != client {
+		if err := retirePreviousClient(previous, login.Log); err != nil {
+			return err
+		}
+	}
+	client.UserLogin = login
+	login.Client = client
+	return nil
+}
+
+// loginConn is the APS connection a login flow opens at its first step. Its
+// ResourceManager retries Apple every <=30s with with_max_times(usize::MAX)
+// from the moment rustpushgo.Connect returns, so every way the flow can end
+// without an IMClient taking ownership must close it: Cancel (the user
+// abandoned the flow) and every error return (bridgev2 treats any error as
+// fatal and does NOT call Cancel afterward — LoginProcess contract). Close is a
+// try_send on the resource's death signal (rustpush util.rs), so closing twice
+// is harmless, and completeLoginWithMeta hands ownership to the IMClient only on
+// success.
+type loginConn struct {
+	conn *rustpushgo.WrappedApsConnection
+}
+
+func (l *loginConn) close() {
+	if l.conn != nil {
+		closeAPSConnection(l.conn)
+	}
+}
+
+// closeConnOnError wraps a login step so that any error return releases the
+// connection. Validation errors ("2FA code is required") count: bridgev2
+// abandons the process on those too.
+//
+// One deliberate trade at the very end of the flow: completeLoginWithMeta
+// installs the IMClient through NewLogin's LoadUserLogin hook, and NewLogin can
+// still fail AFTER that hook at its DB insert/save (bridgev2 userlogin.go). The
+// error return then closes the connection the installed client owns, and in
+// the re-login case bridgev2's cached UserLogin keeps pointing at that client,
+// which is never Connect-ed. That is chosen over the alternative — leaving the
+// connection open — because an open, orphaned APS connection retries Apple
+// every <=30s for the life of the process, while a closed one is inert; the
+// login is dead either way until the user retries, and the retry's load path
+// finds nothing to retire (no Rust client, no epoch, no recovery loop) and
+// installs a fresh client cleanly.
+func closeConnOnError(l *loginConn, step *bridgev2.LoginStep, err error) (*bridgev2.LoginStep, error) {
+	if err != nil {
+		l.close()
+	}
+	return step, err
+}
+
 func completeLoginWithMeta(
 	ctx context.Context,
 	user *bridgev2.User,
@@ -913,12 +998,12 @@ func completeLoginWithMeta(
 	}, &bridgev2.NewLoginParams{
 		DeleteOnConflict: true,
 		LoadUserLogin: func(ctx context.Context, login *bridgev2.UserLogin) error {
-			client.UserLogin = login
-			login.Client = client
-			return nil
+			return installReLoginClient(login, client)
 		},
 	})
 	if err != nil {
+		// The LoginProcess wrapper (closeConnOnError) closes conn on every
+		// error return, this one included; nothing to do here.
 		return nil, fmt.Errorf("failed to create user login: %w", err)
 	}
 

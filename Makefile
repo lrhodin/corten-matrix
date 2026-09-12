@@ -17,12 +17,29 @@ RUSTPUSH_DIR := third_party/rustpush-upstream
 # the location in one variable so a future move is a one-line edit rather than a
 # hunt through the patch block — where a stale path silently no-ops every guard.
 APA_DIR      := $(RUSTPUSH_DIR)/third_party/apple-private-apis
+# Submodule of rustpush-upstream that we replace wholesale with our own copy (see
+# the open-absinthe overlay in ensure-rustpush-source). NEVER let git check this
+# one out: the overlay de-gits it, so a checkout restores upstream files over our
+# native NAC wiring, and repairing that rewrites every mtime and forces a full
+# cargo rebuild of the crate. This is the submodule's PATH relative to
+# $(RUSTPUSH_DIR): `git submodule status` prints paths, every comparison in the
+# recipe is against that output, and the recipe refuses to run unless the pinned
+# .gitmodules still maps a submodule to exactly this path — so an upstream move
+# fails the build loudly instead of silently disabling the exclusion (the
+# apple-private-apis submodule already has a name that differs from its path).
+# Single definition: everything else derives from OVERLAID_SUBMODULE_DIR, and
+# the recipe refuses an empty value rather than letting `make OVERLAID_SUBMODULE=`
+# turn the guard off.
+OVERLAID_SUBMODULE     := open-absinthe
+OVERLAID_SUBMODULE_DIR := $(RUSTPUSH_DIR)/$(OVERLAID_SUBMODULE)
+# Our copy that replaces it.
+OVERLAY_SRC            := rustpush/open-absinthe
 # Pinned OpenBubbles/rustpush commit. Edit third_party/rustpush-upstream.sha to
 # bump, then test locally before committing. The Makefile reads the SHA on build
 # and checks out that exact commit — no auto-bump, no branch drift.
 RUSTPUSH_PIN_FILE := third_party/rustpush-upstream.sha
 RUSTPUSH_PIN      := $(shell cat $(RUSTPUSH_PIN_FILE) 2>/dev/null)
-RUSTPUSH_SRC:= $(shell find $(RUSTPUSH_DIR)/src $(APA_DIR) $(RUSTPUSH_DIR)/open-absinthe/src -name '*.rs' -o -name '*.s' 2>/dev/null) $(wildcard $(RUSTPUSH_DIR)/open-absinthe/build.rs)
+RUSTPUSH_SRC:= $(shell find $(RUSTPUSH_DIR)/src $(APA_DIR) $(OVERLAID_SUBMODULE_DIR)/src -name '*.rs' -o -name '*.s' 2>/dev/null) $(wildcard $(OVERLAID_SUBMODULE_DIR)/build.rs)
 # Patches applied to the pinned tree by ensure-rustpush-source. They and this
 # Makefile are prerequisites of the Rust archive because make stats the tree's
 # .rs files before that recipe patches them: a patch that lands during the run
@@ -225,10 +242,65 @@ RP_PATCH = rp_patch() { \
 
 # Prepare rustpush sources the same way upstream CI does: checkout with
 # submodules present and fake FairPlay certs available for build-time signing.
+#
+# Three git facts shape the submodule handling below, and each has bitten:
+#
+#   - RP_PATCH dirties tracked files inside apple-private-apis on every build,
+#     and a plain `submodule update` refuses to move a submodule with local
+#     changes ("local changes would be overwritten by checkout"). So every
+#     checkout of a nested submodule here is `--force`, which is what discards
+#     those changes; the patches are re-applied afterward. Without it, every
+#     pin bump that moved apple-private-apis aborted once and was repaired only
+#     by the next `make` — and without the drift gate further down, not at all:
+#     rustpush-upstream's own HEAD had already reached the pin, so every later
+#     `make` took the fast path and the nested tree stayed one commit behind
+#     forever, after which a patch written for the newer commit correctly
+#     refused to apply.
+#   - The drift predicate is the gitlink test only, in both directions: `+`
+#     from `submodule status` means the checked-out commit differs from the
+#     commit the superproject records (the stuck-at-the-wrong-commit case), and
+#     `-` means the submodule has no worktree .git at all — never initialized,
+#     deinit'd, or a pin bump whose `update --init` failed on a network error
+#     AFTER checkout had already moved HEAD to the pin, so every later `make`
+#     takes the fast path. Both are repaired by the same `update --init
+#     --recursive --force`; cargo would otherwise compile whatever stale or
+#     empty tree is there with no warning. The overlaid submodule always reads
+#     `-` and is skipped silently. Modified FILES inside a correctly-pinned
+#     submodule show a plain space and are intentionally ignored, because
+#     treating RP_PATCH's edits as drift would reset-and-repatch on every
+#     build, forcing a full cargo rebuild. (When something HAS drifted, the
+#     forced update re-checks-out its direct parent even if that parent's
+#     commit already matched, discarding RP_PATCH's edits there and costing
+#     one full rebuild of that crate — a cost only, since the patches are
+#     re-applied below; the same is true of a deleted overlay exclusion, which
+#     the overlay step repairs at the price of a full rebuild.)
+#   - `submodule update` matches a pathspec against the current repo's index
+#     only, so a depth-2 path such as apple-private-apis/clearadi errors with
+#     "pathspec did not match". Each drifted path is therefore mapped to the
+#     DIRECT submodule that contains it, and only those are passed; naming the
+#     depth-1 parent repairs the nested submodule too because the update is
+#     --recursive. A drifted path that maps to no direct submodule is an error,
+#     not a shrug.
+#
+# $(OVERLAID_SUBMODULE) is excluded from EVERY git operation that could touch a
+# submodule worktree, and nothing here runs a destructive git command over an
+# arbitrary drifted path: the resync is a single `submodule update --force`
+# scoped by pathspec to the mapped direct submodules, with no per-path
+# reset/clean loop in front of it (an earlier version had one, ran it over every
+# drifted path including the overlay, and only consulted the exclusion
+# afterward). open-absinthe is registered in .git/config, so an unscoped
+# `update` targets it regardless of `--init`; its `-` status only reflects the
+# missing worktree .git, not the registration, and one stray `submodule update`
+# re-gits it and makes it `+`-eligible. The pathspec exclusion is the
+# guarantee, for the pin-bump checkout and the drift resync alike; the overlay
+# step at the end owns that tree.
 ensure-rustpush-source:
 	@if [ "$(RUSTPUSH_DIR)" = "third_party/rustpush-upstream" ]; then \
 		if [ -z "$(RUSTPUSH_PIN)" ]; then \
 			echo "error: $(RUSTPUSH_PIN_FILE) is missing or empty — required to pin rustpush SHA" >&2; exit 1; \
+		fi; \
+		if [ -z "$(OVERLAID_SUBMODULE)" ]; then \
+			echo "error: OVERLAID_SUBMODULE is empty; refusing to run submodule checkouts that would then include the open-absinthe overlay" >&2; exit 1; \
 		fi; \
 		export GIT_CONFIG_COUNT=1; \
 		export GIT_CONFIG_KEY_0="url.https://github.com/.insteadOf"; \
@@ -251,7 +323,50 @@ ensure-rustpush-source:
 			git -C third_party/rustpush-upstream fetch --all --tags --prune || exit 1; \
 			git -C third_party/rustpush-upstream checkout $(RUSTPUSH_PIN) || { echo "error: failed to checkout pinned SHA $(RUSTPUSH_PIN)" >&2; exit 1; }; \
 			git -C third_party/rustpush-upstream submodule sync --recursive || exit 1; \
-			git -C third_party/rustpush-upstream submodule update --init --recursive || exit 1; \
+			direct=$$(git -C third_party/rustpush-upstream submodule status) || { echo "error: git submodule status failed in third_party/rustpush-upstream" >&2; exit 1; }; \
+			direct=$$(printf '%s\n' "$$direct" | awk '{print $$2}' | grep -vx "$(OVERLAID_SUBMODULE)"); \
+			if [ -n "$$direct" ]; then \
+				git -C third_party/rustpush-upstream submodule update --init --recursive --force -- $$direct || \
+					{ echo "error: failed to check out rustpush's nested submodules at the pinned tree" >&2; exit 1; }; \
+			fi; \
+		fi; \
+		if ! git -C third_party/rustpush-upstream config -f .gitmodules --get-regexp '^submodule\..*\.path$$' | awk '{print $$2}' | grep -qx "$(OVERLAID_SUBMODULE)"; then \
+			echo "error: the pinned rustpush .gitmodules has no submodule at path '$(OVERLAID_SUBMODULE)'; upstream moved the overlaid submodule — update OVERLAID_SUBMODULE in the Makefile" >&2; exit 1; \
+		fi; \
+		status=$$(git -C third_party/rustpush-upstream submodule status --recursive) || { echo "error: git submodule status --recursive failed in third_party/rustpush-upstream" >&2; exit 1; }; \
+		wrong=$$(printf '%s\n' "$$status" | awk '/^\+/{print $$2}'); \
+		missing=$$(printf '%s\n' "$$status" | awk '/^-/{print $$2}'); \
+		drifted="$$wrong $$missing"; \
+		if [ -n "$$wrong$$missing" ]; then \
+			direct=$$(git -C third_party/rustpush-upstream submodule status) || { echo "error: git submodule status failed in third_party/rustpush-upstream" >&2; exit 1; }; \
+			direct=$$(printf '%s\n' "$$direct" | awk '{print $$2}'); \
+			targets=""; skipped=""; repair=""; \
+			for d in $$drifted; do \
+				case "$$d" in \
+					"$(OVERLAID_SUBMODULE)"|"$(OVERLAID_SUBMODULE)"/*) \
+						for w in $$wrong; do [ "$$w" = "$$d" ] && skipped="$$skipped $$d"; done; continue;; \
+				esac; \
+				mapped=""; \
+				for parent in $$direct; do \
+					case "$$d" in \
+						"$$parent"|"$$parent"/*) mapped="$$parent";; \
+					esac; \
+				done; \
+				if [ -z "$$mapped" ]; then \
+					echo "error: drifted submodule path '$$d' is not under any direct submodule of rustpush-upstream; cannot resync it" >&2; exit 1; \
+				fi; \
+				targets="$$targets $$mapped"; repair="$$repair $$d"; \
+			done; \
+			if [ -n "$$skipped" ]; then \
+				echo "note: drifted path(s)$$skipped are the overlaid $(OVERLAID_SUBMODULE), left untouched; the overlay step owns that tree" >&2; \
+			fi; \
+			targets=$$(printf '%s\n' $$targets | sort -u); \
+			if [ -n "$$targets" ]; then \
+				echo "Nested rustpush submodules at the wrong commit or not checked out ($${repair# }); resyncing direct submodule(s): $$targets"; \
+				git -C third_party/rustpush-upstream submodule sync --recursive || exit 1; \
+				git -C third_party/rustpush-upstream submodule update --init --recursive --force -- $$targets || \
+					{ echo "error: failed to resync nested rustpush submodules to the pinned tree" >&2; exit 1; }; \
+			fi; \
 		fi; \
 		if [ ! -d third_party/rustpush-upstream/certs/fairplay ]; then \
 			echo "Generating FairPlay cert stubs..."; \
@@ -263,11 +378,11 @@ ensure-rustpush-source:
 				   third_party/rustpush-upstream/certs/fairplay/$$name.pem; \
 			done; \
 		fi; \
-		if [ -d rustpush/open-absinthe ] && [ -f rustpush/open-absinthe/Cargo.toml ]; then \
-			if ! diff -rq rustpush/open-absinthe third_party/rustpush-upstream/open-absinthe >/dev/null 2>&1; then \
-				echo "Overlaying our open-absinthe (native NAC wiring) onto $(RUSTPUSH_DIR)/open-absinthe..."; \
-				rm -rf third_party/rustpush-upstream/open-absinthe; \
-				cp -Rp rustpush/open-absinthe third_party/rustpush-upstream/open-absinthe; \
+		if [ -d $(OVERLAY_SRC) ] && [ -f $(OVERLAY_SRC)/Cargo.toml ]; then \
+			if ! diff -rq $(OVERLAY_SRC) $(OVERLAID_SUBMODULE_DIR) >/dev/null 2>&1; then \
+				echo "Overlaying our open-absinthe (native NAC wiring) onto $(OVERLAID_SUBMODULE_DIR)..."; \
+				rm -rf $(OVERLAID_SUBMODULE_DIR); \
+				cp -Rp $(OVERLAY_SRC) $(OVERLAID_SUBMODULE_DIR); \
 			fi; \
 		fi; \
 	fi
