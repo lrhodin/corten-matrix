@@ -48,9 +48,18 @@ func newRecoveryTestClient() *IMClient {
 // loop's exit before asserting on what it sent.
 func runRecoveryLoopForTest(t *testing.T, client *IMClient) (stop func()) {
 	t.Helper()
+	return runRecoveryLoopForTestFrom(t, client, verdictUnreachable)
+}
+
+// runRecoveryLoopForTestFrom is runRecoveryLoopForTest with an explicit entry
+// verdict: verdictUnreachable models an episode entered on a confirmed outage
+// (the common case), verdictReachable an Apple-specific failure on a healthy
+// link — the only entry from which a run of Blocked rounds can hand back.
+func runRecoveryLoopForTestFrom(t *testing.T, client *IMClient, entry recoveryVerdict) (stop func()) {
+	t.Helper()
 	done := make(chan struct{})
 	go func() {
-		client.runPublicOnlyInternetRecovery(zerolog.Nop(), false)
+		client.runPublicOnlyInternetRecovery(zerolog.Nop(), entry)
 		close(done)
 	}()
 	var once sync.Once
@@ -309,7 +318,7 @@ func TestConfirmedOutageIsHeldAppleFreeAndAlarms(t *testing.T) {
 	timing := currentRecoveryTiming()
 	const retryDelay = 7 * time.Minute
 	start := time.Unix(10_000, 0)
-	e := newRecoveryEpisode(start)
+	e := newRecoveryEpisode(start, verdictUnreachable)
 	now := start
 	step := func(verdict recoveryVerdict) recoveryDecision {
 		now = now.Add(internetRecoveryPollInterval)
@@ -440,24 +449,44 @@ func blockedResult() internetprobe.Result {
 func TestRecoveryLoopEndsOnlyOnAVerdictOrCancellation(t *testing.T) {
 	tests := []struct {
 		name    string
+		entry   recoveryVerdict
 		verdict func(round int, phase string) internetprobe.Result
 		wantErr status.BridgeStateErrorCode // "" means: must never ask
 		alarms  bool
 	}{
 		{
 			name:    "continuous outage holds Apple-free and alarms",
+			entry:   verdictUnreachable,
 			verdict: func(int, string) internetprobe.Result { return unreachableResult() },
 			alarms:  true,
 		},
 		{
-			name:    "unusable probe hands back at the blocked grace",
+			name:    "unusable probe after an Apple-specific failure hands back at the blocked grace",
+			entry:   verdictReachable,
+			verdict: func(int, string) internetprobe.Result { return blockedResult() },
+			wantErr: "im-internet-probe-unusable",
+		},
+		{
+			// Root cause A2: the episode was entered on a confirmed outage, so
+			// the most recent verdict is Unreachable and a run of Blocked
+			// rounds is NOT "nothing is known to be down". It holds, and
+			// alarms like any other confirmed outage.
+			name:    "unusable probe after a confirmed outage is held, not handed back",
+			entry:   verdictUnreachable,
+			verdict: func(int, string) internetprobe.Result { return blockedResult() },
+			alarms:  true,
+		},
+		{
+			name:    "unusable probe with no verdict at entry hands back at the blocked grace",
+			entry:   verdictBlocked,
 			verdict: func(int, string) internetprobe.Result { return blockedResult() },
 			wantErr: "im-internet-probe-unusable",
 		},
 		{
 			// The round-4 shape: main probe passes, final preflight fails,
 			// forever. It used to end at the episode ceiling; now it holds.
-			name: "main probe passes but preflight always fails: held",
+			name:  "main probe passes but preflight always fails: held",
+			entry: verdictUnreachable,
 			verdict: func(_ int, phase string) internetprobe.Result {
 				if phase == "final_reconnect_preflight" {
 					return unreachableResult()
@@ -468,7 +497,8 @@ func TestRecoveryLoopEndsOnlyOnAVerdictOrCancellation(t *testing.T) {
 		{
 			// The round-3 shape: up phases shorter than the stability window.
 			// It used to end at the episode ceiling; now it holds, quietly.
-			name: "flapping link is held without an alarm",
+			name:  "flapping link is held without an alarm",
+			entry: verdictUnreachable,
 			verdict: func(round int, _ string) internetprobe.Result {
 				if (round/3)%2 == 0 {
 					return reachableResult()
@@ -478,6 +508,7 @@ func TestRecoveryLoopEndsOnlyOnAVerdictOrCancellation(t *testing.T) {
 		},
 		{
 			name:    "healthy link recovers and requests a rebuild",
+			entry:   verdictUnreachable,
 			verdict: func(int, string) internetprobe.Result { return reachableResult() },
 			wantErr: "im-internet-recovered",
 		},
@@ -515,7 +546,7 @@ func TestRecoveryLoopEndsOnlyOnAVerdictOrCancellation(t *testing.T) {
 			}
 
 			client := newRecoveryTestClient()
-			stop := runRecoveryLoopForTest(t, client)
+			stop := runRecoveryLoopForTestFrom(t, client, tc.entry)
 
 			if tc.wantErr != "" {
 				select {
@@ -645,7 +676,7 @@ func TestLoopStillRecoversNormallyAfterAnUnusableProbeHandBack(t *testing.T) {
 	}
 
 	client := newRecoveryTestClient()
-	stop := runRecoveryLoopForTest(t, client)
+	stop := runRecoveryLoopForTestFrom(t, client, verdictReachable)
 
 	select {
 	case <-handedBack:
@@ -666,20 +697,16 @@ func TestLoopStillRecoversNormallyAfterAnUnusableProbeHandBack(t *testing.T) {
 	stop()
 }
 
-// Round-6 audit finding #1, now pinned for the one hand-back that remains.
-//
-// A hand-back must survive long enough for bridgev2 to act on it.
-// unknownErrorReconnect waits UnknownErrorAutoReconnect (4-6 min jittered with
-// this connector's forced 5m) and THEN re-checks: it declines if any newer
-// bridge state was sent (bridgestate.go `triggeredBy.Timestamp != prev.Timestamp`,
-// and `prevUnsent.StateEvent != status.StateUnknownError` — the latter is set
-// unconditionally by Send() before any dedup, so a differing state always
-// cancels). So any StateTransientDisconnect emitted after the hand-back cancels
-// the rebuild. The transition function keys withdrawal on the pending request's
-// KIND, so a hand-back cannot be withdrawn whatever the verdicts do; this test
-// drives the real loop through an unusable probe that then turns into a
-// confirmed outage, to prove the wiring agrees with the table.
-func TestUnusableProbeHandBackIsNotWithdrawnByALaterOutageVerdict(t *testing.T) {
+// Root cause A1 (round 11). An unusable-probe hand-back rests on "nothing is
+// known to be down". When a confirmed Unreachable verdict arrives while it is
+// pending, that premise is gone and bridgev2 must NOT act on it 4-6 minutes
+// later — so the loop withdraws it (StateTransientDisconnect changes
+// prev.Timestamp and bridgev2's pending unknownErrorReconnect declines). The
+// round-6 concern that a hand-back could be self-canceled one poll later does
+// not apply: the precondition keeps a hand-back from being sent while the
+// most recent verdict is Unreachable, so a withdrawal here is always on
+// genuinely new negative evidence.
+func TestUnusableProbeHandBackIsWithdrawnByALaterOutageVerdict(t *testing.T) {
 	scaleRecoveryTimingForTest(t)
 
 	var mu sync.Mutex
@@ -694,18 +721,21 @@ func TestUnusableProbeHandBackIsNotWithdrawnByALaterOutageVerdict(t *testing.T) 
 	}
 
 	handedBack := make(chan struct{})
-	withdrawn := make(chan status.BridgeStateErrorCode, 1)
-	var once sync.Once
+	withdrawn := make(chan struct{})
+	rebuiltAgain := make(chan status.BridgeStateErrorCode, 1)
+	var onceH, onceW sync.Once
 	sendRecoveryState = func(_ *bridgev2.Bridge, _ *bridgev2.BridgeStateQueue, st status.BridgeState) bool {
 		mu.Lock()
 		defer mu.Unlock()
 		switch {
-		case st.Error == "im-internet-probe-unusable":
+		case st.Error == "im-internet-probe-unusable" && !sawHandBack:
 			sawHandBack = true
-			once.Do(func() { close(handedBack) })
+			onceH.Do(func() { close(handedBack) })
 		case sawHandBack && st.StateEvent == status.StateTransientDisconnect:
+			onceW.Do(func() { close(withdrawn) })
+		case sawHandBack && st.StateEvent == status.StateUnknownError:
 			select {
-			case withdrawn <- st.Error:
+			case rebuiltAgain <- st.Error:
 			default:
 			}
 		}
@@ -713,20 +743,25 @@ func TestUnusableProbeHandBackIsNotWithdrawnByALaterOutageVerdict(t *testing.T) 
 	}
 
 	client := newRecoveryTestClient()
-	runRecoveryLoopForTest(t, client)
+	stop := runRecoveryLoopForTestFrom(t, client, verdictReachable)
 
 	select {
 	case <-handedBack:
 	case <-time.After(10 * time.Second):
 		t.Fatal("never reached the unusable-probe hand-back")
 	}
-	// Many poll rounds' worth of scaled time: long enough for a withdrawal to
-	// happen, far shorter than bridgev2's real reconnect wait.
 	select {
-	case code := <-withdrawn:
-		t.Fatalf("the hand-back was withdrawn with %q on a later unreachable verdict — bridgev2's pending unknownErrorReconnect will decline and the client is never rebuilt", code)
-	case <-time.After(500 * time.Millisecond):
+	case <-withdrawn:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a confirmed outage arrived while an unusable-probe hand-back was pending and the loop did not withdraw it: bridgev2 will reconnect to Apple into the outage")
 	}
+	// And nothing may re-ask while the verdict stays Unreachable.
+	select {
+	case code := <-rebuiltAgain:
+		t.Fatalf("after the withdrawal the loop asked bridgev2 for Apple again with %q on a confirmed outage", code)
+	case <-time.After(300 * time.Millisecond):
+	}
+	stop()
 }
 
 func TestHandBackDelayBacksOffAndCaps(t *testing.T) {
@@ -894,7 +929,7 @@ func TestLoopHoldsRepeatHandBacksBehindTheBackoff(t *testing.T) {
 	}
 
 	client := newRecoveryTestClient()
-	stop := runRecoveryLoopForTest(t, client)
+	stop := runRecoveryLoopForTestFrom(t, client, verdictReachable)
 
 	select {
 	case <-first:
@@ -929,7 +964,11 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 
 	// Episode builders. Each starts from a fresh episode and sets only what the
 	// case is about, so the zero values are the documented defaults.
-	fresh := func() *recoveryEpisode { return newRecoveryEpisode(ago(time.Minute)) }
+	// fresh models an episode entered on an Apple-specific failure: the last
+	// verdict was Reachable a minute ago. afterOutage models the common entry,
+	// a confirmed outage.
+	fresh := func() *recoveryEpisode { return newRecoveryEpisode(ago(time.Minute), verdictReachable) }
+	afterOutage := func(d time.Duration) *recoveryEpisode { return newRecoveryEpisode(ago(d), verdictUnreachable) }
 	stabilizingFor := func(e *recoveryEpisode, d time.Duration) *recoveryEpisode {
 		e.stabilizing = true
 		e.stable.Observe(ago(d), true, timing.stablePeriod)
@@ -1042,12 +1081,19 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			pending: pendingRecovered,
 		},
 		{
-			// The round-5 finding: a hand-back withdrawn one poll later
-			// meant zero honored hand-backs. Structurally impossible now — the
-			// kind, not the clocks, decides.
-			name:    "clause 3: unreachable never withdraws a pending hand-back",
+			// Root cause A1: a hand-back's premise is "nothing is known to be
+			// down"; a confirmed outage destroys it, so the hand-back is
+			// withdrawn like a recovered request would be.
+			name:    "clause 3: unreachable withdraws a pending hand-back too — its premise is gone",
 			episode: func() *recoveryEpisode { return pendingSince(fresh(), pendingHandBack, time.Minute) },
 			verdict: verdictUnreachable,
+			want:    recoveryDecision{action: actionWithdraw},
+			pending: pendingNone,
+		},
+		{
+			name:    "clause 3: blocked does not withdraw a pending hand-back",
+			episode: func() *recoveryEpisode { return pendingSince(fresh(), pendingHandBack, time.Minute) },
+			verdict: verdictBlocked,
 			want:    recoveryDecision{},
 			pending: pendingHandBack,
 		},
@@ -1095,15 +1141,19 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			},
 		},
 		{
-			name: "clause 5: a recent request also defers the hold alarm on an unreachable link",
+			// Root cause A1 again, from the gate's side: the withdrawal is
+			// decided in clause 3, before the re-ask gate is consulted, so a
+			// recent hand-back does not shield itself from new negative
+			// evidence.
+			name: "clause 3: a recent hand-back is still withdrawn by an unreachable verdict",
 			episode: func() *recoveryEpisode {
 				e := pendingSince(fresh(), pendingHandBack, time.Minute)
 				e.outageStartedAt = ago(timing.holdAlarmAfter + time.Minute)
 				return e
 			},
 			verdict: verdictUnreachable,
-			want:    recoveryDecision{},
-			pending: pendingHandBack,
+			want:    recoveryDecision{action: actionWithdraw},
+			pending: pendingNone,
 		},
 		{
 			// Mutation-1 territory: the connector backoff is holding. The
@@ -1137,7 +1187,49 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			name: "clause 7: an unusable probe hands back after the blocked grace",
 			episode: func() *recoveryEpisode {
 				e := fresh()
-				e.lastNetworkVerdict = ago(timing.blockedGrace)
+				e.lastVerdictAt = ago(timing.blockedGrace)
+				return e
+			},
+			verdict: verdictBlocked,
+			want:    recoveryDecision{action: actionHandBack, handBackCode: handBackCodeProbeUnusable},
+			pending: pendingHandBack,
+		},
+		{
+			// Root cause A2: the precondition. The probe has said nothing for
+			// the whole grace, but the last thing it DID say was Unreachable.
+			name: "clause 7: the hatch is ineligible while the most recent verdict is unreachable",
+			episode: func() *recoveryEpisode {
+				e := fresh()
+				e.lastVerdict, e.lastVerdictAt = verdictUnreachable, ago(timing.blockedGrace)
+				return e
+			},
+			verdict: verdictBlocked,
+			want:    recoveryDecision{},
+		},
+		{
+			name:    "clause 7: an episode entered on a confirmed outage cannot hand back on blocked rounds",
+			episode: func() *recoveryEpisode { return afterOutage(timing.blockedGrace) },
+			verdict: verdictBlocked,
+			want:    recoveryDecision{},
+		},
+		{
+			name:    "clause 7: an episode entered with no verdict at all can hand back after the grace",
+			episode: func() *recoveryEpisode { return newRecoveryEpisode(ago(timing.blockedGrace), verdictBlocked) },
+			verdict: verdictBlocked,
+			want:    recoveryDecision{action: actionHandBack, handBackCode: handBackCodeProbeUnusable},
+			pending: pendingHandBack,
+		},
+		{
+			name:    "clause 7: blocked rounds after a confirmed outage are held and still alarm",
+			episode: func() *recoveryEpisode { return afterOutage(timing.holdAlarmAfter) },
+			verdict: verdictBlocked,
+			want:    recoveryDecision{holdAlarm: true},
+		},
+		{
+			name: "clause 7: a reachable verdict re-arms the hatch after an outage",
+			episode: func() *recoveryEpisode {
+				e := afterOutage(time.Hour)
+				e.lastVerdict, e.lastVerdictAt = verdictReachable, ago(timing.blockedGrace)
 				return e
 			},
 			verdict: verdictBlocked,
@@ -1148,7 +1240,7 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			name: "clause 7: an unusable probe inside the grace does nothing",
 			episode: func() *recoveryEpisode {
 				e := fresh()
-				e.lastNetworkVerdict = ago(timing.blockedGrace - time.Second)
+				e.lastVerdictAt = ago(timing.blockedGrace - time.Second)
 				return e
 			},
 			verdict: verdictBlocked,
@@ -1223,7 +1315,7 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			episode: func() *recoveryEpisode {
 				e := fresh()
 				e.outageStartedAt = ago(2 * timing.holdAlarmAfter)
-				e.lastNetworkVerdict = ago(time.Second)
+				e.lastVerdictAt = ago(time.Second)
 				return e
 			},
 			verdict: verdictBlocked,
@@ -1233,7 +1325,7 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			name: "clause 7: a re-ask after the gate opens is a hand-back again while the probe is still unusable",
 			episode: func() *recoveryEpisode {
 				e := pendingSince(fresh(), pendingHandBack, retryDelay)
-				e.lastNetworkVerdict = ago(timing.blockedGrace + retryDelay)
+				e.lastVerdictAt = ago(timing.blockedGrace + retryDelay)
 				return e
 			},
 			verdict: verdictBlocked,
@@ -1253,7 +1345,7 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			name: "clause 7: a hand-back re-arms the hold log so the next hold logs again",
 			episode: func() *recoveryEpisode {
 				e := fresh()
-				e.lastNetworkVerdict = ago(timing.blockedGrace)
+				e.lastVerdictAt = ago(timing.blockedGrace)
 				e.lastHoldLogAt = ago(time.Minute)
 				return e
 			},
@@ -1272,7 +1364,7 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			name: "clause 7: the backoff hold is logged on its first round",
 			episode: func() *recoveryEpisode {
 				e := pendingSince(fresh(), pendingHandBack, retryDelay)
-				e.lastNetworkVerdict = ago(timing.blockedGrace + retryDelay)
+				e.lastVerdictAt = ago(timing.blockedGrace + retryDelay)
 				return e
 			},
 			verdict: verdictBlocked,
@@ -1292,7 +1384,7 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			name: "clause 7: the backoff hold is silent inside the throttle interval",
 			episode: func() *recoveryEpisode {
 				e := pendingSince(fresh(), pendingHandBack, retryDelay)
-				e.lastNetworkVerdict = ago(timing.blockedGrace + retryDelay)
+				e.lastVerdictAt = ago(timing.blockedGrace + retryDelay)
 				e.lastHoldLogAt = ago(retryDelay - time.Second)
 				return e
 			},
@@ -1305,7 +1397,7 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			name: "clause 7: the backoff hold logs again once the throttle interval elapses",
 			episode: func() *recoveryEpisode {
 				e := pendingSince(fresh(), pendingHandBack, retryDelay)
-				e.lastNetworkVerdict = ago(timing.blockedGrace + retryDelay)
+				e.lastVerdictAt = ago(timing.blockedGrace + retryDelay)
 				e.lastHoldLogAt = ago(retryDelay)
 				return e
 			},
@@ -1379,11 +1471,22 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 				pending: pendingNone,
 			},
 			{
-				name: "a failing preflight leaves a pending hand-back standing",
+				// Same premise rule as step's clause 3: a preflight that finds
+				// the network down destroys "nothing is known to be down".
+				name: "a failing preflight withdraws a pending hand-back too",
 				episode: func() *recoveryEpisode {
 					return pendingSince(stabilizingFor(fresh(), timing.stablePeriod), pendingHandBack, retryDelay)
 				},
 				verdict: verdictUnreachable,
+				want:    recoveryDecision{action: actionWithdraw, stabilityReset: true},
+				pending: pendingNone,
+			},
+			{
+				name: "a blocked preflight leaves a pending hand-back standing",
+				episode: func() *recoveryEpisode {
+					return pendingSince(stabilizingFor(fresh(), timing.stablePeriod), pendingHandBack, retryDelay)
+				},
+				verdict: verdictBlocked,
 				want:    recoveryDecision{stabilityReset: true},
 				pending: pendingHandBack,
 			},
@@ -1442,7 +1545,7 @@ func TestRecoveryIsIndependentOfTimingOrder(t *testing.T) {
 			name := "retry=" + retryDelay.String() + "/hold=" + hold.String()
 			t.Run(name, func(t *testing.T) {
 				start := time.Unix(200_000, 0)
-				e := newRecoveryEpisode(start)
+				e := newRecoveryEpisode(start, verdictUnreachable)
 				now := start
 				outageEnd := start.Add(3 * time.Hour)
 				var recoveredAt time.Time
@@ -1529,7 +1632,7 @@ func TestLoopStillReachesTheRecoveredPathAfterTheRetryGateAbsorbsAHandBack(t *te
 	}
 
 	client := newRecoveryTestClient()
-	runRecoveryLoopForTest(t, client)
+	runRecoveryLoopForTestFrom(t, client, verdictReachable)
 
 	select {
 	case <-handedBack:

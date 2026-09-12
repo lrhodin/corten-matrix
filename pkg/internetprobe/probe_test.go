@@ -228,66 +228,67 @@ func startHijacker(t *testing.T) string {
 }
 
 // The voting proof: only a certificate that chains to a trusted root AND names
-// the dialed IP counts. A peer that is provably not the provider votes
-// Unreachable; only a failure that may lie with this host abstains.
+// the dialed IP counts. A peer that is provably not the provider is
+// unreachable; a failure that may lie with this host abstains, and the trust
+// store's contents are never consulted to decide which.
 func TestTLSLegAcceptsOnlyACertificateThatValidatesForTheDialedIP(t *testing.T) {
 	loopback := net.ParseIP("127.0.0.1")
 	cert, pool := fixtureCert(t, loopback)
 	server := startFixtureTLS(t, cert)
-	_, unrelated := fixtureCert(t, loopback) // a trust store that does not contain the server's certificate
+	_, unrelated := fixtureCert(t, loopback) // a non-empty trust store that does not contain the server's certificate
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	leg := func(t *testing.T, roots *x509.CertPool, address string) (Outcome, error) {
+	leg := func(t *testing.T, roots *x509.CertPool, address string) (legVerdict, error) {
 		t.Helper()
 		useLegs(t, address, address, address, roots)
 		return tlsOnce(ctx, address)
 	}
-	expect := func(t *testing.T, outcome Outcome, err error, want Outcome, wantErr error, why string) {
+	expect := func(t *testing.T, verdict legVerdict, err error, want legVerdict, wantErr error, why string) {
 		t.Helper()
-		if outcome != want || !errors.Is(err, wantErr) {
-			t.Fatalf("outcome = %s, err = %v; want %s carrying %v — %s", outcome, err, want, wantErr, why)
+		if verdict != want || !errors.Is(err, wantErr) {
+			t.Fatalf("verdict = %s, err = %v; want %s carrying %v — %s", verdict, err, want, wantErr, why)
 		}
 	}
 
 	t.Run("verified IP SAN is reachable", func(t *testing.T) {
-		outcome, err := leg(t, pool, server)
-		if outcome != OutcomeReachable {
-			t.Fatalf("outcome = %s (err %v), want reachable for a certificate that validates for the dialed IP", outcome, err)
+		verdict, err := leg(t, pool, server)
+		if verdict != legReachable {
+			t.Fatalf("verdict = %s (err %v), want reachable for a certificate that validates for the dialed IP", verdict, err)
 		}
 	})
-	t.Run("an untrusted chain with a trust store present is a portal", func(t *testing.T) {
-		outcome, err := leg(t, unrelated, server)
-		expect(t, outcome, err, OutcomeUnreachable, errTLSRejected, "a self-signed certificate on a host that can validate is interception")
+	t.Run("an untrusted chain abstains even with a non-empty trust store", func(t *testing.T) {
+		verdict, err := leg(t, unrelated, server)
+		expect(t, verdict, err, legAbstain, errTLSUnverified, "a self-signed portal and a stale or malformed local bundle raise the same error; the pool's contents prove nothing")
 	})
 	t.Run("no CA bundle at all abstains", func(t *testing.T) {
-		outcome, err := leg(t, x509.NewCertPool(), server)
-		expect(t, outcome, err, OutcomeBlocked, errTLSUnverified, "an empty trust store proves nothing about the peer")
+		verdict, err := leg(t, x509.NewCertPool(), server)
+		expect(t, verdict, err, legAbstain, errTLSUnverified, "an empty trust store proves nothing about the peer")
 	})
-	t.Run("a trusted certificate for a different IP is a portal", func(t *testing.T) {
+	t.Run("a trusted certificate for a different IP is interception", func(t *testing.T) {
 		otherCert, otherPool := fixtureCert(t, net.ParseIP("203.0.113.1"))
 		otherServer := startFixtureTLS(t, otherCert)
-		outcome, err := leg(t, otherPool, otherServer)
-		expect(t, outcome, err, OutcomeUnreachable, errTLSRejected, "a portal with a real certificate for its own name is not the provider")
+		verdict, err := leg(t, otherPool, otherServer)
+		expect(t, verdict, err, legUnreachable, errTLSRejected, "a portal with a real certificate for its own name is not the provider")
 	})
-	t.Run("a peer that does not speak TLS is a portal", func(t *testing.T) {
-		outcome, err := leg(t, pool, startHijacker(t))
-		expect(t, outcome, err, OutcomeUnreachable, errTLSRejected, "the providers always speak TLS on these ports")
+	t.Run("a peer that does not speak TLS is interception", func(t *testing.T) {
+		verdict, err := leg(t, pool, startHijacker(t))
+		expect(t, verdict, err, legUnreachable, errTLSRejected, "the providers always speak TLS on these ports")
 	})
 	t.Run("an expired certificate abstains", func(t *testing.T) {
 		expiredCert, expiredPool := fixtureCertValid(t, time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour), loopback)
 		expiredServer := startFixtureTLS(t, expiredCert)
-		outcome, err := leg(t, expiredPool, expiredServer)
-		expect(t, outcome, err, OutcomeBlocked, errTLSUnverified, "clock skew on this host is indistinguishable from an expired portal certificate")
+		verdict, err := leg(t, expiredPool, expiredServer)
+		expect(t, verdict, err, legAbstain, errTLSUnverified, "clock skew on this host is indistinguishable from an expired portal certificate")
 	})
 }
 
 // The provider verdict across all three legs, in the cases that matter
-// operationally. The diagnostic 53 leg can lower a verdict but never raise it.
+// operationally. The diagnostic 53 leg contributes no verdict in either
+// direction.
 func TestProviderVerdictCombinesTheLegs(t *testing.T) {
 	loopback := net.ParseIP("127.0.0.1")
 	cert, pool := fixtureCert(t, loopback)
 	tlsServer := startFixtureTLS(t, cert)
-	_, unrelated := fixtureCert(t, loopback)
 	resolver := startFakeResolver(t)
 	refused := closedPort(t)
 	hijacker := startHijacker(t)
@@ -304,8 +305,9 @@ func TestProviderVerdictCombinesTheLegs(t *testing.T) {
 		{"443 refused but a verified 853 is reachable", refused, tlsServer, refused, pool, OutcomeReachable, nil},
 		{"both TLS legs refused and 53 answering is NOT reachable", refused, refused, resolver, pool, OutcomeUnreachable, errDiagnosticAnswered},
 		{"no CA bundle with 53 answering is blocked, not reachable", tlsServer, tlsServer, resolver, x509.NewCertPool(), OutcomeBlocked, errTLSUnverified},
-		{"a self-signed portal on 443 and 853 with 53 echoing our query is unreachable", tlsServer, tlsServer, resolver, unrelated, OutcomeUnreachable, errTLSRejected},
-		{"a portal speaking HTTP on every port is unreachable", hijacker, hijacker, hijacker, nil, OutcomeUnreachable, errHijacked},
+		{"abstaining TLS legs with 53 refused is blocked: a diagnostic leg cannot vote down either", tlsServer, tlsServer, refused, x509.NewCertPool(), OutcomeBlocked, syscall.ECONNREFUSED},
+		{"abstaining TLS legs with 53 hijacked is blocked for the same reason", tlsServer, tlsServer, hijacker, x509.NewCertPool(), OutcomeBlocked, errHijacked},
+		{"a portal speaking HTTP on the TLS ports is unreachable", hijacker, hijacker, resolver, pool, OutcomeUnreachable, errTLSRejected},
 		{"everything refused is unreachable", refused, refused, refused, nil, OutcomeUnreachable, syscall.ECONNREFUSED},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -321,16 +323,18 @@ func TestProviderVerdictCombinesTheLegs(t *testing.T) {
 	}
 }
 
-// Only dial-level failures classify, identically for every leg: no route is an
-// outage, a socket the host denied is Blocked.
+// Only dial-level failures classify, identically for every voting leg: a
+// socket the host denied abstains, a family with no route is not evidence
+// about the Internet, and anything else the network did is unreachable.
 func TestDialLevelErrorsDecideTheVerdict(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		errno syscall.Errno
 		want  Outcome
 	}{
-		{"ENETUNREACH on every leg is unreachable", syscall.ENETUNREACH, OutcomeUnreachable},
-		{"EHOSTUNREACH on every leg is unreachable", syscall.EHOSTUNREACH, OutcomeUnreachable},
+		{"ENETUNREACH on every leg of every family is unreachable: the network is dead", syscall.ENETUNREACH, OutcomeUnreachable},
+		{"EHOSTUNREACH on every leg of every family is unreachable", syscall.EHOSTUNREACH, OutcomeUnreachable},
+		{"ECONNREFUSED on every leg is unreachable", syscall.ECONNREFUSED, OutcomeUnreachable},
 		{"EACCES on every leg is blocked", syscall.EACCES, OutcomeBlocked},
 		{"EMFILE on every leg is blocked", syscall.EMFILE, OutcomeBlocked},
 	} {
@@ -342,20 +346,131 @@ func TestDialLevelErrorsDecideTheVerdict(t *testing.T) {
 			}
 		})
 	}
-	t.Run("a leg that reached the network outranks one the host denied", func(t *testing.T) {
+
+	// Per-family shapes, driven through the dial seam with the real IPv4 and
+	// IPv6 literals of a provider.
+	byFamily := func(t *testing.T, v4, v6 func(address string) (net.Conn, error)) {
+		t.Helper()
 		saved := dialContext
 		t.Cleanup(func() { dialContext = saved })
-		dialContext = func(_ context.Context, _, address string) (net.Conn, error) {
-			_, port, _ := net.SplitHostPort(address)
-			if port == dnsPort {
-				return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ENETUNREACH}
+		dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, _, _ := net.SplitHostPort(address)
+			if net.ParseIP(host).To4() != nil {
+				return v4(address)
 			}
-			return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.EACCES}
+			return v6(address)
 		}
-		if outcome, _ := queryProvider(context.Background(), cloudflareAddresses); outcome != OutcomeUnreachable {
-			t.Fatalf("outcome = %s, want unreachable: the diagnostic leg tested the network even though the TLS legs were denied", outcome)
+	}
+	fail := func(errno syscall.Errno) func(string) (net.Conn, error) {
+		return func(string) (net.Conn, error) { return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errno} }
+	}
+	t.Run("a v6 family with no route cannot outvote abstaining v4 legs", func(t *testing.T) {
+		byFamily(t, fail(syscall.EACCES), fail(syscall.ENETUNREACH))
+		if outcome, err := queryProvider(context.Background(), cloudflareAddresses); outcome != OutcomeBlocked {
+			t.Fatalf("outcome = %s (err %v), want blocked: a missing v6 route is not evidence about the Internet", outcome, err)
 		}
 	})
+	t.Run("a dead network on a v4-only host is unreachable", func(t *testing.T) {
+		byFamily(t, fail(syscall.ECONNREFUSED), fail(syscall.ENETUNREACH))
+		if outcome, _ := queryProvider(context.Background(), cloudflareAddresses); outcome != OutcomeUnreachable {
+			t.Fatalf("outcome = %s, want unreachable: v4 reached the network and found nothing", outcome)
+		}
+	})
+	t.Run("a v4-only host with a working 443 is reachable", func(t *testing.T) {
+		loopback := net.ParseIP("127.0.0.1")
+		cert, pool := fixtureCert(t, loopback)
+		tlsServer := startFixtureTLS(t, cert)
+		useLegs(t, tlsServer, closedPort(t), closedPort(t), pool)
+		real := dialContext
+		byFamily(t,
+			func(address string) (net.Conn, error) {
+				// Route the provider's v4 literal to the loopback fixture on the
+				// same port; the certificate is checked against 127.0.0.1, so
+				// the leg must dial the fixture by its own address.
+				_, port, _ := net.SplitHostPort(address)
+				return real(context.Background(), "tcp", net.JoinHostPort("127.0.0.1", port))
+			},
+			fail(syscall.ENETUNREACH))
+		// tlsOnce validates ServerName = the dialed literal (the provider's
+		// v4), which the fixture certificate does not carry, so run the
+		// verified leg directly against the fixture and the family fold
+		// through the seam.
+		if verdict, err := tlsOnce(context.Background(), tlsServer); verdict != legReachable {
+			t.Fatalf("fixture leg = %s (%v), want reachable", verdict, err)
+		}
+		if outcome, _ := queryProvider(context.Background(), []string{"127.0.0.1", cloudflareTarget6}); outcome != OutcomeReachable {
+			t.Fatalf("outcome = %s, want reachable: the v4 family proved the provider and the v6 no-route is irrelevant", outcome)
+		}
+	})
+}
+
+// A verified leg must not leave the provider race waiting on a leg that is
+// already connected and blocked in a read, and a caller canceling the probe
+// (bridge shutdown) must get its answer promptly too.
+func TestCancellationReachesAConnectedSocket(t *testing.T) {
+	loopback := net.ParseIP("127.0.0.1")
+	cert, pool := fixtureCert(t, loopback)
+	tlsServer := startFixtureTLS(t, cert)
+	silent := startSilentListener(t)
+
+	t.Run("a winning leg cancels a connected but silent leg", func(t *testing.T) {
+		useLegs(t, tlsServer, silent, silent, pool)
+		start := time.Now()
+		outcome, err := queryProvider(context.Background(), []string{"127.0.0.1"})
+		if outcome != OutcomeReachable {
+			t.Fatalf("outcome = %s (err %v), want reachable", outcome, err)
+		}
+		if elapsed := time.Since(start); elapsed > probeTimeout/2 {
+			t.Fatalf("provider race took %v after the verified leg won: cancellation did not reach the connected socket", elapsed)
+		}
+	})
+	t.Run("a caller canceling the probe returns promptly", func(t *testing.T) {
+		useLegs(t, silent, silent, silent, pool)
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+		}()
+		start := time.Now()
+		outcome, _ := queryProvider(ctx, []string{"127.0.0.1"})
+		if outcome != OutcomeBlocked {
+			t.Fatalf("outcome = %s, want blocked: a caller canceling us is not a verdict", outcome)
+		}
+		if elapsed := time.Since(start); elapsed > probeTimeout/2 {
+			t.Fatalf("canceled probe took %v: bridge shutdown would wait out the whole budget", elapsed)
+		}
+	})
+}
+
+// startSilentListener accepts connections and never sends or closes them.
+func startSilentListener(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	t.Cleanup(func() {
+		listener.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			c.Close()
+		}
+	})
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+		}
+	}()
+	return listener.Addr().String()
 }
 
 // A host that silently drops a port must not make every probe take the whole
@@ -497,9 +612,9 @@ func startFakeResolver(t *testing.T) string {
 // replacing ICMP was for: an ordinary TCP socket works as the service account,
 // with no CAP_NET_RAW and no ping_group_range tuning.
 func TestQueryOnceNeedsNoElevatedPrivileges(t *testing.T) {
-	outcome, err := queryOnce(context.Background(), startFakeResolver(t))
-	if outcome != OutcomeReachable {
-		t.Fatalf("queryOnce outcome = %s (err %v), want reachable against a real resolver", outcome, err)
+	verdict, err := queryOnce(context.Background(), startFakeResolver(t))
+	if verdict != legReachable {
+		t.Fatalf("queryOnce verdict = %s (err %v), want reachable against a real resolver", verdict, err)
 	}
 }
 
@@ -540,9 +655,9 @@ func TestQueryOnceRejectsACaptivePortal(t *testing.T) {
 
 			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			defer cancel()
-			outcome, _ := queryOnce(ctx, listener.Addr().String())
-			if outcome != OutcomeUnreachable {
-				t.Fatalf("outcome = %s, want unreachable — a portal must never read as Internet access", outcome)
+			verdict, _ := queryOnce(ctx, listener.Addr().String())
+			if verdict != legUnreachable {
+				t.Fatalf("verdict = %s, want unreachable — a portal must never read as Internet access", verdict)
 			}
 		})
 	}
@@ -583,9 +698,9 @@ func TestQueryOnceRejectsAMismatchedTransactionID(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	outcome, err := queryOnce(ctx, listener.Addr().String())
-	if outcome != OutcomeUnreachable || !errors.Is(err, errHijacked) {
-		t.Fatalf("outcome = %s, err = %v; want unreachable with errHijacked — a reply whose id does not match our query must be rejected by the id check itself, not by a timeout", outcome, err)
+	verdict, err := queryOnce(ctx, listener.Addr().String())
+	if verdict != legUnreachable || !errors.Is(err, errHijacked) {
+		t.Fatalf("verdict = %s, err = %v; want unreachable with errHijacked — a reply whose id does not match our query must be rejected by the id check itself, not by a timeout", verdict, err)
 	}
 }
 
@@ -594,9 +709,9 @@ func TestQueryOnceClassifiesAnUnroutableAddressAsUnreachable(t *testing.T) {
 	defer cancel()
 	// 203.0.113.0/24 is TEST-NET-3: reserved and never routed, so this can only
 	// fail — and it must fail as "unreachable", not as "probe unusable".
-	outcome, _ := queryOnce(ctx, "203.0.113.1:53")
-	if outcome != OutcomeUnreachable {
-		t.Fatalf("outcome = %s, want unreachable for an unroutable address", outcome)
+	verdict, _ := queryOnce(ctx, "203.0.113.1:53")
+	if verdict != legUnreachable {
+		t.Fatalf("verdict = %s, want unreachable for an unroutable address (a timeout is a network verdict, not a missing route)", verdict)
 	}
 }
 

@@ -49,21 +49,44 @@
 //     reported Reachable and let the client keep retrying Apple for the whole
 //     portal period, which is the exact hazard this package exists to prevent.
 //
-// How the legs combine is what keeps the verdict honest. Dial-level failures
-// classify as they always have: a refused or unroutable connection is
-// Unreachable, and a socket the host would not give us is Blocked (see
-// locallyBlocked). A handshake that reaches a peer which is provably NOT the
-// provider — a certificate that validates but names another host, a peer that
-// does not speak TLS at all, a connection reset mid-handshake — is Unreachable.
-// Only two handshake failures ABSTAIN (Blocked, "no evidence") instead of
-// voting: a certificate this host cannot chain to any root when the host has NO
-// trust store at all (a minimal container without ca-certificates — with a
-// trust store present, an untrusted chain is a portal and votes Unreachable),
-// and a certificate the host considers invalid on time grounds (clock skew on
-// the host is indistinguishable from an expired portal cert). A host that
-// cannot validate anything therefore reads as Blocked — the probe cannot run
-// here — and the recovery loop's unusable-probe hatch, not a forged verdict,
-// decides what happens next, with the cert failure named in the log.
+// Classification table. Every (leg kind, failure mode) pair below names the
+// ONLY verdict that leg may contribute; queryProvider's fold is the one place
+// leg verdicts become an Outcome, and nothing outside this table has standing.
+// Two review rounds found bugs that were exactly a leg or state contributing a
+// verdict it had no standing to contribute, so the table is the contract.
+//
+//	Voting TLS leg (443 or 853)
+//	  dial refused by this host (EACCES/EPERM/EMFILE/ENFILE/EAFNOSUPPORT) . abstain
+//	  dial: no route in this family (ENETUNREACH/EHOSTUNREACH/EADDRNOTAVAIL) no-route
+//	  dial: refused, timed out, reset, any other network error ........... unreachable
+//	  handshake verified for the dialed IP ............................. reachable
+//	  handshake: x509.UnknownAuthorityError ............................ abstain
+//	      (a self-signed portal and a missing, stale or malformed local
+//	      trust store raise the same error; the pool's contents are no
+//	      evidence either way, so this abstains UNCONDITIONALLY)
+//	  handshake: x509.CertificateInvalidError with Reason Expired ....... abstain
+//	      (clock skew on this host is indistinguishable from an expired
+//	      portal certificate)
+//	  handshake: chain validates but names another host (HostnameError),
+//	      peer does not speak TLS, EOF/reset mid-handshake, any other
+//	      protocol or certificate error .................................. unreachable
+//	      (positively diagnostic of interception: the providers always
+//	      complete a valid handshake on these ports)
+//	Diagnostic DNS leg (53)
+//	  every outcome ..................................................... abstain
+//	      (its result is a note in the joined error, never a verdict)
+//
+//	Fold, per provider, over all legs of both address families:
+//	  any leg reachable ............................................... Reachable
+//	  else any leg unreachable ........................................ Unreachable
+//	  else every voting leg no-route (no family has a route at all) ... Unreachable
+//	  else (only abstentions, or abstentions plus one family's no-route) Blocked
+//
+// The no-route rule is what keeps a v4-only host honest: its v6 dials fail
+// with no route, which says nothing about the Internet, so they cannot outvote
+// v4 legs that abstained; they only count once no family reached the network.
+// The cross-provider fold in ProbeWith is unchanged: either provider Reachable
+// is Reachable, both Blocked is Blocked, anything else is Unreachable.
 //
 // Each provider is tried over IPv4 and IPv6 concurrently. That is not garnish:
 // on an IPv6-only or NAT64/DNS64 host there is no IPv4 route at all, so dialing
@@ -110,15 +133,48 @@ var (
 	dnsPort = "53"
 )
 
-// probeMethod is one leg of a provider's race. Only a voting leg can make the
-// provider Reachable; a diagnostic leg's success is recorded in the joined
-// error and contributes nothing to the verdict, while its dial-level and
-// hijack failures still count (they can only keep the verdict down).
+// legVerdict is what one leg may contribute to its provider's verdict. The
+// fold in queryProvider is the ONLY place these become an Outcome; the package
+// doc's classification table says which failure yields which.
+type legVerdict uint8
+
+const (
+	// legAbstain: no standing. A diagnostic leg whatever it saw, a socket this
+	// host denied, or a handshake failure that may lie with this host.
+	// Contributes nothing in either direction.
+	legAbstain legVerdict = iota
+	// legNoRoute: this address family has no route on this host. Evidence about
+	// the host's stacks, not the Internet — unless every voting leg of every
+	// family says so.
+	legNoRoute
+	// legUnreachable: the network was reached and the provider was not there,
+	// or the peer is provably not the provider.
+	legUnreachable
+	// legReachable: an authenticated handshake with the provider.
+	legReachable
+)
+
+func (v legVerdict) String() string {
+	switch v {
+	case legReachable:
+		return "reachable"
+	case legUnreachable:
+		return "unreachable"
+	case legNoRoute:
+		return "no-route"
+	default:
+		return "abstain"
+	}
+}
+
+// probeMethod is one leg of a provider's race. Only a voting leg's verdict
+// reaches the fold; a diagnostic leg always abstains, and its result survives
+// only as a note in the joined error.
 type probeMethod struct {
 	name   string
 	port   string
 	voting bool
-	run    func(ctx context.Context, address string) (Outcome, error)
+	run    func(ctx context.Context, address string) (legVerdict, error)
 }
 
 // probeLegs lists the legs raced against every address of a provider, the
@@ -135,7 +191,7 @@ func probeLegs() []probeMethod {
 // diagnostic 53 leg got a valid reply even though the voting legs did not
 // prove the host: the signature of a network that filters 443/853 or of a
 // DNS interceptor, either way not a reason to contact Apple.
-var errDiagnosticAnswered = errors.New("answered (diagnostic leg, cannot vote Reachable)")
+var errDiagnosticAnswered = errors.New("answered (diagnostic leg, contributes no verdict)")
 
 // Seams for tests. dialContext lets a test inject dial-level errnos
 // (ENETUNREACH, EACCES, EMFILE) deterministically and observe which legs are
@@ -256,16 +312,13 @@ func ProbeWith(ctx context.Context, runner Runner) Result {
 	return result
 }
 
-// queryProvider races every (method, address) leg of a provider and keeps the
-// strongest verdict. Outcome's ordering makes that a max: any leg that proved
-// the host outranks everything, and failing that, any leg that actually reached
-// the network outranks one we were never allowed to try — which is also what
-// lets an abstaining TLS leg (OutcomeBlocked) defer to the 53 leg. The first
-// winning leg cancels the rest: on a host that silently drops 53 the DNS leg
-// would otherwise hold a verdict the 443 leg settled in 40ms for the whole
-// probeTimeout. Every leg's error is kept (joined, in method-then-address
-// order) so a log line shows why each leg lost, including a cert failure that
-// did not itself decide anything.
+// queryProvider races every (method, address) leg of a provider and folds
+// their verdicts by the package doc's table. The first reachable leg cancels
+// the rest, and cancellation reaches an already-connected socket (see
+// cancelOnDone), so a won or canceled race returns promptly rather than
+// waiting out probeTimeout. Every leg's error is kept (joined, in
+// method-then-address order) so a log line shows why each leg lost, including
+// a diagnostic leg's note and an abstaining leg's reason.
 func queryProvider(ctx context.Context, addresses []string) (Outcome, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
@@ -273,43 +326,53 @@ func queryProvider(ctx context.Context, addresses []string) (Outcome, error) {
 	legs := probeLegs()
 	type legResult struct {
 		index   int
-		outcome Outcome
+		verdict legVerdict
 		err     error
 	}
 	total := len(legs) * len(addresses)
 	results := make(chan legResult, total)
+	votingLegs := 0
 	for mi, method := range legs {
+		if method.voting {
+			votingLegs += len(addresses)
+		}
 		for ai, address := range addresses {
 			index := mi*len(addresses) + ai
 			go func() {
-				outcome, err := method.run(probeCtx, net.JoinHostPort(address, method.port))
-				if !method.voting && outcome == OutcomeReachable {
-					// A diagnostic leg's success is a note, never a vote.
-					outcome, err = OutcomeBlocked, errDiagnosticAnswered
+				verdict, err := method.run(probeCtx, net.JoinHostPort(address, method.port))
+				if !method.voting {
+					// A diagnostic leg has no standing in either direction.
+					if verdict == legReachable {
+						err = errDiagnosticAnswered
+					}
+					verdict = legAbstain
 				}
 				if err != nil {
-					err = fmt.Errorf("%s:%s %s: %w", method.name, method.port, address, err)
+					err = fmt.Errorf("%s:%s %s (%s): %w", method.name, method.port, address, verdict, err)
 				}
-				results <- legResult{index: index, outcome: outcome, err: err}
+				results <- legResult{index: index, verdict: verdict, err: err}
 			}()
 		}
 	}
 
-	best := OutcomeBlocked
+	var reachable, unreachable, noRoute int
 	errs := make([]error, total)
 	for range total {
 		leg := <-results
 		errs[leg.index] = leg.err
-		if leg.outcome > best {
-			best = leg.outcome
-		}
-		if best == OutcomeReachable {
+		switch leg.verdict {
+		case legReachable:
+			reachable++
 			// Nothing can strengthen the verdict now; stop waiting on the
-			// legs that are still timing out. They are still drained below.
+			// legs that are still timing out. They are still drained.
 			cancel()
+		case legUnreachable:
+			unreachable++
+		case legNoRoute:
+			noRoute++
 		}
 	}
-	if best == OutcomeReachable {
+	if reachable > 0 {
 		return OutcomeReachable, nil
 	}
 	// A caller canceling us (bridge shutdown) is not an outage verdict. Our own
@@ -317,95 +380,102 @@ func queryProvider(ctx context.Context, addresses []string) (Outcome, error) {
 	if ctx.Err() != nil {
 		return OutcomeBlocked, ctx.Err()
 	}
-	return best, errors.Join(errs...)
+	if unreachable > 0 || (noRoute > 0 && noRoute == votingLegs) {
+		return OutcomeUnreachable, errors.Join(errs...)
+	}
+	return OutcomeBlocked, errors.Join(errs...)
 }
 
-// classifyDialError is the ONLY place a probe failure becomes a verdict: a
-// socket the host refused us is Blocked (no evidence), anything the network
-// did is Unreachable. Both methods share it so they cannot classify the same
-// errno differently.
-func classifyDialError(err error) (Outcome, error) {
-	if locallyBlocked(err) {
-		return OutcomeBlocked, err
+// classifyDialError is the ONLY place a dial failure becomes a leg verdict, and
+// both methods share it so they cannot classify the same errno differently:
+// a socket this host refused us abstains, a family with no route is no-route,
+// anything else the network did is unreachable.
+func classifyDialError(err error) (legVerdict, error) {
+	switch {
+	case locallyBlocked(err):
+		return legAbstain, err
+	case noRoute(err):
+		return legNoRoute, err
+	default:
+		return legUnreachable, err
 	}
-	return OutcomeUnreachable, err
+}
+
+// noRoute reports a dial that this host could not even start because the
+// address family has no route or no address here — the shape a v6 literal
+// takes on a v4-only host (ENETUNREACH on Linux, EHOSTUNREACH on macOS).
+func noRoute(err error) bool {
+	return errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.EADDRNOTAVAIL)
+}
+
+// cancelOnDone wires ctx cancellation to an already-connected socket: a
+// canceled leg would otherwise block in its read until the deadline it set
+// from ctx.Deadline(), so a race won by another leg — or a probe canceled by
+// bridge shutdown — waited out the whole probeTimeout. The returned stop must
+// be deferred.
+func cancelOnDone(ctx context.Context, conn net.Conn) (stop func() bool) {
+	return context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
 }
 
 // errTLSUnverified marks a TLS leg that ABSTAINS: the TCP connection succeeded
-// but this host could not validate the certificate for a reason that may lie
-// with the host rather than the peer (no trust store at all, or a certificate
-// it considers invalid on time grounds). OutcomeBlocked, "no evidence".
-var errTLSUnverified = errors.New("TLS handshake could not be validated on this host (no usable CA bundle, or a certificate this host considers invalid)")
+// but the handshake failed for a reason that may lie with this host rather
+// than the peer — a chain no root here signs (which a self-signed portal and a
+// missing, stale or malformed local trust store raise alike), or a certificate
+// this host's clock considers expired.
+var errTLSUnverified = errors.New("TLS handshake could not be validated on this host (untrusted chain: a portal or this host's CA bundle; or a certificate this host's clock rejects)")
 
 // errTLSRejected marks a TLS leg that reached a peer which is provably not the
 // provider: a certificate that validates but names another host (a portal with
-// a real certificate for its own domain), a chain no root in a present trust
-// store signs (a self-signed portal), a peer that does not speak TLS, or a
-// connection cut mid-handshake. OutcomeUnreachable.
+// a real certificate for its own domain), a peer that does not speak TLS, a
+// connection cut mid-handshake, or any other protocol error.
 var errTLSRejected = errors.New("TLS peer is not the provider (captive portal or interception)")
 
-// hasTrustStore reports whether this host has any root certificates at all
-// under the pool the probe validates against. With none, an untrusted chain
-// says nothing about the peer; with some, it says the peer is not who it
-// claims. Computed once for the system roots.
-var (
-	systemTrustStoreOnce  sync.Once
-	systemTrustStoreKnown bool
-)
-
-func hasTrustStore(pool *x509.CertPool) bool {
-	if pool != nil {
-		return !pool.Equal(x509.NewCertPool())
-	}
-	systemTrustStoreOnce.Do(func() {
-		system, err := x509.SystemCertPool()
-		systemTrustStoreKnown = err == nil && system != nil && !system.Equal(x509.NewCertPool())
-	})
-	return systemTrustStoreKnown
-}
-
-// classifyHandshakeError sorts a failed handshake into abstain (Blocked) or a
-// verdict (Unreachable) per the package doc.
-func classifyHandshakeError(err error, roots *x509.CertPool) (Outcome, error) {
+// classifyHandshakeError sorts a failed handshake into abstain or unreachable
+// per the package doc's table. It never consults the trust store's contents:
+// a non-empty pool can still be stale or malformed, so an untrusted chain is
+// ambiguous whatever the pool looks like.
+func classifyHandshakeError(err error) (legVerdict, error) {
 	var unknownAuthority x509.UnknownAuthorityError
 	var invalid x509.CertificateInvalidError
 	switch {
-	case errors.As(err, &unknownAuthority) && !hasTrustStore(roots):
-		return OutcomeBlocked, fmt.Errorf("%w: %v", errTLSUnverified, err)
+	case errors.As(err, &unknownAuthority):
+		return legAbstain, fmt.Errorf("%w: %v", errTLSUnverified, err)
 	case errors.As(err, &invalid) && invalid.Reason == x509.Expired:
-		return OutcomeBlocked, fmt.Errorf("%w: %v", errTLSUnverified, err)
+		return legAbstain, fmt.Errorf("%w: %v", errTLSUnverified, err)
 	default:
-		return OutcomeUnreachable, fmt.Errorf("%w: %v", errTLSRejected, err)
+		return legUnreachable, fmt.Errorf("%w: %v", errTLSRejected, err)
 	}
 }
 
 // tlsOnce is a voting leg: a TLS handshake (on 443 or 853) validated against
 // the dialed IP literal. With ServerName set to the literal, Go checks the
 // certificate's IP SANs, so no name resolution is involved.
-func tlsOnce(ctx context.Context, address string) (Outcome, error) {
+func tlsOnce(ctx context.Context, address string) (legVerdict, error) {
 	conn, err := dialContext(ctx, "tcp", address)
 	if err != nil {
 		return classifyDialError(err)
 	}
 	defer conn.Close()
+	defer cancelOnDone(ctx, conn)()
 
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
-		return OutcomeBlocked, err
+		return legAbstain, err
 	}
-	roots := tlsRootCAs
 	tlsConn := tls.Client(conn, &tls.Config{
 		ServerName: host,
-		RootCAs:    roots,
+		RootCAs:    tlsRootCAs,
 		MinVersion: tls.VersionTLS12,
 	})
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		return classifyHandshakeError(err, roots)
+		return classifyHandshakeError(err)
 	}
-	return OutcomeReachable, nil
+	return legReachable, nil
 }
 
 // errHijacked marks a connection that completed but did not carry a real DNS
@@ -415,13 +485,14 @@ var errHijacked = errors.New("connected but no valid DNS reply (captive portal o
 // queryOnce is the diagnostic leg: a DNS-over-TCP query on 53 whose reply must
 // carry our transaction id. That check defeats a portal that speaks HTTP on 53
 // but not one that echoes our query, which is why queryProvider never lets its
-// success vote (see probeMethod.voting).
-func queryOnce(ctx context.Context, address string) (Outcome, error) {
+// verdict count in either direction (see probeMethod.voting).
+func queryOnce(ctx context.Context, address string) (legVerdict, error) {
 	conn, err := dialContext(ctx, "tcp", address)
 	if err != nil {
 		return classifyDialError(err)
 	}
 	defer conn.Close()
+	defer cancelOnDone(ctx, conn)()
 
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
@@ -430,12 +501,12 @@ func queryOnce(ctx context.Context, address string) (Outcome, error) {
 	// that a stale or echoed reply on this one connection does not match.
 	id := uint16(rand.Intn(1 << 16))
 	if _, err := conn.Write(dnsRootNSQuery(id)); err != nil {
-		return OutcomeUnreachable, err
+		return legUnreachable, err
 	}
 	if err := readDNSReply(conn, id); err != nil {
-		return OutcomeUnreachable, err
+		return legUnreachable, err
 	}
-	return OutcomeReachable, nil
+	return legReachable, nil
 }
 
 // dnsRootNSQuery builds a DNS-over-TCP query for the root NS set: a 2-byte

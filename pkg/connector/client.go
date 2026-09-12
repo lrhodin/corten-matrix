@@ -2400,7 +2400,7 @@ func (c *IMClient) runReceiveWedgeWatchdog(stop chan struct{}, log zerolog.Logge
 				log.Warn().
 					Uint64("idle_secs", idle).
 					Msg("APNs receive path wedged and both public Internet probes failed — entering Apple-free recovery instead of rebuilding into an outage")
-				c.runPublicOnlyInternetRecovery(log, false)
+				c.runPublicOnlyInternetRecovery(log, verdictUnreachable)
 				return
 			}
 			now := time.Now()

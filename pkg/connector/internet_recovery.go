@@ -226,7 +226,7 @@ func (c *IMClient) runAPSConnectionEventLoop(stop <-chan struct{}, log zerolog.L
 							Bool("sustained", sustained).
 							Dur("window", window).
 							Msg("APS transport is flapping faster than a healthy link can explain while public Internet is reachable — treating as a reconnect storm and stopping Apple retries (rustpush reconnects this shape with no backoff at all)")
-						c.runPublicOnlyInternetRecovery(log, true)
+						c.runPublicOnlyInternetRecovery(log, verdictReachable)
 						return
 					}
 					log.Info().
@@ -257,7 +257,7 @@ func (c *IMClient) runAPSConnectionEventLoop(stop <-chan struct{}, log zerolog.L
 					continue
 				}
 				log.Warn().Msg("Public Internet outage confirmed across the confirmation window; stopping Apple retries")
-				c.runPublicOnlyInternetRecovery(log, false)
+				c.runPublicOnlyInternetRecovery(log, verdictUnreachable)
 				return
 
 			case rustpushgo.ApsConnectionEventRetryFailed:
@@ -277,7 +277,7 @@ func (c *IMClient) runAPSConnectionEventLoop(stop <-chan struct{}, log zerolog.L
 				default:
 					log.Warn().Msg("APS reconnect failed and both public Internet probes failed; stopping Apple retries")
 				}
-				c.runPublicOnlyInternetRecovery(log, result.Reachable())
+				c.runPublicOnlyInternetRecovery(log, classifyRecoveryVerdict(result))
 				return
 			}
 		}
@@ -366,7 +366,14 @@ func recordInterruption(history []time.Time, now time.Time) []time.Time {
 // mutable variables that were updated in one arm and read in another. The
 // transition function makes those interactions enumerable: see
 // TestRecoveryStepDecisionTable.
-func (c *IMClient) runPublicOnlyInternetRecovery(log zerolog.Logger, appleSpecificFailure bool) {
+// entry is the last thing the caller actually knew about the network when it
+// decided to enter recovery: verdictUnreachable for a confirmed outage,
+// verdictReachable for an Apple-specific failure on a healthy link, and
+// verdictBlocked when the probe could not run. The episode is seeded with it,
+// so a hand-back cannot be sent on the strength of "no verdict yet" when the
+// last verdict — the one that started the episode — was a confirmed outage.
+func (c *IMClient) runPublicOnlyInternetRecovery(log zerolog.Logger, entry recoveryVerdict) {
+	appleSpecificFailure := entry == verdictReachable
 	main := c.Main
 	if main == nil || main.Bridge == nil {
 		return
@@ -420,7 +427,7 @@ func (c *IMClient) runPublicOnlyInternetRecovery(log zerolog.Logger, appleSpecif
 		Msg("APNs recovery entered public-only mode: iMessage client teardown completed; the recovery watcher will use only public probes until Internet stability is established")
 
 	var probeLog internetProbeLogger
-	episode := newRecoveryEpisode(time.Now())
+	episode := newRecoveryEpisode(time.Now(), entry)
 	canceled := func() bool {
 		return main.Bridge.IsStopping() || internetRecoveryCanceled(ctx, recoveryDone)
 	}
@@ -581,7 +588,7 @@ func (c *IMClient) logRecoveryDecision(log zerolog.Logger, phase string, result 
 	if d.action == actionHandBack {
 		logBlockedProbe(log.With().
 			Int("request_attempt", e.attempt).
-			Dur("no_verdict_for", round.now.Sub(e.lastNetworkVerdict)).
+			Dur("no_verdict_for", round.now.Sub(e.lastVerdictAt)).
 			Dur("bridgev2_reconnect_delay", c.Main.Bridge.Config.UnknownErrorAutoReconnect).
 			Logger(), result).Msg("Public Internet probe cannot run on this host, so recovery has no connectivity signal at all; handing control back to bridgev2 rather than staying in Apple-free mode on no evidence")
 	}
@@ -616,12 +623,15 @@ func (c *IMClient) bridgeRecoveryContext() context.Context {
 // TestRecoveryStepDecisionTable enumerates it. Two structural properties do the
 // work the old arms did by convention:
 //
-//  1. A pending request has a KIND. An unreachable round withdraws a "recovered"
-//     request (bridgev2 must not rebuild into an outage) and never an
-//     unusable-probe hand-back (whose whole point is to let Apple decide when
-//     the probe cannot produce a verdict at all). The round-5 self-canceling
-//     hand-back — withdrawn one poll later — cannot be expressed here,
-//     whatever the clocks do.
+//  1. A pending request has a PREMISE, and a verdict that destroys the premise
+//     withdraws the request. A "recovered" request rests on "the link is
+//     stable"; an unusable-probe hand-back rests on "nothing is known to be
+//     down". A confirmed Unreachable verdict destroys both, so it withdraws
+//     either kind; a Blocked verdict (no evidence) destroys neither. The kind
+//     is not what protects a hand-back from withdrawal — the hand-back
+//     precondition (clause 7's invariant) is what keeps one from being sent
+//     while the most recent verdict is Unreachable, so a hand-back that IS
+//     sent is withdrawn only by genuinely new negative evidence.
 //
 //  2. The re-ask gate is evaluated BEFORE the hand-back clause. While bridgev2
 //     has a request it has not had time to act on, no clock can preempt the
@@ -793,9 +803,13 @@ type recoveryEpisode struct {
 	// It is what the hold alarm measures from, so a flapping link that keeps
 	// resetting it is a different, quieter kind of hold than a dead link.
 	outageStartedAt time.Time
-	// lastNetworkVerdict is the last round that actually tested the network, as
-	// opposed to being refused a socket by this host.
-	lastNetworkVerdict time.Time
+	// lastVerdictAt and lastVerdict are the most recent round that actually
+	// tested the network (Reachable or Unreachable) — as opposed to being
+	// refused a socket by this host — INCLUDING the verdict the episode was
+	// entered on. lastVerdict is verdictBlocked when there has been none. This
+	// pair is what the hand-back precondition reads.
+	lastVerdictAt time.Time
+	lastVerdict   recoveryVerdict
 
 	stabilizing bool
 	stable      internetprobe.Stability
@@ -812,8 +826,10 @@ type recoveryEpisode struct {
 	lastHoldAlarmAt    time.Time
 }
 
-func newRecoveryEpisode(now time.Time) *recoveryEpisode {
-	return &recoveryEpisode{startedAt: now, outageStartedAt: now, lastNetworkVerdict: now}
+// newRecoveryEpisode starts an episode whose most recent network knowledge is
+// entry (see runPublicOnlyInternetRecovery).
+func newRecoveryEpisode(now time.Time, entry recoveryVerdict) *recoveryEpisode {
+	return &recoveryEpisode{startedAt: now, outageStartedAt: now, lastVerdictAt: now, lastVerdict: entry}
 }
 
 // step applies one probe round to the episode and names the loop's next effect.
@@ -823,10 +839,10 @@ func (e *recoveryEpisode) step(in recoveryRound) recoveryDecision {
 	var d recoveryDecision
 	now := in.now
 
-	// 1. Clocks. Only a verdict that tested the network moves the unusable-probe
-	// clock; only a reachable verdict ends the current outage.
+	// 1. Clocks. Only a verdict that tested the network becomes the most recent
+	// thing known; only a reachable verdict ends the current outage.
 	if in.verdict != verdictBlocked {
-		e.lastNetworkVerdict = now
+		e.lastVerdictAt, e.lastVerdict = now, in.verdict
 	}
 	if in.verdict == verdictReachable {
 		e.outageStartedAt = now
@@ -846,9 +862,9 @@ func (e *recoveryEpisode) step(in recoveryRound) recoveryDecision {
 		e.resetStability(&d)
 	}
 
-	// 3. Withdrawal. A real outage verdict voids a pending "recovered" request;
-	// a Blocked round does not (one EACCES round must not cost a bridgev2 wait
-	// cycle), and a pending hand-back is never withdrawn by anything.
+	// 3. Withdrawal. A verdict that destroys a pending request's premise voids
+	// it (see recoveryPending.voidedBy); a Blocked round destroys nothing (one
+	// EACCES round must not cost a bridgev2 wait cycle).
 	if e.withdrawIfVoided(in.verdict, &d) {
 		return d
 	}
@@ -877,17 +893,30 @@ func (e *recoveryEpisode) step(in recoveryRound) recoveryDecision {
 		return d
 	}
 
-	// 7. Holds. A confirmed outage is held Apple-free for as long as it lasts,
-	// and made loud rather than automatic: after holdAlarmAfter of continuous
-	// Unreachable verdicts the loop alarms (throttled to holdAlarmInterval) and
-	// keeps holding. The one hand-back left is the unusable-probe hatch: a
-	// probe that has produced NO verdict for blockedGrace cannot hold the
-	// bridge on no evidence, so bridgev2 is asked to let a real Apple attempt
-	// decide. Nothing in this clause fires on an Unreachable verdict except
-	// the alarm.
-	probeUnusable := in.verdict != verdictReachable && now.Sub(e.lastNetworkVerdict) >= in.timing.blockedGrace
+	// 7. Holds, and the one hand-back.
+	//
+	// INVARIANT — the hand-back precondition: a hand-back is sent only when
+	// nothing is known to be down AND the probe has stopped saying anything.
+	// "Nothing is known to be down" means this episode's most recent network
+	// verdict, counting the verdict it was entered on, is not Unreachable;
+	// "stopped saying anything" means no verdict of any kind for blockedGrace.
+	// This is a statement about evidence, not about clause order: clause 3
+	// enforces the same premise after the fact by withdrawing a pending
+	// hand-back the moment an Unreachable verdict arrives. A confirmed outage
+	// therefore never reaches Apple through this clause, in either direction:
+	// not before the hand-back (the precondition) and not after (the
+	// withdrawal).
+	//
+	// Everything else here is a hold. A confirmed outage — Unreachable rounds,
+	// or Blocked rounds after one — is held Apple-free for as long as it lasts
+	// and made loud rather than automatic: after holdAlarmAfter of the current
+	// outage the loop alarms (throttled to holdAlarmInterval) and keeps
+	// holding.
+	knownDown := e.lastVerdict == verdictUnreachable
+	probeUnusable := in.verdict == verdictBlocked && !knownDown && now.Sub(e.lastVerdictAt) >= in.timing.blockedGrace
 	if !probeUnusable {
-		if in.verdict == verdictUnreachable && now.Sub(e.outageStartedAt) >= in.timing.holdAlarmAfter &&
+		held := in.verdict == verdictUnreachable || (in.verdict == verdictBlocked && knownDown)
+		if held && now.Sub(e.outageStartedAt) >= in.timing.holdAlarmAfter &&
 			internetRecoveryHoldLogDue(now, e.lastHoldAlarmAt, in.timing.holdAlarmInterval) {
 			e.lastHoldAlarmAt = now
 			d.holdAlarm = true
@@ -915,9 +944,10 @@ func (e *recoveryEpisode) step(in recoveryRound) recoveryDecision {
 // verdict. A passing preflight requests the rebuild. Any other verdict is
 // scored by the SAME clause-2 and clause-3 helpers step uses, so the preflight
 // cannot rate a verdict differently from a main round: Unreachable resets the
-// window and withdraws a pending recovered request; Blocked resets the window
-// and withdraws nothing, because the probe not running is not evidence of an
-// outage (probe.go's contract). The parameter is the three-valued verdict for
+// window and withdraws whatever request is pending (its premise is gone,
+// whichever kind it was); Blocked resets the window and withdraws nothing,
+// because the probe not running is not evidence of an outage (probe.go's
+// contract). The parameter is the three-valued verdict for
 // that reason — a bool collapsed Blocked into Unreachable here and cost a
 // bridgev2 wait cycle on a descriptor-exhaustion round (round-8 finding 2).
 func (e *recoveryEpisode) finishPreflight(now time.Time, verdict recoveryVerdict) recoveryDecision {
@@ -940,16 +970,28 @@ func (e *recoveryEpisode) resetStability(d *recoveryDecision) {
 	e.stable.Reset()
 }
 
-// withdrawIfVoided is clause 3: only a verdict that tested the network and
-// found it down voids a pending recovered request, and a pending hand-back is
-// never withdrawn. Reports whether a withdrawal was decided.
+// withdrawIfVoided is clause 3: a pending request whose premise the verdict
+// destroys is withdrawn. Reports whether a withdrawal was decided.
 func (e *recoveryEpisode) withdrawIfVoided(verdict recoveryVerdict, d *recoveryDecision) bool {
-	if verdict != verdictUnreachable || e.pending != pendingRecovered {
+	if !e.pending.voidedBy(verdict) {
 		return false
 	}
 	e.clearPending()
 	d.action = actionWithdraw
 	return true
+}
+
+// voidedBy reports whether a verdict destroys the premise a pending request
+// was made on. The rule follows the premise, not the kind: pendingRecovered
+// was sent because the link was stable, pendingHandBack because nothing was
+// known to be down, and a confirmed Unreachable verdict contradicts both.
+// (When hand-backs came from an outage ceiling they already implied a long
+// confirmed outage and withdrawing one made no sense; now that a hand-back's
+// only ground is the absence of evidence, new negative evidence must void it,
+// or bridgev2 would reconnect to Apple 4-6 minutes into a confirmed outage.)
+// Blocked is the absence of evidence and voids nothing.
+func (p recoveryPending) voidedBy(verdict recoveryVerdict) bool {
+	return p != pendingNone && verdict == verdictUnreachable
 }
 
 // noteRequest records a rebuild request of the given kind. A re-ask replaces
