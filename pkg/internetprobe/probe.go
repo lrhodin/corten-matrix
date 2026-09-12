@@ -60,18 +60,29 @@
 //	  dial: no route in this family (ENETUNREACH/EHOSTUNREACH/EADDRNOTAVAIL) no-route
 //	  dial: refused, timed out, reset, any other network error ........... unreachable
 //	  handshake verified for the dialed IP ............................. reachable
-//	  handshake: x509.UnknownAuthorityError ............................ abstain
-//	      (a self-signed portal and a missing, stale or malformed local
-//	      trust store raise the same error; the pool's contents are no
-//	      evidence either way, so this abstains UNCONDITIONALLY)
-//	  handshake: x509.CertificateInvalidError with Reason Expired ....... abstain
-//	      (clock skew on this host is indistinguishable from an expired
-//	      portal certificate)
-//	  handshake: chain validates but names another host (HostnameError),
-//	      peer does not speak TLS, EOF/reset mid-handshake, any other
-//	      protocol or certificate error .................................. unreachable
-//	      (positively diagnostic of interception: the providers always
-//	      complete a valid handshake on these ports)
+//	  handshake failures POSITIVELY diagnostic of interception ......... unreachable
+//	      x509.HostnameError: the chain validates but names another host
+//	        (a portal with a real certificate for its own domain)
+//	      tls.RecordHeaderError: the peer does not speak TLS at all
+//	      tls.AlertError: a TLS peer refused the handshake (the providers
+//	        never alert on a plain handshake with this configuration)
+//	      io.EOF / io.ErrUnexpectedEOF / ECONNRESET / EPIPE: the peer or a
+//	        middlebox cut the handshake
+//	  every other handshake failure ..................................... abstain
+//	      x509.UnknownAuthorityError: a self-signed portal and a missing,
+//	        stale or malformed local trust store raise the same error, so
+//	        the pool's contents are no evidence either way
+//	      x509.SystemRootsError: this host could not load its roots — a
+//	        local failure, never evidence about the peer
+//	      x509.CertificateInvalidError (every Reason: Expired is clock skew
+//	        on this host, the rest are verifier policy), x509.
+//	        InsecureAlgorithmError, x509.ConstraintViolationError,
+//	        x509.UnhandledCriticalExtension: local verifier policy
+//	      context canceled / deadline, i/o timeout after the connect: ours,
+//	        or a stalled path — not proof of interception
+//	      anything not enumerated here: abstains BY DEFAULT. The default
+//	        is the abstention, so an error type nobody reviewed can only
+//	        ever withhold a verdict, never manufacture an outage
 //	Diagnostic DNS leg (53)
 //	  every outcome ..................................................... abstain
 //	      (its result is a note in the joined error, never a verdict)
@@ -104,6 +115,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"sync"
@@ -424,7 +436,7 @@ func cancelOnDone(ctx context.Context, conn net.Conn) (stop func() bool) {
 // than the peer — a chain no root here signs (which a self-signed portal and a
 // missing, stale or malformed local trust store raise alike), or a certificate
 // this host's clock considers expired.
-var errTLSUnverified = errors.New("TLS handshake could not be validated on this host (untrusted chain: a portal or this host's CA bundle; or a certificate this host's clock rejects)")
+var errTLSUnverified = errors.New("TLS handshake failed for a reason that is not proof of interception (untrusted chain, local roots or clock, a stalled path, or an unclassified error)")
 
 // errTLSRejected marks a TLS leg that reached a peer which is provably not the
 // provider: a certificate that validates but names another host (a portal with
@@ -432,20 +444,32 @@ var errTLSUnverified = errors.New("TLS handshake could not be validated on this 
 // connection cut mid-handshake, or any other protocol error.
 var errTLSRejected = errors.New("TLS peer is not the provider (captive portal or interception)")
 
-// classifyHandshakeError sorts a failed handshake into abstain or unreachable
-// per the package doc's table. It never consults the trust store's contents:
-// a non-empty pool can still be stale or malformed, so an untrusted chain is
-// ambiguous whatever the pool looks like.
+// classifyHandshakeError sorts a failed handshake per the package doc's table.
+// The default is ABSTAIN: only failures positively diagnostic of interception
+// are enumerated, and they are the only ones that vote. An earlier version
+// enumerated the abstentions and sent everything else to unreachable, which
+// turned x509.SystemRootsError — a host that cannot load its own roots — into
+// a confirmed Internet outage; a permissive default writes rows into the
+// table that nobody reviewed. It never consults the trust store's contents
+// either: a non-empty pool can still be stale or malformed. Local-failure
+// types that would abstain anyway (SystemRootsError, UnknownAuthorityError,
+// CertificateInvalidError) are named in the table above so a reader can see
+// they were considered, not merely defaulted.
 func classifyHandshakeError(err error) (legVerdict, error) {
-	var unknownAuthority x509.UnknownAuthorityError
-	var invalid x509.CertificateInvalidError
+	var hostname x509.HostnameError
+	var recordHeader tls.RecordHeaderError
+	var alert tls.AlertError
 	switch {
-	case errors.As(err, &unknownAuthority):
-		return legAbstain, fmt.Errorf("%w: %v", errTLSUnverified, err)
-	case errors.As(err, &invalid) && invalid.Reason == x509.Expired:
-		return legAbstain, fmt.Errorf("%w: %v", errTLSUnverified, err)
-	default:
+	case errors.As(err, &hostname),
+		errors.As(err, &recordHeader),
+		errors.As(err, &alert),
+		errors.Is(err, io.EOF),
+		errors.Is(err, io.ErrUnexpectedEOF),
+		errors.Is(err, syscall.ECONNRESET),
+		errors.Is(err, syscall.EPIPE):
 		return legUnreachable, fmt.Errorf("%w: %v", errTLSRejected, err)
+	default:
+		return legAbstain, fmt.Errorf("%w: %v", errTLSUnverified, err)
 	}
 }
 

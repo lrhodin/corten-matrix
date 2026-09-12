@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"sync"
@@ -281,6 +282,55 @@ func TestTLSLegAcceptsOnlyACertificateThatValidatesForTheDialedIP(t *testing.T) 
 		expect(t, verdict, err, legAbstain, errTLSUnverified, "clock skew on this host is indistinguishable from an expired portal certificate")
 	})
 }
+
+// The classifier's table, row by row, including the default: an error nobody
+// enumerated must abstain, never vote. SystemRootsError is the case that
+// showed a permissive default manufactures outages from local failures.
+func TestHandshakeClassifierVotesOnlyOnPositiveEvidenceOfInterception(t *testing.T) {
+	timeout := &net.OpError{Op: "read", Net: "tcp", Err: &timeoutError{}}
+	for _, tc := range []struct {
+		name string
+		err  error
+		want legVerdict
+	}{
+		{"chain validates for another host", x509.HostnameError{Host: "127.0.0.1"}, legUnreachable},
+		{"wrapped by tls.CertificateVerificationError", &tls.CertificateVerificationError{Err: x509.HostnameError{Host: "127.0.0.1"}}, legUnreachable},
+		{"peer does not speak TLS", tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}, legUnreachable},
+		{"peer sent a fatal alert", tls.AlertError(40), legUnreachable},
+		{"peer closed mid-handshake", io.ErrUnexpectedEOF, legUnreachable},
+		{"connection reset mid-handshake", &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}, legUnreachable},
+		{"untrusted chain", x509.UnknownAuthorityError{}, legAbstain},
+		{"untrusted chain wrapped", &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}, legAbstain},
+		{"system roots could not be loaded", x509.SystemRootsError{Err: errors.New("no such file")}, legAbstain},
+		{"expired certificate", x509.CertificateInvalidError{Reason: x509.Expired}, legAbstain},
+		{"any other certificate invalidity", x509.CertificateInvalidError{Reason: x509.IncompatibleUsage}, legAbstain},
+		{"insecure signature algorithm", x509.InsecureAlgorithmError(0), legAbstain},
+		{"our own cancellation", context.Canceled, legAbstain},
+		{"our own deadline", context.DeadlineExceeded, legAbstain},
+		{"i/o timeout after the connect", timeout, legAbstain},
+		{"an error nobody enumerated", errors.New("tls: something new"), legAbstain},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			verdict, err := classifyHandshakeError(tc.err)
+			if verdict != tc.want {
+				t.Fatalf("classify(%v) = %s, want %s", tc.err, verdict, tc.want)
+			}
+			wantErr := errTLSUnverified
+			if tc.want == legUnreachable {
+				wantErr = errTLSRejected
+			}
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("classify(%v) err = %v, want it to carry %v", tc.err, err, wantErr)
+			}
+		})
+	}
+}
+
+type timeoutError struct{}
+
+func (*timeoutError) Error() string   { return "i/o timeout" }
+func (*timeoutError) Timeout() bool   { return true }
+func (*timeoutError) Temporary() bool { return true }
 
 // The provider verdict across all three legs, in the cases that matter
 // operationally. The diagnostic 53 leg contributes no verdict in either

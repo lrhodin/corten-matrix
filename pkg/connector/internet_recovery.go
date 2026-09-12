@@ -642,11 +642,14 @@ func (c *IMClient) bridgeRecoveryContext() context.Context {
 //     and the connector backoff is not load-bearing, which is what makes the
 //     loop safe under operator-supplied unknown_error_auto_reconnect values.
 //
-//  3. A confirmed-Unreachable verdict NEVER produces a request. There is no
-//     outage ceiling and no episode ceiling (both were removed in round 10:
-//     each contacted Apple while the probe still said down, which the
-//     requirement forbids). The only hand-back is the unusable-probe hatch,
-//     which fires on the ABSENCE of a verdict. A link that never stabilizes —
+//  3. A confirmed-Unreachable verdict NEVER produces a request, and once the
+//     episode has concluded the network is down (outageConfirmed) nothing
+//     produces a request until the network is positively re-established to
+//     the rebuild standard. There is no outage ceiling and no episode ceiling
+//     (both were removed in round 10: each contacted Apple while the probe
+//     still said down, which the requirement forbids). The only hand-back is
+//     the unusable-probe hatch, which fires on the ABSENCE of any conclusion
+//     in an episode that holds no outage belief. A link that never stabilizes —
 //     down for good, or flapping faster than the stability window forever —
 //     therefore holds Apple-free indefinitely, and the loop makes that loud
 //     rather than automatic: after holdAlarmAfter of continuous confirmed
@@ -803,13 +806,21 @@ type recoveryEpisode struct {
 	// It is what the hold alarm measures from, so a flapping link that keeps
 	// resetting it is a different, quieter kind of hold than a dead link.
 	outageStartedAt time.Time
-	// lastVerdictAt and lastVerdict are the most recent round that actually
-	// tested the network (Reachable or Unreachable) — as opposed to being
-	// refused a socket by this host — INCLUDING the verdict the episode was
-	// entered on. lastVerdict is verdictBlocked when there has been none. This
-	// pair is what the hand-back precondition reads.
+	// lastVerdictAt is when the probe last produced a conclusion (Reachable or
+	// Unreachable, from a main round or the final preflight), as opposed to
+	// being refused a socket by this host — including the verdict the episode
+	// was entered on. It is a timestamp, not a belief: it says how long the
+	// probe has been silent, nothing about what it last said.
 	lastVerdictAt time.Time
-	lastVerdict   recoveryVerdict
+	// outageConfirmed is the episode's BELIEF that the network is down. SET by
+	// every Unreachable conclusion — the entry verdict, a main round, or a
+	// failed final preflight — and CLEARED by exactly one thing: the evidence
+	// that authorizes a rebuild (a full stability window plus a passing
+	// preflight, i.e. actionRecovered). A single Reachable sample does not
+	// clear it; a most-recent sample is not a conclusion, and an earlier
+	// version that used one as the hand-back guard let a confirmed outage
+	// followed by one Reachable round and then Blocked rounds hand back.
+	outageConfirmed bool
 
 	stabilizing bool
 	stable      internetprobe.Stability
@@ -829,7 +840,7 @@ type recoveryEpisode struct {
 // newRecoveryEpisode starts an episode whose most recent network knowledge is
 // entry (see runPublicOnlyInternetRecovery).
 func newRecoveryEpisode(now time.Time, entry recoveryVerdict) *recoveryEpisode {
-	return &recoveryEpisode{startedAt: now, outageStartedAt: now, lastVerdictAt: now, lastVerdict: entry}
+	return &recoveryEpisode{startedAt: now, outageStartedAt: now, lastVerdictAt: now, outageConfirmed: entry == verdictUnreachable}
 }
 
 // step applies one probe round to the episode and names the loop's next effect.
@@ -839,14 +850,9 @@ func (e *recoveryEpisode) step(in recoveryRound) recoveryDecision {
 	var d recoveryDecision
 	now := in.now
 
-	// 1. Clocks. Only a verdict that tested the network becomes the most recent
-	// thing known; only a reachable verdict ends the current outage.
-	if in.verdict != verdictBlocked {
-		e.lastVerdictAt, e.lastVerdict = now, in.verdict
-	}
-	if in.verdict == verdictReachable {
-		e.outageStartedAt = now
-	}
+	// 1. Conclusions. Shared with finishPreflight (noteConclusion), so a
+	// preflight's verdict counts exactly as a main round's does.
+	e.noteConclusion(now, in.verdict)
 
 	// 2. Stability. Blocked cannot assert stability on absent evidence, so it
 	// resets the window like an outage does — but see clause 3 for the
@@ -895,27 +901,29 @@ func (e *recoveryEpisode) step(in recoveryRound) recoveryDecision {
 
 	// 7. Holds, and the one hand-back.
 	//
-	// INVARIANT — the hand-back precondition: a hand-back is sent only when
-	// nothing is known to be down AND the probe has stopped saying anything.
-	// "Nothing is known to be down" means this episode's most recent network
-	// verdict, counting the verdict it was entered on, is not Unreachable;
-	// "stopped saying anything" means no verdict of any kind for blockedGrace.
-	// This is a statement about evidence, not about clause order: clause 3
+	// INVARIANT — the hand-back precondition: the unusable-probe hatch may
+	// fire only when this episode has NEVER concluded the network is down, or
+	// has since positively re-established it to the standard that authorizes
+	// a rebuild (a full stability window plus a passing preflight, the only
+	// thing that clears outageConfirmed) — AND the probe has produced no
+	// conclusion of any kind for blockedGrace. It is a statement about the
+	// episode's belief, not about the most recent sample and not about clause
+	// order: a failed preflight sets the belief like any other Unreachable
+	// conclusion, a single Reachable round does not clear it, and clause 3
 	// enforces the same premise after the fact by withdrawing a pending
-	// hand-back the moment an Unreachable verdict arrives. A confirmed outage
-	// therefore never reaches Apple through this clause, in either direction:
-	// not before the hand-back (the precondition) and not after (the
-	// withdrawal).
+	// hand-back the moment an Unreachable conclusion arrives. A confirmed
+	// outage therefore never reaches Apple through this clause, in either
+	// direction: not before the hand-back (the precondition) and not after
+	// (the withdrawal).
 	//
 	// Everything else here is a hold. A confirmed outage — Unreachable rounds,
 	// or Blocked rounds after one — is held Apple-free for as long as it lasts
 	// and made loud rather than automatic: after holdAlarmAfter of the current
 	// outage the loop alarms (throttled to holdAlarmInterval) and keeps
 	// holding.
-	knownDown := e.lastVerdict == verdictUnreachable
-	probeUnusable := in.verdict == verdictBlocked && !knownDown && now.Sub(e.lastVerdictAt) >= in.timing.blockedGrace
+	probeUnusable := in.verdict == verdictBlocked && !e.outageConfirmed && now.Sub(e.lastVerdictAt) >= in.timing.blockedGrace
 	if !probeUnusable {
-		held := in.verdict == verdictUnreachable || (in.verdict == verdictBlocked && knownDown)
+		held := in.verdict == verdictUnreachable || (in.verdict == verdictBlocked && e.outageConfirmed)
 		if held && now.Sub(e.outageStartedAt) >= in.timing.holdAlarmAfter &&
 			internetRecoveryHoldLogDue(now, e.lastHoldAlarmAt, in.timing.holdAlarmInterval) {
 			e.lastHoldAlarmAt = now
@@ -952,7 +960,11 @@ func (e *recoveryEpisode) step(in recoveryRound) recoveryDecision {
 // bridgev2 wait cycle on a descriptor-exhaustion round (round-8 finding 2).
 func (e *recoveryEpisode) finishPreflight(now time.Time, verdict recoveryVerdict) recoveryDecision {
 	var d recoveryDecision
+	e.noteConclusion(now, verdict)
 	if verdict == verdictReachable {
+		// The one place the outage belief is cleared: the same evidence that
+		// authorizes the rebuild.
+		e.outageConfirmed = false
 		e.noteRequest(now, pendingRecovered)
 		d.action = actionRecovered
 		return d
@@ -960,6 +972,22 @@ func (e *recoveryEpisode) finishPreflight(now time.Time, verdict recoveryVerdict
 	e.resetStability(&d)
 	e.withdrawIfVoided(verdict, &d)
 	return d
+}
+
+// noteConclusion is the bookkeeping every conclusion performs, whether it came
+// from a main round or the final preflight: a conclusion stamps lastVerdictAt;
+// a Reachable one ends the current outage's clock; an Unreachable one sets the
+// outage belief. Nothing clears the belief here — see finishPreflight. A
+// Blocked verdict is not a conclusion and changes nothing.
+func (e *recoveryEpisode) noteConclusion(now time.Time, verdict recoveryVerdict) {
+	switch verdict {
+	case verdictReachable:
+		e.lastVerdictAt = now
+		e.outageStartedAt = now
+	case verdictUnreachable:
+		e.lastVerdictAt = now
+		e.outageConfirmed = true
+	}
 }
 
 // resetStability is clause 2's non-reachable half: end any stability window in

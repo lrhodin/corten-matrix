@@ -483,6 +483,35 @@ func TestRecoveryLoopEndsOnlyOnAVerdictOrCancellation(t *testing.T) {
 			wantErr: "im-internet-probe-unusable",
 		},
 		{
+			// Wrong abstraction 2(a): the final preflight said down; the
+			// Blocked rounds that follow must not hand back.
+			name:  "a failed preflight followed by blocked rounds is held",
+			entry: verdictReachable,
+			verdict: func(round int, phase string) internetprobe.Result {
+				if phase == "final_reconnect_preflight" {
+					return unreachableResult()
+				}
+				if round <= 60 {
+					return reachableResult()
+				}
+				return blockedResult()
+			},
+			alarms: true, // the belief is "down" and the hold is long: loud, as any confirmed outage
+		},
+		{
+			// Wrong abstraction 2(b): one reachable sample is not a conclusion
+			// that connectivity returned.
+			name:  "a confirmed outage, one reachable round, then blocked rounds is held",
+			entry: verdictUnreachable,
+			verdict: func(round int, _ string) internetprobe.Result {
+				if round == 1 {
+					return reachableResult()
+				}
+				return blockedResult()
+			},
+			alarms: true,
+		},
+		{
 			// The round-4 shape: main probe passes, final preflight fails,
 			// forever. It used to end at the episode ceiling; now it holds.
 			name:  "main probe passes but preflight always fails: held",
@@ -1197,10 +1226,10 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 		{
 			// Root cause A2: the precondition. The probe has said nothing for
 			// the whole grace, but the last thing it DID say was Unreachable.
-			name: "clause 7: the hatch is ineligible while the most recent verdict is unreachable",
+			name: "clause 7: the hatch is ineligible while the episode believes the network is down",
 			episode: func() *recoveryEpisode {
 				e := fresh()
-				e.lastVerdict, e.lastVerdictAt = verdictUnreachable, ago(timing.blockedGrace)
+				e.outageConfirmed, e.lastVerdictAt = true, ago(timing.blockedGrace)
 				return e
 			},
 			verdict: verdictBlocked,
@@ -1226,15 +1255,44 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 			want:    recoveryDecision{holdAlarm: true},
 		},
 		{
-			name: "clause 7: a reachable verdict re-arms the hatch after an outage",
+			// Wrong abstraction 2(b): one Reachable SAMPLE after a confirmed
+			// outage is not a conclusion that connectivity returned.
+			name: "clause 7: a single reachable sample after an outage does not re-arm the hatch",
 			episode: func() *recoveryEpisode {
 				e := afterOutage(time.Hour)
-				e.lastVerdict, e.lastVerdictAt = verdictReachable, ago(timing.blockedGrace)
+				e.step(recoveryRound{now: ago(timing.blockedGrace), verdict: verdictReachable, retryDelay: retryDelay, timing: timing})
+				return e
+			},
+			verdict: verdictBlocked,
+			// The one sample opened a stability window, which the Blocked round
+			// resets (clause 2); it decides nothing — no hand-back, no alarm.
+			want: recoveryDecision{stabilityReset: true},
+		},
+		{
+			// Only the evidence that authorizes a rebuild — a passed preflight
+			// after a full window — clears the belief and re-arms the hatch.
+			name: "clause 7: a rebuild-grade recovery re-arms the hatch after an outage",
+			episode: func() *recoveryEpisode {
+				e := afterOutage(time.Hour)
+				e.finishPreflight(ago(timing.blockedGrace), verdictReachable)
+				e.requestedAt = ago(retryDelay) // the gate has since opened
 				return e
 			},
 			verdict: verdictBlocked,
 			want:    recoveryDecision{action: actionHandBack, handBackCode: handBackCodeProbeUnusable},
 			pending: pendingHandBack,
+		},
+		{
+			// Wrong abstraction 2(a): a failed final preflight is an Unreachable
+			// conclusion like any other and must set the belief.
+			name: "clause 7: blocked rounds after a failed preflight cannot hand back",
+			episode: func() *recoveryEpisode {
+				e := stabilizingFor(fresh(), timing.stablePeriod)
+				e.finishPreflight(ago(timing.blockedGrace), verdictUnreachable)
+				return e
+			},
+			verdict: verdictBlocked,
+			want:    recoveryDecision{},
 		},
 		{
 			name: "clause 7: an unusable probe inside the grace does nothing",
@@ -1438,6 +1496,25 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 				verdict: verdictReachable,
 				want:    recoveryDecision{action: actionRecovered},
 				pending: pendingRecovered,
+				after: func(t *testing.T, e *recoveryEpisode) {
+					if e.outageConfirmed || !e.lastVerdictAt.Equal(now) {
+						t.Errorf("a passing preflight must stamp the conclusion and clear the belief: confirmed=%v at=%v", e.outageConfirmed, e.lastVerdictAt)
+					}
+				},
+			},
+			{
+				name: "a passing preflight after a confirmed outage clears the belief",
+				episode: func() *recoveryEpisode {
+					return stabilizingFor(afterOutage(time.Hour), timing.stablePeriod)
+				},
+				verdict: verdictReachable,
+				want:    recoveryDecision{action: actionRecovered},
+				pending: pendingRecovered,
+				after: func(t *testing.T, e *recoveryEpisode) {
+					if e.outageConfirmed {
+						t.Error("the rebuild-grade evidence must clear the outage belief")
+					}
+				},
 			},
 			{
 				name: "a passing preflight after a hand-back re-asks with the truthful kind",
@@ -1449,7 +1526,7 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 				pending: pendingRecovered,
 			},
 			{
-				name:    "a failing preflight resets the window",
+				name:    "a failing preflight resets the window and sets the outage belief",
 				episode: func() *recoveryEpisode { return stabilizingFor(fresh(), timing.stablePeriod) },
 				verdict: verdictUnreachable,
 				want:    recoveryDecision{stabilityReset: true},
@@ -1458,6 +1535,10 @@ func TestRecoveryStepDecisionTable(t *testing.T) {
 					// state, or the next reachable round never logs a new start.
 					if e.stabilizing {
 						t.Error("a reset preflight left stabilizing set")
+					}
+					// Wrong abstraction 2(a): a failed preflight is a conclusion.
+					if !e.outageConfirmed || !e.lastVerdictAt.Equal(now) {
+						t.Errorf("a failed preflight must set the belief and stamp the conclusion: confirmed=%v at=%v", e.outageConfirmed, e.lastVerdictAt)
 					}
 				},
 			},
